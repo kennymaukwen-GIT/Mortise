@@ -71,6 +71,15 @@ def _fill_paragraphs(tf, paragraphs, element_id: str, degradations: list[Degrada
                 degradations.append(Degradation(element_id=tb_id, concept="文字透明度", action="以不透明顏色輸出", lossy=True))
 
 
+def _drop_style(shape) -> None:
+    """拿掉形狀的主題樣式參照（p:style）。填色與線條都已明確寫出；留著它，
+    LibreOffice 會依 effectRef 畫出主題陰影，PowerPoint 則不會，兩邊看起來就不一樣。"""
+    el = shape._element
+    style = el.find(qn("p:style"))
+    if style is not None:
+        el.remove(style)
+
+
 def _add_text_box(slide, tb: StyledTextBox, degradations: list[Degradation], fonts: set[str]) -> None:
     b = tb.box
     shape = slide.shapes.add_textbox(Emu(pt_to_emu(b.x)), Emu(pt_to_emu(b.y)), Emu(pt_to_emu(b.w)), Emu(pt_to_emu(b.h)))
@@ -114,6 +123,7 @@ def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradatio
             y0, y1 = (b.y + b.h, b.y) if b.rotation else (b.y, b.y + b.h)
             line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, x, Emu(pt_to_emu(y0)), Emu(pt_to_emu(b.x + b.w)), Emu(pt_to_emu(y1)))
             line.name = item.id
+            _drop_style(line)
             if item.stroke:
                 line.line.color.rgb = RGBColor(item.stroke.r, item.stroke.g, item.stroke.b)
             line.line.width = Pt(item.stroke_width_pt or 1.0)
@@ -125,6 +135,7 @@ def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradatio
                 # 圓角比例 = 半徑 ÷ 短邊（PowerPoint 的 adj 值，0 到 0.5）
                 shape.adjustments[0] = max(0.0, min(0.5, item.corner_radius_pt / max(min(b.w, b.h), 1e-6)))
             shape.shadow.inherit = False  # 不套主題預設的陰影
+            _drop_style(shape)
             if b.rotation:
                 shape.rotation = b.rotation
             if item.fill:
@@ -210,6 +221,7 @@ def _add_path(slide, shape, degradations: list[Degradation]) -> None:
     sp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Emu(pt_to_emu(b.x)), Emu(pt_to_emu(b.y)), Emu(max(1, pt_to_emu(b.w))), Emu(max(1, pt_to_emu(b.h))))
     sp.name = shape.id
     sp.shadow.inherit = False
+    _drop_style(sp)
     spPr = sp._element.spPr
     prst = spPr.find(qn("a:prstGeom"))
     cust = etree.Element(qn("a:custGeom"))
