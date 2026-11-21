@@ -10,7 +10,9 @@
 1. **偵測**：PP-OCRv6 small 偵測模型（DB，可微分二值化），以 onnxruntime 執行。
    - 影像長邊不超過 det_tile_threshold：整張一次（短邊過小時先放大到 det_min_side）。
    - 更大的影像：原解析度切成互相重疊的方塊各跑一次，另外整頁縮小再跑一次抓大標題；
-     不同方塊、不同尺度找到的框，若共線且沿行方向重疊，就以聯集合併（union-find）。
+     不同方塊、不同尺度找到的框（以及同一次偵測中互相重疊的大字碎片），
+     若共線且沿行方向重疊，就以聯集合併（union-find）。辨識之後，同一基線上間隙小於
+     line_merge_gap_em 的兩行再合併一次（偵測模型常在中英之間的大字距處斷行）。
    - DB 後處理自己寫（機率圖二值化 → 輪廓 → 最小外接矩形 → 依 DB 論文公式外擴），
      不依賴 pyclipper／shapely。
 2. **方向**：框高明顯大於框寬時，同時試 0、90、270 度三種讀法，取平均字機率最高者
@@ -50,6 +52,14 @@
 - 斜體字的字界：直行投影對斜體會相黏，字界取谷底，誤差較大（x_error 會變大）。
 - CTC 的「漏讀」（某時間步 blank 第一、某字第二）目前不表達成候選，只有「多讀」用 "" 候選表達。
 - 1 到 2 個字的短行，角度沿用整頁主要角度；整頁只有短行時沿用偵測框角度。
+- 空白判斷依賴字界：模型漏掉空白、而且字界初值被拉偏時，仍可能漏空白（實測 doc_a4 的
+  「上半年 H1」讀成「上半年H1」）；模糊影像的空白錯誤率明顯升高（見測試數字）。
+- 全形標點常被讀成半形（「（萬元）」→「(萬元)」），候選擴充表（繁簡、全半形）屬⑤之前的
+  後續層級，這裡不做；簡繁混淆（「參」→「参」、「輸」→「输」）同理，只留在候選清單中。
+- 墨跡四角與「字型上緣到下緣」的行框本質不同：極短的行（「致。」、頁碼「1」）與 PDF 行框的
+  IoU 可能低於 0.5，評測時會被算成漏偵測。
+- 低解析度（墨跡行高低於約 8 像素）時，模型會在字間多讀空白，字界量測也不夠準去刪掉它們；
+  這些行會標「低解析度」並降信心。
 
 可單獨升級的點
 --------------
@@ -86,6 +96,7 @@ DEFAULT_PARAMS: dict = {
     "rec_model_path": None,  # 辨識模型 ONNX 路徑；None 表示用 rapidocr 內附的 PP-OCRv6 small
     "cls_model_path": None,  # 方向分類模型 ONNX 路徑；None 表示用 rapidocr 內附的 mobile v2.0
     "num_threads": 0,  # onnxruntime 執行緒數（個）；0 表示由 onnxruntime 自行決定
+    "ort_allow_spinning": False,  # onnxruntime 執行緒空等時是否自旋；共用機器上關掉可省約 25% CPU，專屬伺服器可開
     # ---- 偵測：尺度與切塊
     "det_min_side": 736,  # 影像短邊小於此值（像素）時先放大再偵測（PP-OCR 慣例）
     "det_max_upscale": 2.0,  # 偵測前放大倍率上限（倍）
@@ -271,6 +282,7 @@ def _session(path: Path, p: dict) -> ort.InferenceSession:
     if p["num_threads"] and p["num_threads"] > 0:
         so.intra_op_num_threads = int(p["num_threads"])
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.add_session_config_entry("session.intra_op.allow_spinning", "1" if p["ort_allow_spinning"] else "0")
     return ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
 
 
@@ -510,9 +522,8 @@ class OcrEngine:
                 pts[:, 0] = (pts[:, 0] + 0.5) * (w / rw) + x0
                 pts[:, 1] = (pts[:, 1] + 0.5) * (h / rh) + y0
                 boxes.append(_DetBox(pts, score, pid))
-        if len(passes) > 1:
-            boxes = _merge_det_boxes(boxes, p)
-        return boxes
+        # 不同切塊、不同尺度的同一行要合併；同一次偵測中互相重疊的共線框（大字的斷行碎片）也合併
+        return _merge_det_boxes(boxes, p)
 
     # ------------------------------------------------------------------ 方向分類
 
@@ -669,7 +680,7 @@ def _merge_det_boxes(boxes: list[_DetBox], p: dict) -> list[_DetBox]:
         ov = (aabb[:, 0] <= aabb[i, 2]) & (aabb[:, 2] >= aabb[i, 0]) & (aabb[:, 1] <= aabb[i, 3]) & (aabb[:, 3] >= aabb[i, 1])
         for j in np.nonzero(ov)[0]:
             j = int(j)
-            if j <= i or boxes[j].pass_id == boxes[i].pass_id:
+            if j <= i:
                 continue
             if _same_line(geo[i], geo[j], p):
                 ri, rj = find(i), find(j)
@@ -1209,6 +1220,10 @@ def _text_likeness(c: _Cand, text: str, em: float, p: dict) -> tuple[float, dict
 def _space_thresholds(a: str, b: str, p: dict) -> tuple[float, float]:
     """兩個相鄰字之間補入與刪除空白的間隙門檻（em）。"""
     if _is_fullwidth_punct(a) or _is_fullwidth_punct(b):
+        return p["space_fw_insert_em"], p["space_fw_remove_em"]
+    # 中文字旁的半形標點常是把全形標點讀成半形（例如「（」讀成「(」），字形內建留白，門檻比照全形
+    punct = lambda c: unicodedata.category(c)[0] == "P"  # noqa: E731
+    if (_is_wide(a) and punct(b)) or (punct(a) and _is_wide(b)):
         return p["space_fw_insert_em"], p["space_fw_remove_em"]
     if _is_wide(a) and _is_wide(b):
         return p["space_cjk_insert_em"], p["space_cjk_remove_em"]

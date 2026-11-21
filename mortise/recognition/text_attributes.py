@@ -29,8 +29,9 @@
     e. 底線與刪除線：水平開運算（長度 1.5 個字級）挑出長橫線候選；先從遮罩拿掉再量測，
        量出基線後依位置分類（基線下方 0.03 到 0.3 個字級為底線；基線上方 0.1 到 0.6 個字級且連續跨過
        字間空隙為刪除線）；其他位置的長橫線若沒有超出文字範圍就放回遮罩（可能是字形本身的橫筆）。
-(2) 顏色：從工作影像原始像素（最近鄰，不經內插）取樣。遮罩內縮（筆畫粗細的 25 %，至少 1 px）
-    後取各色版中位數；核心像素不足時，取覆蓋率投影最高的 5 % 像素的中位數（極值法），信心值降低。
+(2) 顏色：從工作影像原始像素（最近鄰，不經內插）取樣。遮罩內縮（筆畫粗細的 25 %，至少半個影像像素）
+    後取各色版中位數；核心像素不足或筆畫細於 thin_stroke_px 時，取覆蓋率投影最高的 5 % 像素的中位數
+    （極值法），再以「線寬 w、模糊 σ 的峰值覆蓋率 erf(w ÷ 2√2σ)」從鄰近底色外插回筆色，信心值降低。
     鄰近背景色取遮罩外擴 2 到 6 px 的環狀區域中位數。
 (3) 字級與字型聯合求解（檢索加重繪比對）
     a. 單位切分：以空白與文字類別（全形字／其他）把行切成「單位」（拉丁的詞、中文的連續全形字）。
@@ -48,13 +49,18 @@
        c_i = c0 + i·p 求間距 p（標點不參與）；字級 = p ÷ 該字型的平均前進寬度（全形字為 1 em）。
        與高度證據比對：不一致超過 tracking_tol 就是「調字距嫌疑」，差值記成字距原始量測。
        間距變異超過 pitch_cv_max 判為「比例寬度嫌疑」，不用捷徑。
-    f. 量度分數 = 垂直吻合 × 寬高吻合 × 傾斜吻合；取前 topk_redraw 名（並補上前幾名字族的粗體、
-       斜體樣式），以各自解出的字級用 FreeType 逐單位重繪、做同等模糊、對齊後與遮罩比「軟重疊率」
-       （Σmin ÷ Σmax）。綜合分數 = metric_weight × 量度分數 + redraw_weight × 重繪分數。
+    f. 量度分數 = 垂直吻合 × 寬高吻合 × 傾斜吻合 × 粗細吻合（筆畫粗細比與字型探針的同一估計法相比）；
+       斜體字型的傾斜以「同一個量法量它自己的重繪」為準（字型檔的 italicAngle 與墨跡傾斜常不同）。
+    g. 模糊校準與自我校正：以量度第一名重繪，搜尋讓重疊率最高的額外高斯模糊；再把它以同樣的模糊畫出、
+       用同一套量法量回來，量到的字級 ÷ 畫的字級就是模糊（與放大取樣）造成的偏差，所有候選的高度與寬度
+       證據都除以這個偏差（誤差另加偏差量的 bias_unc 倍）。
+    h. 重繪比對：取前 topk_redraw 名（並補上前幾名字族的粗體、斜體樣式），以各自解出的字級用 FreeType
+       逐單位重繪（調字距時全形字逐字放在間距格點上）、做同等模糊、在小範圍的垂直位移與縮放中取
+       「軟重疊率」（Σmin ÷ Σmax）的最大值。綜合分數 = metric_weight × 量度分數 + redraw_weight × 重繪分數。
 (4) 其他屬性
     - 斜體：把覆蓋率遮罩以各角度反向推斜，取欄投影「集中度」（Σp² ÷ (Σp)²）最高的角度，拋物線內插；
       誤差取集中度曲線的半寬。
-    - 粗體：筆畫粗細（距離轉換脊線中位數 × 2 − 1）與最佳字族 Regular、Bold 以同字級重繪（同等模糊）
+    - 粗體：筆畫粗細（2 × 覆蓋率總和 ÷ 總變差，對模糊不敏感）與最佳字族 Regular、Bold 以同字級重繪（同等模糊）
       的粗細比較，再加上兩者重繪重疊率的差。沒有 Bold 字型時以 bold_stem_ratio 推估。
     - 行內分段：先依文字類別（全形／拉丁）切，再對單位序列的「核心顏色、高度字級」做二元切分的
       改變點偵測（每切一刀要有 run_split_penalty 的證據），每段各自求解一次。
@@ -182,6 +188,9 @@ DEFAULT_PARAMS: dict = {
     "split_by_script": True,  # 全形字與拉丁文字分段量測
     # ---------------- 信心值
     "conf_rel_scale": 0.06,  # 字級相對誤差達此值時信心值約 0.37（exp(−1)）
+    # ---------------- 除錯
+    "debug": False,  # True 時印出每一段的候選字型評分（開發用）
+    "debug_family": None,  # 除錯時額外印出這個字族的評分
 }
 
 _DESCENDERS = set("gjpqy,;Q()[]{}|/@$")
@@ -235,6 +244,7 @@ class _Unit:
     a: float = 0.0  # 墨跡左緣（mask x）
     b: float = 0.0  # 墨跡右緣
     exact: bool = False  # 左右緣由空隙定出（可用於寬度證據）
+    center: Optional[float] = None  # 重繪時以墨跡中心對齊（調字距時逐字放在間距格點上）
 
 
 @dataclass
@@ -1010,10 +1020,22 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
     elif justified:
         for e in evals:
             _combine(e, P, use_width=True)
+    # ---- 重繪用的單位：調字距時，全形字逐字放在量到的間距格點上（否則整段縮放會對不齊）
+    r_units = units
+    if tracking and pitch and not pitch.get("proportional"):
+        r_units = []
+        for u in units:
+            pr = next((q for uu, q in pitch["items"] if uu is u), None)
+            if pr is None:
+                r_units.append(u)
+                continue
+            for k in range(u.i1 - u.i0):
+                c = pr["c0"] + k * pr["p"]
+                r_units.append(_Unit(u.i0 + k, u.i0 + k + 1, True, c - 0.5 * pr["p"], c + 0.5 * pr["p"], False, c))
     # ---- 重繪比對
     cands = _redraw_candidates(evals, fonts, P)
     for e in cands:
-        e.redraw_iou = _redraw_score(e, units, text, mk, slant if e.synthetic_slant else 0.0, P)
+        e.redraw_iou = _redraw_score(e, r_units, text, mk, slant if e.synthetic_slant else 0.0, P)
         lo_, hi_ = P["redraw_iou_floor"], P["redraw_iou_ref"]
         e.redraw = float(np.clip((e.redraw_iou - lo_) / (hi_ - lo_), 0, 1))
         e.score = P["metric_weight"] * e.metric + P["redraw_weight"] * e.redraw
@@ -1079,7 +1101,7 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
     if eq:
         notes.append("量度等價（字寬相容）：" + "、".join(sorted({x.family for x in eq})))
     # ---- 粗體
-    bold, sw_est = _bold(mk, units, text, best, fonts, slant if best.synthetic_slant else 0.0, P, notes, f)
+    bold, sw_est = _bold(mk, r_units, text, best, fonts, slant if best.synthetic_slant else 0.0, P, notes, f)
     # ---- 斜體
     conf_it = 0.5 + 0.5 * math.tanh(abs(slant - P["italic_min_slant"]) / max(sig_slant, 1.0))
     conf_it *= 0.6 + 0.4 * min(1.0, slant_q * 20)
@@ -1308,11 +1330,12 @@ def _render_run(e: _FaceEval, units: list[_Unit], text: str, shape: tuple[int, i
         if rl is None or rr is None or rr - rl < 0.5:
             continue
         xs = 1.0
-        if u.exact:
+        if u.exact and u.center is None:
             xs = float(np.clip((u.b - u.a) / (rr - rl), 0.85, 1.15))
-        xc = 0.5 * (u.a + u.b)
+        xc = 0.5 * (u.a + u.b) if u.center is None else u.center
         yb = e.base_b + e.base_t * (xc - e.xm)
-        tm = np.float32([[xs, 0, u.a - rl * xs], [0, 1, yb - rt.baseline_y]])
+        dx = u.a - rl * xs if u.center is None else u.center - 0.5 * (rl + rr)
+        tm = np.float32([[xs, 0, dx], [0, 1, yb - rt.baseline_y]])
         warped = cv2.warpAffine(m, tm, (shape[1], shape[0]), flags=cv2.INTER_LINEAR, borderValue=0)
         np.maximum(canvas, warped, out=canvas)
     return canvas

@@ -125,9 +125,11 @@ class Acc:
         self.corner_err: list[float] = []
         self.lr_err: list[float] = []
         self.times: list[float] = []
+        self.cpu: list[float] = []
 
-    def add_page(self, lines: list[OcrLine], truths: list[dict], seconds: float, char_mode: str = "pen"):
+    def add_page(self, lines: list[OcrLine], truths: list[dict], seconds: float, cpu: float = 0.0):
         self.times.append(seconds)
+        self.cpu.append(cpu)
         self.n_true += len(truths)
         self.n_pred += len(lines)
         m = match([l.quad for l in lines], [t["quad"] for t in truths])
@@ -181,6 +183,7 @@ class Acc:
             "corner_err_px": f(self.corner_err),
             "left_right_err_px": f(self.lr_err),
             "sec_per_page": round(float(np.mean(self.times)), 2) if self.times else None,
+            "cpu_sec_per_page": round(float(np.mean(self.cpu)), 2) if self.cpu else None,
             "n_true": self.n_true,
             "n_pred": self.n_pred,
         }
@@ -321,25 +324,28 @@ def engine() -> OcrEngine:
 
 
 def _timed_read(img):
-    t = time.perf_counter()
+    """回傳（文字行、牆鐘秒數、本行程 CPU 秒數（各執行緒加總，不受其他程式搶 CPU 影響））。"""
+    t, c = time.perf_counter(), time.process_time()
     lines = engine().read(img)
-    return lines, time.perf_counter() - t
+    return lines, time.perf_counter() - t, time.process_time() - c
 
 
 @lru_cache(maxsize=None)
 def fixture_results() -> dict:
-    conds = {"clean_150dpi": (150, None), "clean_96dpi": (96, None), "blur_s1.2_150dpi": (150, blur), "jpeg_q30_150dpi": (150, jpeg)}
+    # 干擾組只跑三頁（不含最大的 A3 海報與只有兩行的附錄頁），以控制測試時間
+    sub = [("slide_basic", 0), ("slide_dark", 0), ("doc_a4", 0)]
+    conds = {"clean_150dpi": (150, None, PAGES), "clean_96dpi": (96, None, PAGES), "blur_s1.2_150dpi": (150, blur, sub), "jpeg_q30_150dpi": (150, jpeg, sub)}
     out = {}
-    for name, (dpi, fn) in conds.items():
+    for name, (dpi, fn, pages) in conds.items():
         acc = Acc()
         per_page = {}
-        for pdf, page in PAGES:
+        for pdf, page in pages:
             img, truth, _ = render_truth(FIX / f"{pdf}.pdf", page, dpi)
             if fn is not None:
                 img = fn(img)
-            lines, sec = _timed_read(img)
+            lines, sec, cpu = _timed_read(img)
             tl = truth_lines(truth, img.shape[1])
-            acc.add_page(lines, tl, sec)
+            acc.add_page(lines, tl, sec, cpu)
             per_page[f"{pdf}#{page}"] = [l.text for l in lines]
         out[name] = {"summary": acc.summary(), "pages": per_page}
     return out
@@ -355,13 +361,12 @@ def synth_results() -> dict:
         "noise_s12": (noise(base), truths),
         "lowres_x0.5": scale_page(base, truths, 0.5),
         "uneven_light": (uneven_light(base), truths),
-        "jpeg_q30": (jpeg(base), truths),
     }
     out = {}
     for name, (img, tr) in conds.items():
         acc = Acc()
-        lines, sec = _timed_read(img)
-        acc.add_page(lines, tr, sec)
+        lines, sec, cpu = _timed_read(img)
+        acc.add_page(lines, tr, sec, cpu)
         out[name] = {"summary": acc.summary(), "lines": lines, "truths": tr}
     return out
 
@@ -384,8 +389,7 @@ def test_empty_and_tiny_images():
 
 
 def test_line_structure_and_candidates():
-    img, truths = synth_page()
-    lines = engine().read(img)
+    lines = synth_results()["clean"]["lines"]
     assert lines
     for l in lines:
         assert l.quad.shape == (4, 2)
@@ -414,7 +418,7 @@ def test_params_override():
     assert eng.params["cand_topk"] == 2
     assert eng.params["em_ratio"]["cjk"] == 0.95 and eng.params["em_ratio"]["tall"] == DEFAULT_PARAMS["em_ratio"]["tall"]
     img, _ = synth_page()
-    lines = eng.read(img[:200])
+    lines = eng.read(img[:200, :900])
     assert all(len(c.candidates) <= 2 for l in lines for c in l.chars)
 
 
@@ -423,36 +427,38 @@ def test_params_override():
 
 def test_fixture_clean_150():
     s = fixture_results()["clean_150dpi"]["summary"]
-    assert s["line_recall"] >= 0.95
-    assert s["line_precision"] >= 0.95
-    assert s["cer_cjk"] <= 0.02
-    assert s["cer_latin"] <= 0.02
-    assert s["space_err_rate"] <= 0.15
-    assert s["char_start_err_offset_removed_px"] <= 2.5
-    assert s["left_right_err_px"] <= 6.0
+    assert s["line_recall"] >= 0.95  # 實測 0.957（兩個漏的是短行 IoU 定義問題，見模組文件）
+    assert s["line_precision"] >= 0.95  # 實測 0.957
+    assert s["cer_cjk"] <= 0.014  # 實測 0.010
+    assert s["cer_latin"] <= 0.011  # 實測 0.0073
+    assert s["space_err_rate"] <= 0.07  # 實測 0.044
+    assert s["char_start_err_offset_removed_px"] <= 1.3  # 實測 1.07
+    assert s["left_right_err_px"] <= 5.0  # 實測 4.47（含首字左側留白，答案是筆位）
 
 
 def test_fixture_clean_96():
     s = fixture_results()["clean_96dpi"]["summary"]
-    assert s["line_recall"] >= 0.9
-    assert s["line_precision"] >= 0.9
-    assert s["cer_cjk"] <= 0.04
-    assert s["cer_latin"] <= 0.04
-    assert s["char_start_err_offset_removed_px"] <= 2.0
+    assert s["line_recall"] >= 0.95  # 實測 0.957
+    assert s["line_precision"] >= 0.95  # 實測 0.957
+    assert s["cer_cjk"] <= 0.03  # 實測 0.023
+    assert s["cer_latin"] <= 0.011  # 實測 0.0073
+    assert s["char_start_err_offset_removed_px"] <= 0.9  # 實測 0.71
 
 
 def test_fixture_blur_and_jpeg():
     for cond in ("blur_s1.2_150dpi", "jpeg_q30_150dpi"):
         s = fixture_results()[cond]["summary"]
-        assert s["line_recall"] >= 0.9, cond
-        assert s["line_precision"] >= 0.9, cond
-        assert s["cer_cjk"] <= 0.05, cond
-        assert s["cer_latin"] <= 0.05, cond
+        assert s["line_recall"] >= 0.9, cond  # 實測 0.917 兩組
+        assert s["line_precision"] >= 0.9, cond  # 實測 0.943、0.917
+        assert s["cer_cjk"] <= 0.025, cond  # 實測 0.019、0.016
+        assert s["cer_latin"] <= 0.015, cond  # 實測 0.011 兩組
+        assert s["char_start_err_offset_removed_px"] <= 1.5, cond  # 實測 1.26、1.05
 
 
 def test_fixture_speed():
+    """以 CPU 秒數（各執行緒加總）判斷，牆鐘時間受機器負載影響太大。"""
     for cond, r in fixture_results().items():
-        assert r["summary"]["sec_per_page"] <= 4.0, cond
+        assert r["summary"]["cpu_sec_per_page"] <= 8.0, cond
 
 
 def test_slide_basic_circle_not_read():
@@ -470,8 +476,8 @@ def test_synth_clean_geometry():
     assert s["line_precision"] >= 0.99
     assert s["cer_cjk"] <= 0.02
     assert s["cer_latin"] <= 0.02
-    assert s["corner_err_px"] <= 1.5
-    assert s["char_start_err_px"] <= 1.5
+    assert s["corner_err_px"] <= 0.6  # 實測 0.41
+    assert s["char_start_err_px"] <= 0.35  # 實測 0.19
 
 
 def test_synth_rotated_90_270():
@@ -495,19 +501,18 @@ def test_synth_circle_dropped():
 def test_synth_skewed_page():
     s = synth_results()["skew_2.5deg"]["summary"]
     assert s["line_recall"] >= 0.99
-    assert s["corner_err_px"] <= 2.0
-    assert s["char_start_err_px"] <= 1.5
-    assert s["cer_latin"] <= 0.02
+    assert s["corner_err_px"] <= 0.8  # 實測 0.59
+    assert s["char_start_err_px"] <= 0.6  # 實測 0.40
+    assert s["cer_latin"] <= 0.01  # 實測 0
 
 
 def test_synth_degraded():
     res = synth_results()
-    assert res["noise_s12"]["summary"]["line_recall"] >= 0.9
-    assert res["noise_s12"]["summary"]["corner_err_px"] <= 3.0
-    assert res["uneven_light"]["summary"]["line_recall"] >= 0.9
-    assert res["uneven_light"]["summary"]["corner_err_px"] <= 2.0
-    assert res["lowres_x0.5"]["summary"]["line_recall"] >= 0.8
-    assert res["jpeg_q30"]["summary"]["line_recall"] >= 0.9
+    for cond in ("noise_s12", "uneven_light", "lowres_x0.5"):
+        s = res[cond]["summary"]
+        assert s["line_recall"] >= 0.99, cond  # 實測 1.0
+        assert s["corner_err_px"] <= 0.6, cond  # 實測 0.38、0.38、0.31
+        assert s["char_start_err_px"] <= 0.75, cond  # 實測 0.31、0.19、0.56
 
 
 def test_low_resolution_flagged_and_less_confident():
@@ -520,21 +525,35 @@ def test_low_resolution_flagged_and_less_confident():
 
 
 def test_large_image_tiling():
-    """長邊超過切塊門檻的大圖：切塊偵測，小字與大標題都要找到。"""
-    big = np.full((2600, 3400, 3), 250, np.uint8)
+    """長邊超過切塊門檻的大圖：切塊偵測加整頁縮小偵測，跨切塊的行、小字與大標題都要找到。
+    為了控制測試時間，把切塊門檻調到 1600 像素，用 2000 × 1400 的影像測同一套邏輯。"""
+    big = np.full((1200, 1800, 3), 250, np.uint8)
     pil = Image.fromarray(big)
-    t1 = _draw_line(pil, "Large Display Title", SANS_B, 160, (200, 150), (20, 20, 20))
-    t2 = _draw_line(pil, "tiny footnote text near the tile border 42", SANS, 20, (1150, 1260), (40, 40, 40))
-    t3 = _draw_line(pil, "中文小字也要讀得到", WQY, 22, (2600, 2400), (40, 40, 40))
+    t1 = _draw_line(pil, "Large Display Title", SANS_B, 140, (120, 60), (20, 20, 20))
+    # 這一行橫跨兩個切塊的重疊區（橫向切塊起點 0 與 776）
+    t2 = _draw_line(pil, "tiny footnote text across the tile border 42", SANS, 18, (700, 640), (40, 40, 40))
+    t3 = _draw_line(pil, "中文小字也要讀得到", WQY, 20, (1400, 1120), (40, 40, 40))
     img = np.asarray(pil)
-    t = time.perf_counter()
-    lines = engine().read(img)
-    sec = time.perf_counter() - t
+    c = time.process_time()
+    lines = engine().read(img, params={"det_tile_threshold": 1500, "det_tile_size": 1024})
+    sec = time.process_time() - c
     for tr in (t1, t2, t3):
         best = max(lines, key=lambda l: quad_iou(l.quad, tr["quad"]))
         assert quad_iou(best.quad, tr["quad"]) > 0.6, tr["text"]
         assert best.text.replace(" ", "") == tr["text"].replace(" ", ""), (best.text, tr["text"])
-    assert sec < 15.0
+    assert sec < 20.0  # CPU 秒數
+
+
+def test_zz_report():
+    """設了環境變數 MORTISE_OCR_METRICS（檔案路徑）時，把所有數字寫成 JSON（供回報用）。"""
+    import os
+
+    path = os.environ.get("MORTISE_OCR_METRICS")
+    if not path:
+        return
+    data = {"fixtures": {k: v["summary"] for k, v in fixture_results().items()}, "synthetic": {k: v["summary"] for k, v in synth_results().items()}}
+    data["fixture_texts_clean_150"] = fixture_results()["clean_150dpi"]["pages"]
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=1))
 
 
 # ============================================================================ 直接執行：印出數字

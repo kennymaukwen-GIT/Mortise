@@ -176,7 +176,7 @@ class PageQuad:
     notes: list[str] = field(default_factory=list)
     corner_error_px: Optional[np.ndarray] = None  # (4,)：每個角的位置誤差（像素，約一個標準差）
     aspect: Optional[Estimate] = None  # 長寬比（高 ÷ 寬）的量測值、誤差範圍、信心值
-    aspect_method: str = ""  # "perspective"（由透視反推焦距）、"side_ratio"（退回邊長比）、"image"（整張圖）
+    aspect_method: str = ""  # "perspective"（由四角反推焦距）、"known_focal"（用已知焦距）、"side_ratio"（近乎正面，退回邊長比）、"focal_prior"（單向透視，用焦距先驗範圍）、"image"（整張圖）
     focal_px: Optional[float] = None  # 由四角反推的焦距（像素）；解不穩定時留空
     edge_support: Optional[list[float]] = None  # 上、右、下、左四邊有邊緣支持的長度比例（0 到 1）
 
