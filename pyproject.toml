@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mortise"
+version = "0.1.0"
+description = "Mortise：把不可編輯的文件還原成可編輯、排版一致的檔案"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6",
+  "pypdfium2>=5.0",
+  "python-pptx>=1.0",
+  "lxml>=5.0",
+  "pillow>=10.0",
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.29", "python-multipart>=0.0.9"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+mortise = "mortise.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mortise*"]
+
+[tool.setuptools.package-data]
+mortise = ["config/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

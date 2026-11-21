@@ -1,0 +1,88 @@
+# Mortise 設定檔：門檻、容差、吸附表。每個階段一節；改某一節只會讓該階段之後重跑。
+# 標示「初始值」的數字是工程判斷，待評測調整。
+
+[input]                              # ① 輸入
+max_file_mb = 100                    # 檔案大小上限（MB）
+max_pages = 200                      # 頁數上限
+max_image_megapixels = 100           # 單張影像像素上限（百萬像素）
+native_min_chars = 5                 # 一頁至少幾個真文字字元才算原生 PDF（初始值）
+scan_image_coverage = 0.85           # 單張圖佔頁面面積超過此比例，視為掃描頁（初始值）
+hidden_text_ratio = 0.8              # 不可見文字超過此比例，判為 OCR 文字層（初始值）
+unicode_error_ratio = 0.3            # 缺 Unicode 對照的字元超過此比例，改走影像產線（初始值）
+
+[page]                               # ② 頁面
+working_dpi = 150                    # 工作影像解析度（dpi）
+max_working_pixels = 40000000        # 工作影像像素上限
+assumed_image_dpi = 96               # 影像沒有尺寸資訊時假設的 dpi（信心值低）
+
+[recognize]                          # ③ 辨識
+line_gap_factor = 1.5                # 同一基線上兩字間距超過「字級 × 此值」就拆成兩行
+baseline_tolerance = 0.25            # 基線高度差超過「字級 × 此值」視為不同行
+background_blank_tolerance = 6       # 背景與底色的像素差在此值以內視為空白（0 到 255）
+background_blank_ratio = 0.0005      # 超出容差的像素比例低於此值，就不輸出底圖
+full_page_coverage = 0.98            # 矩形或圖片佔頁面比例超過此值，視為整頁底
+min_image_pixels = 4                 # 寬或高小於此像素的圖片忽略
+
+[structure]                          # ④ 結構
+paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）
+line_pitch_tolerance = 0.12          # 行距一致性的容差（比例）
+left_align_tolerance = 0.006         # 左緣對齊的容差（頁寬比例）
+short_line_ratio = 0.82              # 行寬小於「段落寬 × 此值」視為段落最後一行（初始值）
+size_tolerance = 0.03                # 字級相同的容差（比例）
+title_size_ratio = 1.4               # 字級超過內文中位數此倍數，候選為標題
+page_number_band = 0.12              # 頁面底部此比例高度內的短數字，候選為頁碼
+master_min_pages = 3                 # 至少幾頁才做跨頁母片分析
+master_repeat_ratio = 0.6            # 元素在超過此比例的頁面重複出現，列為母片候選
+
+[settings]                           # ⑤ 設定
+size_snap_step_pt = 0.5              # 字級吸附的格距（pt）
+size_snap_tolerance_pt = 0.06        # 距離格點在此值以內才吸附；否則保留原值（「不吸附」永遠是候選）
+page_snap_tolerance_pt = 0.5         # 頁面尺寸吸附到標準規格的容差（pt）
+line_spacing_candidates = [1.0, 1.15, 1.2, 1.5, 2.0]  # 行距倍數候選
+line_spacing_tolerance = 0.03        # 行距倍數吸附的容差
+font_line_height = 1.2               # 不知道字型量度時，單倍行距約為字級的幾倍（初始值）
+box_width_slack_pt = 1.5             # 文字框寬度多留的餘裕（pt），降低目標軟體重新斷行的機率
+single_line_no_wrap = true           # 單行文字關閉自動換行
+
+[export]                             # ⑥ 輸出
+image_format = "png"
+
+[verify]                             # ⑦ 驗證
+render_dpi = 100                     # 比對用的渲染解析度（dpi）
+position_tolerance_pt = 1.5          # 位置誤差合格線（pt，初始值）
+position_fix_threshold_pt = 0.3      # 位置誤差超過此值就開修正單把文字框移回去（pt，初始值）
+similarity_pass = 0.97               # 整頁相似度合格線（0 到 1，初始值）
+max_rounds = 2                       # 修正迴圈最多幾輪
+libreoffice_timeout_s = 120          # 目標渲染逾時（秒）
+
+# 字型對應表：推論的字型 → 伺服器上拿來驗證的開放授權字型。
+[fonts.substitutes]
+"Calibri" = "Carlito"
+"Cambria" = "Caladea"
+"Arial" = "Liberation Sans"
+"Helvetica" = "Liberation Sans"
+"Times New Roman" = "Liberation Serif"
+"Times" = "Liberation Serif"
+"Courier New" = "Liberation Mono"
+"Courier" = "Liberation Mono"
+"Microsoft JhengHei" = "Noto Sans TC"
+"微軟正黑體" = "Noto Sans TC"
+"PMingLiU" = "Noto Serif TC"
+"新細明體" = "Noto Serif TC"
+"MingLiU" = "Noto Serif TC"
+"細明體" = "Noto Serif TC"
+"DFKai-SB" = "LXGW WenKai TC"
+"標楷體" = "LXGW WenKai TC"
+
+# 標準頁面尺寸（pt）：寬、高。可自行加入台灣常見印刷規格。
+[page_sizes]
+"16:9 簡報" = [960.0, 540.0]
+"4:3 簡報" = [720.0, 540.0]
+"16:10 簡報" = [960.0, 600.0]
+"A4 直" = [595.276, 841.89]
+"A4 橫" = [841.89, 595.276]
+"A3 直" = [841.89, 1190.551]
+"A3 橫" = [1190.551, 841.89]
+"A5 直" = [419.528, 595.276]
+"Letter 直" = [612.0, 792.0]
+"Letter 橫" = [792.0, 612.0]
