@@ -33,8 +33,10 @@
 單一樣本（或單一評測）失敗不會中斷整批：錯誤記在該樣本的 errors 與總表的 errors，然後繼續。
 
 已知限制：
-- 影像產線目前是暫時版（整頁當成一張圖），所以合成評測的文字指標接近 0、整頁點陣化比例為 1，這是正常的；
-  影像辨識模組接上之後不必修改本模組就會反映進步。
+- 本模組一律透過 Pipeline 評測，不直接呼叫任何辨識模組：影像產線若還是暫時版（整頁當成一張圖），
+  合成評測的文字指標為 0、整頁點陣化比例為 1；影像辨識模組接上之後不必修改本模組就會反映進步
+  （2026-11-21 開發期間影像產線已接上，基準數字見 summary.md）。
+- 影像產線接上後，每個合成評測要跑一次完整辨識（每頁約 10 到 60 秒），四份 fixture 加三種干擾約 6 分鐘。
 - 擷取產線的標準答案缺圓形、圓角矩形與複雜路徑（它們留在底圖），旋轉文字的標準答案可能不可靠。
 - 多頁 PDF 的自我監督預設最多評前 max_pages_per_sample 頁。
 
@@ -59,7 +61,7 @@ import numpy as np
 from PIL import Image
 
 from ..artifacts import (
-    Color, ElementList, FidelityReport, FontCandidate, ImageElement, ImageKind, InputType, Intent, Layout, Measured, OutputFormat,
+    Color, ElementList, FidelityReport, FontCandidate, ImageElement, ImageKind, InputType, Intent, Layout, OutputFormat,
     PageSpec, Point, Provenance, Quad, ShapeElement, ShapeGeometry, SourceDoc, StyledDoc, TextLine, TextRun, BlobRef, measured,
 )
 from ..artifacts.layout import PageLayout

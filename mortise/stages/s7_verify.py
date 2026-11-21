@@ -185,7 +185,7 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
                 image = reader.render(c["render_dpi"])
             finally:
                 reader.close()
-            working = Image.open(store.blob_path(spec.working_image))
+            working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
             sim = similarity(working, image)
             issues = list(report.issues)
             if sim < c.get("neutral_similarity_pass", 0.95):
@@ -221,7 +221,7 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                     r_lines = [t for t in s3_recognize.read_text_lines(reader, spec.page_index, matrix, dw, rc) if not t.hidden]
                 finally:
                     reader.close()
-                working = Image.open(store.blob_path(spec.working_image))
+                working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
                 sim = similarity(working, image)
                 sp = styled.pages[spec.page_index]
                 w = sp.width_pt

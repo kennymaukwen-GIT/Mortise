@@ -107,6 +107,11 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
         if top and top["confidence"] >= c.get("size_auto_accept", 0.6):
             file_width = measured(top["width_pt"], top["confidence"], Provenance.INFERRED, w_step)
             notes.append(f"尺寸推論為「{top['name']}」（{top['reason']}）。如果不對，請輸入實際尺寸。")
+        elif top and top.get("verdict") == "ambiguous" and top["confidence"] > 0.2:
+            # 長寬比對上了規格家族，但同家族的大小分不出來（單張照片的常態）：先預填第一名，請使用者確認
+            file_width = measured(top["width_pt"], top["confidence"], Provenance.INFERRED, w_step)
+            others = "、".join(x["name"] for x in size_candidates[1:3] if x["confidence"] > 0.05)
+            notes.append(f"長寬比符合「{top['name']}」，但單張影像量不出實際大小（也可能是 {others}）。已先用「{top['name']}」，請確認或輸入實際尺寸。")
         elif ref.dpi_hint and quad_method in ("full_image", ""):
             file_width = measured(pw * 72 / ref.dpi_hint, 0.4, Provenance.INFERRED, w_step)
             notes.append(f"尺寸依檔案標記的 {ref.dpi_hint:.0f} dpi 推算，可能不準，建議輸入實際尺寸。")
@@ -203,14 +208,29 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             notes += list(getattr(quad, "notes", []))
             notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
         color = Image.fromarray(np.ascontiguousarray(image_arr))
-        if kind in (InputType.PHOTO, InputType.SCANNED_PDF) and c.get("enhance_photos", True):
+        if kind in (InputType.PHOTO, InputType.SCANNED_PDF) and c.get("enhance_photos", True) and _paper_like(image_arr, c):
             work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
+            notes.append("頁面像一般紙張，已去陰影與白平衡後再辨識（量顏色仍用原圖）。")
         else:
             work = color
         _ASPECT_ERR[id(work)] = aspect_err
         return work, color, matrix, corners_l, aspect, method, conf, notes
     except Exception as e:  # 幾何處理失敗不中斷：退回整張圖
         return raw, raw, *full, "full_image", 0.3, [f"頁面幾何處理失敗（{e}），以整張圖為頁面。"]
+
+
+def _paper_like(arr, c: dict) -> bool:
+    """頁面是不是「白紙上印字」：最常見的顏色夠亮、幾乎沒有彩度。只有這種頁面才做白平衡與去陰影；
+    彩色海報、深色投影片做了反而會破壞顏色與對比（白字壓在彩色底上會變得看不清楚）。"""
+    import numpy as np
+
+    small = arr[:: max(1, arr.shape[0] // 200), :: max(1, arr.shape[1] // 200)].reshape(-1, 3).astype(np.int32)
+    q = (small // 16) * 16 + 8
+    keys, counts = np.unique(q, axis=0, return_counts=True)
+    dominant = keys[counts.argmax()]
+    share = counts.max() / counts.sum()
+    chroma = int(dominant.max() - dominant.min())
+    return share >= c.get("paper_min_share", 0.25) and dominant.mean() >= c.get("paper_min_brightness", 150) and chroma <= c.get("paper_max_chroma", 40)
 
 
 def _aspect_from_corners(corners) -> float:

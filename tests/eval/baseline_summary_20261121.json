@@ -1,0 +1,1604 @@
+{
+ "created": "2026-11-21T11:13:27",
+ "config_hash": "93b2060151bc82b2",
+ "n_samples": 4,
+ "n_evaluations": 16,
+ "n_failed_samples": 0,
+ "metric_meta": {
+  "composite": {
+   "label": "綜合分數",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "綜合",
+   "tolerance": 0.01
+  },
+  "text_recall": {
+   "label": "文字行召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.01
+  },
+  "text_precision": {
+   "label": "文字行精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.01
+  },
+  "text_f1": {
+   "label": "文字行 F1",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.01
+  },
+  "cer": {
+   "label": "字元錯誤率（已配對行，總體）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.005
+  },
+  "cer_zh": {
+   "label": "字元錯誤率（中文）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.005
+  },
+  "cer_en": {
+   "label": "字元錯誤率（英文與數字標點）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.005
+  },
+  "page_cer": {
+   "label": "整頁字元錯誤率（含漏抓多抓）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.01
+  },
+  "position_error_pt": {
+   "label": "文字行位置誤差（四角平均，與方向無關）",
+   "unit": "pt",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.25
+  },
+  "orientation_accuracy": {
+   "label": "文字方向正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.01
+  },
+  "baseline_error_pt": {
+   "label": "基線偏移",
+   "unit": "pt",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.25
+  },
+  "size_error_pt": {
+   "label": "字級誤差",
+   "unit": "pt",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.1
+  },
+  "size_error_pct": {
+   "label": "字級相對誤差",
+   "unit": "%",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 0.5
+  },
+  "font_top1": {
+   "label": "字型命中率（第一名）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.02
+  },
+  "font_top3": {
+   "label": "字型命中率（前三名）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.02
+  },
+  "color_delta_e": {
+   "label": "文字顏色差（CIE76 ΔE）",
+   "unit": "ΔE",
+   "higher_is_better": false,
+   "group": "文字",
+   "tolerance": 1.0
+  },
+  "bold_accuracy": {
+   "label": "粗體正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.02
+  },
+  "italic_accuracy": {
+   "label": "斜體正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "文字",
+   "tolerance": 0.02
+  },
+  "image_recall": {
+   "label": "圖片召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "圖形",
+   "tolerance": 0.02
+  },
+  "image_precision": {
+   "label": "圖片精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "圖形",
+   "tolerance": 0.02
+  },
+  "shape_recall": {
+   "label": "形狀召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "圖形",
+   "tolerance": 0.02
+  },
+  "shape_precision": {
+   "label": "形狀精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "圖形",
+   "tolerance": 0.02
+  },
+  "shape_kind_accuracy": {
+   "label": "形狀種類正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "圖形",
+   "tolerance": 0.02
+  },
+  "paragraph_pair_f1": {
+   "label": "段落分組成對 F1",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "結構",
+   "tolerance": 0.01
+  },
+  "boxes_per_paragraph": {
+   "label": "文字框數 ÷ 段落數（越低越不碎）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "結構",
+   "tolerance": 0.02
+  },
+  "box_count_error": {
+   "label": "文字框數相對誤差（與標準答案比）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "結構",
+   "tolerance": 0.02
+  },
+  "reading_order": {
+   "label": "閱讀順序一致率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "結構",
+   "tolerance": 0.01
+  },
+  "e2e_score": {
+   "label": "還原度總分（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "端到端",
+   "tolerance": 0.01
+  },
+  "e2e_similarity": {
+   "label": "整頁相似度（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "端到端",
+   "tolerance": 0.005
+  },
+  "e2e_text_match": {
+   "label": "文字一致率（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "端到端",
+   "tolerance": 0.01
+  },
+  "e2e_linebreak_match": {
+   "label": "斷行一致率（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "端到端",
+   "tolerance": 0.01
+  },
+  "e2e_position_error_pt": {
+   "label": "輸出位置誤差（⑦）",
+   "unit": "pt",
+   "higher_is_better": false,
+   "group": "端到端",
+   "tolerance": 0.1
+  },
+  "rasterized_page": {
+   "label": "整頁點陣化比例（文字不可編輯）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "group": "端到端",
+   "tolerance": 0.01
+  },
+  "user_rating": {
+   "label": "使用者整頁評分（換算成 0 到 1）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "group": "回饋",
+   "tolerance": 0.05
+  }
+ },
+ "overall": {
+  "e2e_score": {
+   "mean": 0.922126269520329,
+   "n": 16,
+   "min": 0.49936434626579285,
+   "max": 0.9991333186626434
+  },
+  "e2e_similarity": {
+   "mean": 0.9549803528934717,
+   "n": 16,
+   "min": 0.4987286925315857,
+   "max": 0.9982666373252869
+  },
+  "e2e_text_match": {
+   "mean": 0.9114583333333333,
+   "n": 16,
+   "min": 0.5,
+   "max": 1.0
+  },
+  "e2e_linebreak_match": {
+   "mean": 0.890625,
+   "n": 16,
+   "min": 0.5,
+   "max": 1.0
+  },
+  "e2e_position_error_pt": {
+   "mean": 1.2259110147591477,
+   "n": 16,
+   "min": 0.007896314559129486,
+   "max": 17.515861738799117
+  },
+  "rasterized_page": {
+   "mean": 0.0,
+   "n": 16,
+   "min": 0.0,
+   "max": 0.0
+  },
+  "composite": {
+   "mean": 0.8354911766376396,
+   "n": 16,
+   "min": 0.6405324930468852,
+   "max": 0.9995666593313217
+  },
+  "text_recall": {
+   "mean": 0.96875,
+   "n": 12,
+   "min": 0.875,
+   "max": 1.0
+  },
+  "text_precision": {
+   "mean": 1.0,
+   "n": 12,
+   "min": 1.0,
+   "max": 1.0
+  },
+  "text_f1": {
+   "mean": 0.9833333333333334,
+   "n": 12,
+   "min": 0.9333333333333333,
+   "max": 1.0
+  },
+  "cer": {
+   "mean": 0.015796190995521424,
+   "n": 12,
+   "min": 0.0,
+   "max": 0.05319148936170213
+  },
+  "cer_zh": {
+   "mean": 0.010542078466606769,
+   "n": 9,
+   "min": 0.0,
+   "max": 0.047619047619047616
+  },
+  "cer_en": {
+   "mean": 0.02131782945736434,
+   "n": 12,
+   "min": 0.0,
+   "max": 0.09259259259259259
+  },
+  "page_cer": {
+   "mean": 0.017352139632837986,
+   "n": 12,
+   "min": 0.0,
+   "max": 0.05319148936170213
+  },
+  "position_error_pt": {
+   "mean": 4.0043257887956125,
+   "n": 12,
+   "min": 1.049491326340511,
+   "max": 8.590692925214723
+  },
+  "baseline_error_pt": {
+   "mean": 0.3107322297928056,
+   "n": 12,
+   "min": 0.07166990776686943,
+   "max": 0.7478178653501557
+  },
+  "size_error_pt": {
+   "mean": 0.8140971394558658,
+   "n": 12,
+   "min": 0.1693944795583111,
+   "max": 2.0482003369362225
+  },
+  "size_error_pct": {
+   "mean": 4.374079409727059,
+   "n": 12,
+   "min": 0.5006539654766624,
+   "max": 9.966781379974476
+  },
+  "color_delta_e": {
+   "mean": 17.27497810727034,
+   "n": 12,
+   "min": 1.851934697487864,
+   "max": 41.76937008730823
+  },
+  "orientation_accuracy": {
+   "mean": 1.0,
+   "n": 12,
+   "min": 1.0,
+   "max": 1.0
+  },
+  "font_top1": {
+   "mean": 0.5372197247197247,
+   "n": 12,
+   "min": 0.07692307692307693,
+   "max": 1.0
+  },
+  "font_top3": {
+   "mean": 0.7168907481407482,
+   "n": 12,
+   "min": 0.375,
+   "max": 1.0
+  },
+  "bold_accuracy": {
+   "mean": 0.7919996669996671,
+   "n": 12,
+   "min": 0.4166666666666667,
+   "max": 1.0
+  },
+  "italic_accuracy": {
+   "mean": 0.9395604395604397,
+   "n": 12,
+   "min": 0.5,
+   "max": 1.0
+  },
+  "reading_order": {
+   "mean": 0.9669552669552671,
+   "n": 12,
+   "min": 0.8666666666666667,
+   "max": 1.0
+  },
+  "paragraph_pair_f1": {
+   "mean": 0.44949494949494945,
+   "n": 12,
+   "min": 0.0,
+   "max": 1.0
+  },
+  "boxes_per_paragraph": {
+   "mean": 0.9557539682539682,
+   "n": 12,
+   "min": 0.4,
+   "max": 1.75
+  },
+  "box_count_error": {
+   "mean": 0.8015873015873015,
+   "n": 12,
+   "min": 0.0,
+   "max": 2.0
+  },
+  "image_precision": {
+   "mean": 0.1111111111111111,
+   "n": 9,
+   "min": 0.0,
+   "max": 1.0
+  },
+  "shape_precision": {
+   "mean": 0.4441609977324263,
+   "n": 7,
+   "min": 0.0,
+   "max": 1.0
+  },
+  "shape_kind_accuracy": {
+   "mean": 1.0,
+   "n": 6,
+   "min": 1.0,
+   "max": 1.0
+  },
+  "image_recall": {
+   "mean": 0.1111111111111111,
+   "n": 9,
+   "min": 0.0,
+   "max": 1.0
+  },
+  "shape_recall": {
+   "mean": 0.6666666666666666,
+   "n": 9,
+   "min": 0.0,
+   "max": 1.0
+  }
+ },
+ "by_type": {
+  "native_pdf": {
+   "e2e_score": {
+    "mean": 0.9983363673090935,
+    "n": 4,
+    "min": 0.9977811574935913,
+    "max": 0.9991333186626434
+   },
+   "e2e_similarity": {
+    "mean": 0.996672734618187,
+    "n": 4,
+    "min": 0.9955623149871826,
+    "max": 0.9982666373252869
+   },
+   "e2e_text_match": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 0.015317854424525377,
+    "n": 4,
+    "min": 0.007896314559129486,
+    "max": 0.02188864240439629
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.9991681836545467,
+    "n": 4,
+    "min": 0.9988905787467957,
+    "max": 0.9995666593313217
+   }
+  },
+  "synth_photo": {
+   "text_recall": {
+    "mean": 0.96875,
+    "n": 4,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "text_precision": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_f1": {
+    "mean": 0.9833333333333334,
+    "n": 4,
+    "min": 0.9333333333333333,
+    "max": 1.0
+   },
+   "cer": {
+    "mean": 0.024938268321695628,
+    "n": 4,
+    "min": 0.005813953488372093,
+    "max": 0.05319148936170213
+   },
+   "cer_zh": {
+    "mean": 0.028451632225217127,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.047619047619047616
+   },
+   "cer_en": {
+    "mean": 0.026916451335055984,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.09259259259259259
+   },
+   "page_cer": {
+    "mean": 0.02648111423364532,
+    "n": 4,
+    "min": 0.005813953488372093,
+    "max": 0.05319148936170213
+   },
+   "position_error_pt": {
+    "mean": 4.713156839106375,
+    "n": 4,
+    "min": 1.764778497434677,
+    "max": 8.590692925214723
+   },
+   "baseline_error_pt": {
+    "mean": 0.5342189595357268,
+    "n": 4,
+    "min": 0.27753443697968266,
+    "max": 0.7478178653501557
+   },
+   "size_error_pt": {
+    "mean": 1.4198812176823497,
+    "n": 4,
+    "min": 0.8881572056607809,
+    "max": 2.0482003369362225
+   },
+   "size_error_pct": {
+    "mean": 7.476381160924643,
+    "n": 4,
+    "min": 4.579224904743909,
+    "max": 9.966781379974476
+   },
+   "color_delta_e": {
+    "mean": 23.236105497757535,
+    "n": 4,
+    "min": 16.05974392329145,
+    "max": 29.40303303320636
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "font_top1": {
+    "mean": 0.19157925407925408,
+    "n": 4,
+    "min": 0.07692307692307693,
+    "max": 0.2727272727272727
+   },
+   "font_top3": {
+    "mean": 0.4745775058275058,
+    "n": 4,
+    "min": 0.375,
+    "max": 0.5384615384615384
+   },
+   "bold_accuracy": {
+    "mean": 0.6850233100233101,
+    "n": 4,
+    "min": 0.4166666666666667,
+    "max": 0.8461538461538461
+   },
+   "italic_accuracy": {
+    "mean": 0.8557692307692308,
+    "n": 4,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "reading_order": {
+    "mean": 0.9680735930735931,
+    "n": 4,
+    "min": 0.9285714285714286,
+    "max": 1.0
+   },
+   "image_precision": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.25,
+    "n": 4,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "boxes_per_paragraph": {
+    "mean": 1.1232142857142857,
+    "n": 4,
+    "min": 0.6,
+    "max": 1.75
+   },
+   "box_count_error": {
+    "mean": 1.119047619047619,
+    "n": 4,
+    "min": 0.14285714285714285,
+    "max": 2.0
+   },
+   "e2e_score": {
+    "mean": 0.9734436182135886,
+    "n": 4,
+    "min": 0.932612419128418,
+    "max": 0.9949711859226227
+   },
+   "e2e_similarity": {
+    "mean": 0.9895008727908134,
+    "n": 4,
+    "min": 0.9867531061172485,
+    "max": 0.991083174943924
+   },
+   "e2e_text_match": {
+    "mean": 0.96875,
+    "n": 4,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.96875,
+    "n": 4,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 4.437154141867565,
+    "n": 4,
+    "min": 0.016458793285366098,
+    "max": 17.515861738799117
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.7044281106777603,
+    "n": 4,
+    "min": 0.6405324930468852,
+    "max": 0.7579192894943481
+   },
+   "image_recall": {
+    "mean": 0.0,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "shape_recall": {
+    "mean": 0.0,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.0
+   }
+  },
+  "synth_scan": {
+   "text_recall": {
+    "mean": 0.96875,
+    "n": 4,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "text_precision": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_f1": {
+    "mean": 0.9833333333333334,
+    "n": 4,
+    "min": 0.9333333333333333,
+    "max": 1.0
+   },
+   "cer": {
+    "mean": 0.010638297872340425,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0425531914893617
+   },
+   "cer_zh": {
+    "mean": 0.0,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "cer_en": {
+    "mean": 0.018518518518518517,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.07407407407407407
+   },
+   "page_cer": {
+    "mean": 0.012200797872340425,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0425531914893617
+   },
+   "position_error_pt": {
+    "mean": 3.3883327730678925,
+    "n": 4,
+    "min": 1.3042050890188694,
+    "max": 6.294394273317967
+   },
+   "baseline_error_pt": {
+    "mean": 0.18770630172628083,
+    "n": 4,
+    "min": 0.07166990776686943,
+    "max": 0.361082534622565
+   },
+   "size_error_pt": {
+    "mean": 0.3672829751424064,
+    "n": 4,
+    "min": 0.1693944795583111,
+    "max": 0.6623902194326358
+   },
+   "size_error_pct": {
+    "mean": 2.1080484329271676,
+    "n": 4,
+    "min": 0.5006539654766624,
+    "max": 3.299276001141936
+   },
+   "color_delta_e": {
+    "mean": 24.7333972557037,
+    "n": 4,
+    "min": 11.28279025602722,
+    "max": 41.76937008730823
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "font_top1": {
+    "mean": 0.663961038961039,
+    "n": 4,
+    "min": 0.3939393939393939,
+    "max": 1.0
+   },
+   "font_top3": {
+    "mean": 0.795995670995671,
+    "n": 4,
+    "min": 0.6363636363636364,
+    "max": 1.0
+   },
+   "bold_accuracy": {
+    "mean": 0.8430735930735931,
+    "n": 4,
+    "min": 0.5151515151515151,
+    "max": 1.0
+   },
+   "italic_accuracy": {
+    "mean": 0.9821428571428572,
+    "n": 4,
+    "min": 0.9285714285714286,
+    "max": 1.0
+   },
+   "reading_order": {
+    "mean": 0.9666666666666667,
+    "n": 4,
+    "min": 0.8666666666666667,
+    "max": 1.0
+   },
+   "image_precision": {
+    "mean": 0.0,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "shape_precision": {
+    "mean": 0.30853174603174605,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.5555555555555556
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.25,
+    "n": 4,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "boxes_per_paragraph": {
+    "mean": 1.0398809523809525,
+    "n": 4,
+    "min": 0.6,
+    "max": 1.75
+   },
+   "box_count_error": {
+    "mean": 0.9523809523809524,
+    "n": 4,
+    "min": 0.14285714285714285,
+    "max": 2.0
+   },
+   "e2e_score": {
+    "mean": 0.8451577946543694,
+    "n": 4,
+    "min": 0.49936434626579285,
+    "max": 0.9914241433143616
+   },
+   "e2e_similarity": {
+    "mean": 0.8465655893087387,
+    "n": 4,
+    "min": 0.4987286925315857,
+    "max": 0.9828482866287231
+   },
+   "e2e_text_match": {
+    "mean": 0.84375,
+    "n": 4,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.84375,
+    "n": 4,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 0.21026730462624754,
+    "n": 4,
+    "min": 0.012189158858921346,
+    "max": 0.48384828246893624
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.7689451168720989,
+    "n": 4,
+    "min": 0.7552685423408265,
+    "max": 0.7782115942719326
+   },
+   "shape_kind_accuracy": {
+    "mean": 1.0,
+    "n": 3,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "image_recall": {
+    "mean": 0.0,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "shape_recall": {
+    "mean": 1.0,
+    "n": 3,
+    "min": 1.0,
+    "max": 1.0
+   }
+  },
+  "synth_screenshot": {
+   "text_recall": {
+    "mean": 0.96875,
+    "n": 4,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "text_precision": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_f1": {
+    "mean": 0.9833333333333334,
+    "n": 4,
+    "min": 0.9333333333333333,
+    "max": 1.0
+   },
+   "cer": {
+    "mean": 0.011812006792528218,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0425531914893617
+   },
+   "cer_zh": {
+    "mean": 0.003174603174603175,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.009523809523809525
+   },
+   "cer_en": {
+    "mean": 0.018518518518518517,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.07407407407407407
+   },
+   "page_cer": {
+    "mean": 0.013374506792528218,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0425531914893617
+   },
+   "position_error_pt": {
+    "mean": 3.91148775421257,
+    "n": 4,
+    "min": 1.049491326340511,
+    "max": 8.460082782060645
+   },
+   "baseline_error_pt": {
+    "mean": 0.21027142811640936,
+    "n": 4,
+    "min": 0.10405370292514948,
+    "max": 0.30270876105930716
+   },
+   "size_error_pt": {
+    "mean": 0.6551272255428412,
+    "n": 4,
+    "min": 0.218311916744784,
+    "max": 1.6135368377976067
+   },
+   "size_error_pct": {
+    "mean": 3.537808635329368,
+    "n": 4,
+    "min": 0.6612778988600061,
+    "max": 7.931377968589349
+   },
+   "color_delta_e": {
+    "mean": 3.8554315683497715,
+    "n": 4,
+    "min": 1.851934697487864,
+    "max": 9.44348486475531
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "font_top1": {
+    "mean": 0.7561188811188811,
+    "n": 4,
+    "min": 0.5757575757575758,
+    "max": 1.0
+   },
+   "font_top3": {
+    "mean": 0.8800990675990676,
+    "n": 4,
+    "min": 0.7575757575757576,
+    "max": 1.0
+   },
+   "bold_accuracy": {
+    "mean": 0.8479020979020979,
+    "n": 4,
+    "min": 0.5454545454545454,
+    "max": 1.0
+   },
+   "italic_accuracy": {
+    "mean": 0.9807692307692308,
+    "n": 4,
+    "min": 0.9230769230769231,
+    "max": 1.0
+   },
+   "reading_order": {
+    "mean": 0.9661255411255412,
+    "n": 4,
+    "min": 0.8666666666666667,
+    "max": 1.0
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.8484848484848484,
+    "n": 4,
+    "min": 0.6666666666666666,
+    "max": 1.0
+   },
+   "boxes_per_paragraph": {
+    "mean": 0.7041666666666666,
+    "n": 4,
+    "min": 0.4,
+    "max": 1.0
+   },
+   "box_count_error": {
+    "mean": 0.3333333333333333,
+    "n": 4,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "e2e_score": {
+    "mean": 0.8715672979042643,
+    "n": 4,
+    "min": 0.7411336600780487,
+    "max": 0.9949513375759125
+   },
+   "e2e_similarity": {
+    "mean": 0.9871822148561478,
+    "n": 4,
+    "min": 0.9822673201560974,
+    "max": 0.9899706244468689
+   },
+   "e2e_text_match": {
+    "mean": 0.8333333333333333,
+    "n": 4,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.75,
+    "n": 4,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 0.24090475811825277,
+    "n": 4,
+    "min": 0.011556748093498574,
+    "max": 0.3684411279123544
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.8694232953461525,
+    "n": 4,
+    "min": 0.8037125162122354,
+    "max": 0.950401837108001
+   },
+   "shape_kind_accuracy": {
+    "mean": 1.0,
+    "n": 3,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "image_recall": {
+    "mean": 0.3333333333333333,
+    "n": 3,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "image_precision": {
+    "mean": 0.5,
+    "n": 2,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "shape_recall": {
+    "mean": 1.0,
+    "n": 3,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "shape_precision": {
+    "mean": 0.625,
+    "n": 3,
+    "min": 0.25,
+    "max": 1.0
+   }
+  }
+ },
+ "by_group": {
+  "docs": {
+   "e2e_score": {
+    "mean": 0.9666480892519285,
+    "n": 8,
+    "min": 0.9213947653770447,
+    "max": 0.9982568919658661
+   },
+   "e2e_similarity": {
+    "mean": 0.9880851395428181,
+    "n": 8,
+    "min": 0.9677895307540894,
+    "max": 0.9965137839317322
+   },
+   "e2e_text_match": {
+    "mean": 0.9479166666666666,
+    "n": 8,
+    "min": 0.8333333333333333,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.9479166666666666,
+    "n": 8,
+    "min": 0.8333333333333333,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 2.303085464943912,
+    "n": 8,
+    "min": 0.011556748093498574,
+    "max": 17.515861738799117
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 8,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.8495286609757535,
+    "n": 8,
+    "min": 0.6679466073593782,
+    "max": 0.999128445982933
+   },
+   "text_recall": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_precision": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_f1": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "cer": {
+    "mean": 0.006446300542271718,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.028169014084507043
+   },
+   "cer_zh": {
+    "mean": 0.019047619047619046,
+    "n": 3,
+    "min": 0.0,
+    "max": 0.047619047619047616
+   },
+   "cer_en": {
+    "mean": 0.0025122021246052253,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.009259259259259259
+   },
+   "page_cer": {
+    "mean": 0.006446300542271718,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.028169014084507043
+   },
+   "position_error_pt": {
+    "mean": 2.9109871337011346,
+    "n": 6,
+    "min": 1.049491326340511,
+    "max": 5.007543173456498
+   },
+   "baseline_error_pt": {
+    "mean": 0.31972243372093173,
+    "n": 6,
+    "min": 0.176836718973646,
+    "max": 0.5974201028304604
+   },
+   "size_error_pt": {
+    "mean": 0.5298845445014669,
+    "n": 6,
+    "min": 0.1693944795583111,
+    "max": 1.205853721905814
+   },
+   "size_error_pct": {
+    "mean": 3.3103673981149364,
+    "n": 6,
+    "min": 0.5006539654766624,
+    "max": 7.834032635234804
+   },
+   "color_delta_e": {
+    "mean": 18.310419937145195,
+    "n": 6,
+    "min": 1.9040974582825911,
+    "max": 41.76937008730823
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "font_top1": {
+    "mean": 0.5820707070707071,
+    "n": 6,
+    "min": 0.25,
+    "max": 1.0
+   },
+   "font_top3": {
+    "mean": 0.7089646464646465,
+    "n": 6,
+    "min": 0.375,
+    "max": 1.0
+   },
+   "bold_accuracy": {
+    "mean": 0.7563131313131314,
+    "n": 6,
+    "min": 0.5151515151515151,
+    "max": 1.0
+   },
+   "italic_accuracy": {
+    "mean": 0.9166666666666666,
+    "n": 6,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "reading_order": {
+    "mean": 0.9862914862914863,
+    "n": 6,
+    "min": 0.9285714285714286,
+    "max": 1.0
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.27777777777777773,
+    "n": 6,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "boxes_per_paragraph": {
+    "mean": 0.8142857142857144,
+    "n": 6,
+    "min": 0.4,
+    "max": 1.1428571428571428
+   },
+   "box_count_error": {
+    "mean": 0.880952380952381,
+    "n": 6,
+    "min": 0.0,
+    "max": 2.0
+   },
+   "image_precision": {
+    "mean": 0.2,
+    "n": 5,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "shape_precision": {
+    "mean": 0.4761904761904762,
+    "n": 3,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "shape_kind_accuracy": {
+    "mean": 1.0,
+    "n": 2,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "image_recall": {
+    "mean": 0.3333333333333333,
+    "n": 3,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "shape_recall": {
+    "mean": 0.6666666666666666,
+    "n": 3,
+    "min": 0.0,
+    "max": 1.0
+   }
+  },
+  "slides": {
+   "e2e_score": {
+    "mean": 0.8776044497887293,
+    "n": 8,
+    "min": 0.49936434626579285,
+    "max": 0.9991333186626434
+   },
+   "e2e_similarity": {
+    "mean": 0.9218755662441254,
+    "n": 8,
+    "min": 0.4987286925315857,
+    "max": 0.9982666373252869
+   },
+   "e2e_text_match": {
+    "mean": 0.875,
+    "n": 8,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.8333333333333333,
+    "n": 8,
+    "min": 0.5,
+    "max": 1.0
+   },
+   "e2e_position_error_pt": {
+    "mean": 0.14873656457438317,
+    "n": 8,
+    "min": 0.007896314559129486,
+    "max": 0.48384828246893624
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 8,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "composite": {
+    "mean": 0.8214536922995257,
+    "n": 8,
+    "min": 0.6405324930468852,
+    "max": 0.9995666593313217
+   },
+   "text_recall": {
+    "mean": 0.9375,
+    "n": 6,
+    "min": 0.875,
+    "max": 1.0
+   },
+   "text_precision": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "text_f1": {
+    "mean": 0.9666666666666667,
+    "n": 6,
+    "min": 0.9333333333333333,
+    "max": 1.0
+   },
+   "cer": {
+    "mean": 0.025146081448771132,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.05319148936170213
+   },
+   "cer_zh": {
+    "mean": 0.006289308176100628,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.03773584905660377
+   },
+   "cer_en": {
+    "mean": 0.040123456790123455,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.09259259259259259
+   },
+   "page_cer": {
+    "mean": 0.028257978723404256,
+    "n": 6,
+    "min": 0.00625,
+    "max": 0.05319148936170213
+   },
+   "position_error_pt": {
+    "mean": 5.09766444389009,
+    "n": 6,
+    "min": 1.7964412367042708,
+    "max": 8.590692925214723
+   },
+   "baseline_error_pt": {
+    "mean": 0.30174202586467963,
+    "n": 6,
+    "min": 0.07166990776686943,
+    "max": 0.7478178653501557
+   },
+   "size_error_pt": {
+    "mean": 1.0983097344102646,
+    "n": 6,
+    "min": 0.3183417576352528,
+    "max": 2.0482003369362225
+   },
+   "size_error_pct": {
+    "mean": 5.437791421339184,
+    "n": 6,
+    "min": 1.7537574107451317,
+    "max": 9.966781379974476
+   },
+   "color_delta_e": {
+    "mean": 16.23953627739548,
+    "n": 6,
+    "min": 1.851934697487864,
+    "max": 32.282768498306645
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 6,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "font_top1": {
+    "mean": 0.4923687423687424,
+    "n": 6,
+    "min": 0.07692307692307693,
+    "max": 0.8333333333333334
+   },
+   "font_top3": {
+    "mean": 0.7248168498168499,
+    "n": 6,
+    "min": 0.5,
+    "max": 0.9166666666666666
+   },
+   "bold_accuracy": {
+    "mean": 0.8276862026862025,
+    "n": 6,
+    "min": 0.4166666666666667,
+    "max": 1.0
+   },
+   "italic_accuracy": {
+    "mean": 0.9624542124542126,
+    "n": 6,
+    "min": 0.9230769230769231,
+    "max": 1.0
+   },
+   "shape_kind_accuracy": {
+    "mean": 1.0,
+    "n": 4,
+    "min": 1.0,
+    "max": 1.0
+   },
+   "reading_order": {
+    "mean": 0.9476190476190477,
+    "n": 6,
+    "min": 0.8666666666666667,
+    "max": 1.0
+   },
+   "image_recall": {
+    "mean": 0.0,
+    "n": 6,
+    "min": 0.0,
+    "max": 0.0
+   },
+   "shape_recall": {
+    "mean": 0.6666666666666666,
+    "n": 6,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "shape_precision": {
+    "mean": 0.4201388888888889,
+    "n": 4,
+    "min": 0.25,
+    "max": 0.625
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.6212121212121212,
+    "n": 6,
+    "min": 0.0,
+    "max": 1.0
+   },
+   "boxes_per_paragraph": {
+    "mean": 1.0972222222222223,
+    "n": 6,
+    "min": 0.6666666666666666,
+    "max": 1.75
+   },
+   "box_count_error": {
+    "mean": 0.7222222222222223,
+    "n": 6,
+    "min": 0.0,
+    "max": 1.3333333333333333
+   },
+   "image_precision": {
+    "mean": 0.0,
+    "n": 4,
+    "min": 0.0,
+    "max": 0.0
+   }
+  }
+ },
+ "worst": [
+  {
+   "sample": "slides/slide_basic.pdf",
+   "type": "synth_photo",
+   "group": "slides",
+   "composite": 0.6405324930468852,
+   "text_f1": 0.9333333333333333,
+   "page_cer": 0.01875,
+   "e2e_score": 0.9933765530586243,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "docs/poster.pdf",
+   "type": "synth_photo",
+   "group": "docs",
+   "composite": 0.6679466073593782,
+   "text_f1": 1.0,
+   "page_cer": 0.005813953488372093,
+   "e2e_score": 0.932612419128418,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "docs/doc_a4.pdf",
+   "type": "synth_photo",
+   "group": "docs",
+   "composite": 0.7513140528104304,
+   "text_f1": 1.0,
+   "page_cer": 0.028169014084507043,
+   "e2e_score": 0.9728143147446893,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "slides/slide_dark.pdf",
+   "type": "synth_scan",
+   "group": "slides",
+   "composite": 0.7552685423408265,
+   "text_f1": 1.0,
+   "page_cer": 0.0425531914893617,
+   "e2e_score": 0.49936434626579285,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "slides/slide_dark.pdf",
+   "type": "synth_photo",
+   "group": "slides",
+   "composite": 0.7579192894943481,
+   "text_f1": 1.0,
+   "page_cer": 0.05319148936170213,
+   "e2e_score": 0.9949711859226227,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "docs/poster.pdf",
+   "type": "synth_scan",
+   "group": "docs",
+   "composite": 0.7708347529034388,
+   "text_f1": 1.0,
+   "page_cer": 0.0,
+   "e2e_score": 0.9213947653770447,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "slides/slide_basic.pdf",
+   "type": "synth_scan",
+   "group": "slides",
+   "composite": 0.7714655779721976,
+   "text_f1": 0.9333333333333333,
+   "page_cer": 0.00625,
+   "e2e_score": 0.9684479236602783,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "docs/doc_a4.pdf",
+   "type": "synth_scan",
+   "group": "docs",
+   "composite": 0.7782115942719326,
+   "text_f1": 1.0,
+   "page_cer": 0.0,
+   "e2e_score": 0.9914241433143616,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "slides/slide_dark.pdf",
+   "type": "synth_screenshot",
+   "group": "slides",
+   "composite": 0.8037125162122354,
+   "text_f1": 1.0,
+   "page_cer": 0.0425531914893617,
+   "e2e_score": 0.7411336600780487,
+   "rasterized_page": 0.0
+  },
+  {
+   "sample": "slides/slide_basic.pdf",
+   "type": "synth_screenshot",
+   "group": "slides",
+   "composite": 0.8442738812515953,
+   "text_f1": 0.9333333333333333,
+   "page_cer": 0.00625,
+   "e2e_score": 0.8266274531682332,
+   "rasterized_page": 0.0
+  }
+ ],
+ "errors": [],
+ "params": {
+  "variants": [
+   "screenshot",
+   "scan",
+   "photo"
+  ],
+  "seed": 0,
+  "strength": 1.0,
+  "max_pages_per_sample": 5,
+  "worst_n": 10,
+  "save_degraded_images": true,
+  "regression_tolerance": {},
+  "metrics": {},
+  "synth": {},
+  "outputs": [
+   "pptx"
+  ]
+ }
+}

@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from mortise.artifacts import Color, FontCandidate, Measured, Paragraph, PageLayout, Point, Provenance, Quad, TextBox, measured
+from mortise.artifacts import Color, FontCandidate, Paragraph, PageLayout, Provenance, Quad, TextBox, measured
 from mortise.artifacts.common import Align, Role
 from mortise.config import Config
 from mortise.eval import metrics as M

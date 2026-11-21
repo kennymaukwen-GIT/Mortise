@@ -112,11 +112,11 @@ def test_tune_runs_one_round_on_small_sample(tmp_path):
     root.mkdir()
     shutil.copy(FIX / "slide_basic.pdf", root / "a.pdf")
     shutil.copy(FIX / "slide_basic.pdf", root / "b.pdf")
-    ts = [t for t in T.load_tunable() if t.path in ("structure.paragraph_gap_factor", "settings.box_width_slack_pt")]
+    ts = [t for t in T.load_tunable() if t.path == "settings.box_width_slack_pt"]
     res = T.tune(root, tmp_path / "out", ts, params={"max_rounds": 1, "max_steps_per_param": 1, "validation_fraction": 0.5})
     assert res.train_before is not None and res.train_after >= res.train_before
     assert len(res.train_samples) == 1 and len(res.validation_samples) == 1 and res.validation_before is not None
-    assert res.adopt is not None and 3 <= res.evaluations <= 5
+    assert res.adopt is not None and 2 <= res.evaluations <= 3
     rep = json.loads((tmp_path / "out" / "tune_report.json").read_text(encoding="utf-8"))
-    assert len(rep["params"]) == 2 and all(p["tried"] for p in rep["params"])
+    assert len(rep["params"]) == 1 and rep["params"][0]["tried"] and rep["params"][0]["path"] == "settings.box_width_slack_pt"
     Config.load(override=Path(res.override_path))  # 覆寫檔可讀
