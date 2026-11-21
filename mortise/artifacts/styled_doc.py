@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Optional
 
 from .common import SCHEMA_VERSION, Align, BlobRef, Color, Measured, Model, Role
+from .element_list import Gradient, VectorPrimitive
 
 
 class TargetMode(str, Enum):
@@ -79,6 +80,33 @@ class StyledImage(Model):
     box: Box
     z: int
     image: BlobRef
+    vector_id: Optional[str] = None  # 這張圖片其實是向量圖的點陣版：支援向量的輸出器改畫同頁 vectors 裡這個編號的向量圖，並跳過這張圖片
+
+
+class StyledVectorPath(Model):
+    path: list[list[float]]  # 每段 [種類, x, y, ...]，座標相對於 box 左上角（pt）；種類 0 起筆、1 直線、2 三次貝茲、3 閉合
+    fill: Optional[Color] = None
+    fill_rule: str = "nonzero"
+    gradient: Optional[Gradient] = None  # 座標相對於 box 左上角（pt）
+    stroke: Optional[Color] = None
+    stroke_width_pt: Optional[float] = None
+    stroke_cap: str = "butt"
+    stroke_join: str = "miter"
+    primitive: Optional[VectorPrimitive] = None  # 座標相對於 box 左上角（pt）
+
+
+class StyledVector(Model):
+    """向量圖（見 element_list.VectorGraphic）。box 與對應圖片的 box 相同，不旋轉。"""
+
+    id: str
+    image_id: str
+    box: Box
+    z: int
+    paths: list[StyledVectorPath]  # 由下到上
+    origin: str  # "pdf_paths"（精確擷取）或 "traced"（描圖重建）
+    confidence: float = 1.0
+    kind: str = "unknown"
+    render_error: Optional[float] = None
 
 
 class StyledShape(Model):
@@ -136,6 +164,7 @@ class StyledPage(Model):
     shapes: list[StyledShape] = []
     reading_order: list[str] = []
     tables: list[StyledTable] = []
+    vectors: list[StyledVector] = []  # 向量圖；每個都對應 images 裡 vector_id 相同的那張圖片
 
 
 class StyledMaster(Model):
@@ -172,3 +201,14 @@ class StyledDoc(Model):
     theme_colors: list[Color] = []
     notes: list[str] = []
     masters: list[StyledMaster] = []
+
+
+def vector_index(doc: "StyledDoc") -> dict[str, StyledVector]:
+    """向量圖編號 → 向量圖。輸出器畫圖片時用它由圖片的 vector_id 找到向量圖（母片裡的圖片也適用：
+    母片的圖片取自第一頁，它的向量圖就在那一頁的 vectors 裡）。
+    輸出器一律「由圖片找向量圖」，不要直接逐一畫 page.vectors，母片取代的元素才不會被重複畫。"""
+    out: dict[str, StyledVector] = {}
+    for page in doc.pages:
+        for v in page.vectors:
+            out[v.id] = v
+    return out

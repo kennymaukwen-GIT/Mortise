@@ -78,6 +78,9 @@ FORMAT_LABELS = {
     OutputFormat.AI_PDF: "Illustrator 可編輯 PDF（.pdf）",
     OutputFormat.IDML: "InDesign（.idml）",
     OutputFormat.TEMPLATE: "版面模板（.pptx）",
+    OutputFormat.PDF: "可編輯 PDF（.pdf）",
+    OutputFormat.SVG: "SVG 整頁（.svg；多頁為 .zip）",
+    OutputFormat.SVG_ASSETS: "SVG 向量圖（每個圖一個 .svg，打包成 .zip）",
 }
 
 # 修正欄位 → 送給哪個階段
@@ -110,7 +113,7 @@ def health() -> dict[str, Any]:
 @app.get("/api/formats")
 def formats() -> list[dict[str, Any]]:
     ready = set(s6_export.available())
-    return [{"format": f.value, "label": FORMAT_LABELS[f], "available": f in ready} for f in OutputFormat]
+    return [{"format": f.value, "label": FORMAT_LABELS.get(f, f.value), "available": f in ready} for f in OutputFormat]
 
 
 # ====================================================================== 建立工作

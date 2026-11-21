@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from .common import SCHEMA_VERSION, BlobRef, Model
+from .common import SCHEMA_VERSION, BlobRef, Model, OutputFormat
 from .correction import Correction
 
 
@@ -51,6 +51,27 @@ class PageReport(Model):
     issues: list[Issue] = []
 
 
+class FormatPageReport(Model):
+    """某個輸出格式、某一頁的目標驗證結果。"""
+
+    page_index: int
+    similarity: Optional[float] = None  # 把輸出檔重新畫出來，與工作影像的相似度（0 到 1）
+    text_match_ratio: Optional[float] = None  # 從輸出檔讀回來的文字，與成品文件一致的比例（0 到 1）
+    position_error_pt: Optional[float] = None  # 讀回來的文字位置與成品文件的最大差（pt）
+    issues: list[Issue] = []
+
+
+class FormatReport(Model):
+    """某個輸出格式的目標驗證結果（7B）：把輸出檔重新打開、畫出來、讀回來，確認它真的是我們要的。"""
+
+    format: OutputFormat
+    engine: str  # 用什麼把輸出檔畫出來或讀回來（不是使用者手上的目標軟體時要寫明）
+    ok: bool = True
+    pages: list[FormatPageReport] = []
+    notes: list[str] = []
+    render: Optional[BlobRef] = None  # 重新畫出來的結果（前端疊圖預覽用），沒有就留空
+
+
 class FidelityReport(Model):
     schema_version: str = SCHEMA_VERSION
     neutral_engine: Optional[str] = None  # 7A 用的渲染方式
@@ -62,3 +83,4 @@ class FidelityReport(Model):
     round: int = 0
     notes: list[str] = []
     target_render: Optional[BlobRef] = None  # 7B 目標驗證渲染出來的 PDF（前端疊圖預覽用）
+    format_reports: list[FormatReport] = []  # PowerPoint 以外各輸出格式的目標驗證結果

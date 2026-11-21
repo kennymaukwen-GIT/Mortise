@@ -30,7 +30,7 @@ from ..tools.fonts import clean_font_name, is_cjk, split_style
 from ..tools.geometry import to_point
 
 NAME = "s3"
-VERSION = "2"
+VERSION = "3"
 
 SEG_LINETO, SEG_BEZIERTO, SEG_MOVETO = 0, 1, 2
 

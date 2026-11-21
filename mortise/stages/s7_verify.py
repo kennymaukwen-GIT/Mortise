@@ -31,7 +31,7 @@ from ..tools import pdfium as pdf
 from . import s2_page, s3_recognize
 
 NAME = "s7"
-VERSION = "2"
+VERSION = "3"
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -80,6 +80,19 @@ def run(
     elif pptx is not None:
         notes.append("7B 目標驗證沒有執行：這台機器沒有安裝 LibreOffice。")
 
+    # 其他格式的目標驗證（mortise/verify/ 下各格式一個模組）
+    from .. import verify as targets
+
+    format_reports = []
+    for o in outputs:
+        fn = targets.verifier(o.format)
+        if fn is None:
+            continue
+        try:
+            format_reports.append(fn(o, specs, elements, layout, styled, cfg, store))
+        except Exception as e:  # 單一格式的驗證失敗不影響其他驗證
+            notes.append(f"{o.format.value} 的目標驗證沒有執行：{type(e).__name__}: {e}")
+
     counts: dict[str, int] = {}
     for p in pages:
         for e in p.elements:
@@ -102,6 +115,7 @@ def run(
     return FidelityReport(
         neutral_engine=neutral_engine, target_engine=target_engine, pages=pages, overall_score=(sum(scores) / len(scores)) if scores else None,
         field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes, target_render=target_render,
+        format_reports=format_reports,
     )
 
 

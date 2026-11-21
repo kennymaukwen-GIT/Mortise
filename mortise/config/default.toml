@@ -37,6 +37,8 @@ implausible_min_score = 0.97
 join_max_gap_factor = 4.0            # 同一基線上相距不超過幾個字寬的片段，可能接成同一行
 max_vector_paths = 300               # 一頁的複雜向量路徑超過這個數量，整批留在底圖（避免插畫被拆成上千個形狀）
 max_path_segments = 400              # 單一路徑的線段超過這個數量，留在底圖
+# ---- 原生 PDF 的向量圖與扁平化內容（stages/s3_recognize.py、stages/s3_flattened.py）：設定加在這一行下面 ----
+# ---- 描圖向量化（recognition/vectorize.py）：設定加在這一行下面，名稱以 vector_ 開頭 ----
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）
@@ -75,6 +77,8 @@ single_line_no_wrap = true           # 單行文字關閉自動換行
 
 [export]                             # ⑥ 輸出
 image_format = "png"
+# ---- 可編輯 PDF（exporters/pdf_editable.py）：設定加在這一行下面，名稱以 pdf_ 開頭 ----
+# ---- SVG（exporters/svg.py）：設定加在這一行下面，名稱以 svg_ 開頭 ----
 
 [verify]                             # ⑦ 驗證
 render_dpi = 100                     # 比對用的渲染解析度（dpi）
@@ -86,6 +90,8 @@ low_confidence = 0.7                 # 信心值低於此值的元素，在預�
 neutral = true                       # 7A 中性驗證（需要 ai_pdf 輸出器）
 neutral_similarity_pass = 0.95       # 中性渲染與原圖的相似度合格線（初始值）
 libreoffice_timeout_s = 120          # 目標渲染逾時（秒）
+# ---- 可編輯 PDF 的目標驗證（verify/pdf_target.py）：設定加在這一行下面，名稱以 pdf_ 開頭 ----
+# ---- SVG 的目標驗證（verify/svg_target.py）：設定加在這一行下面，名稱以 svg_ 開頭 ----
 
 [ai]                                 # 大型 AI（只回答編號、標籤、或在候選中選擇）
 enabled = true                       # 有憑證才會真的呼叫；沒有憑證時流水線照常跑，全用規則判斷

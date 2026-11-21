@@ -55,6 +55,9 @@ class OutputFormat(str, Enum):
     AI_PDF = "ai_pdf"
     IDML = "idml"
     TEMPLATE = "template"
+    PDF = "pdf"  # 可編輯 PDF（一般 PDF 編輯軟體用；文字是真的文字、圖片與向量圖各自獨立）
+    SVG = "svg"  # 整頁 SVG（一頁一個檔；多頁打包成 zip）
+    SVG_ASSETS = "svg_assets"  # 只輸出頁面裡的向量圖，每個圖一個 SVG 檔（打包成 zip）
 
 
 class UsageMode(str, Enum):

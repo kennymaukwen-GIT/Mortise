@@ -23,6 +23,7 @@ from collections import Counter
 from ..artifacts import (
     Align, Box, Color, Correction, ElementList, FontChoice, Layout, LineSpacing, LineSpacingMode, OutputFormat, PageSpec, Provenance,
     Quad, Role, SourceDoc, Style, StyledDoc, StyledImage, StyledPage, StyledParagraph, StyledRun, StyledShape, StyledTextBox,
+    StyledVector, StyledVectorPath,
     TargetMode, TextLine, TextRun, measured,
 )
 from ..artifacts.common import Measured
@@ -31,7 +32,7 @@ from ..config import Config
 from ..tools.fonts import has_cjk, verification_font
 
 NAME = "s5"
-VERSION = "4"
+VERSION = "5"
 
 _APPS = [
     ("powerpoint", "powerpoint"), ("impress", "libreoffice_impress"), ("keynote", "keynote"), ("google slides", "google_slides"),
@@ -66,6 +67,50 @@ def _box(q: Quad, w: float, measured_input: bool = False) -> Box:
         l, t, r, b = q.bbox  # 量測產線：微小傾斜視為水平，用外接矩形
         return Box(x=l * w, y=t * w, w=(r - l) * w, h=(b - t) * w)
     return Box(x=cx - bw / 2, y=cy - bh / 2, w=bw, h=bh, rotation=rotation)
+
+
+def _vectors(el: ElementList, images: list[StyledImage], w: float) -> tuple[list[StyledImage], list[StyledVector]]:
+    """向量圖 → 成品文件的向量圖：座標換成相對於框左上角的 pt，並在對應的圖片記上 vector_id。
+    純換算，不改任何值：向量圖的路徑是③讀出來或描出來的事實，⑤不吸附、不簡化。"""
+    by_id = {im.id: im for im in images}
+    out: list[StyledVector] = []
+    linked: dict[str, str] = {}
+    for v in el.vectors:
+        im = by_id.get(v.image_id)
+        if im is None or not v.paths:
+            continue
+        l, t, r, b = v.quad.bbox
+        box = Box(x=l * w, y=t * w, w=(r - l) * w, h=(b - t) * w)
+
+        def pts(values: list[float]) -> list[float]:
+            return [val * w - (box.x if i % 2 == 0 else box.y) for i, val in enumerate(values)]
+
+        paths: list[StyledVectorPath] = []
+        for vp in v.paths:
+            gradient = vp.gradient
+            if gradient is not None:
+                coords = pts(gradient.coords[:4]) if gradient.kind == "linear" else pts(gradient.coords[:2]) + [c * w for c in gradient.coords[2:]]
+                gradient = gradient.model_copy(update={"coords": coords})
+            prim = vp.primitive
+            if prim is not None:
+                cx, cy = pts([prim.cx, prim.cy])
+                prim = prim.model_copy(update={
+                    "cx": cx, "cy": cy, "w": prim.w * w, "h": prim.h * w, "corner_radius": prim.corner_radius * w,
+                    "points": [pts(list(pt)) for pt in prim.points],
+                })
+            paths.append(StyledVectorPath(
+                path=[[sg[0]] + pts(list(sg[1:])) for sg in vp.path], fill=vp.fill, fill_rule=vp.fill_rule, gradient=gradient,
+                stroke=vp.stroke, stroke_width_pt=(vp.stroke_width * w) if vp.stroke_width else None,
+                stroke_cap=vp.stroke_cap, stroke_join=vp.stroke_join, primitive=prim,
+            ))
+        out.append(StyledVector(
+            id=v.id, image_id=v.image_id, box=box, z=v.z, paths=paths, origin=v.origin.value,
+            confidence=v.origin.confidence, kind=v.kind, render_error=v.render_error,
+        ))
+        linked[v.image_id] = v.id
+    if linked:
+        images = [im.model_copy(update={"vector_id": linked[im.id]}) if im.id in linked else im for im in images]
+    return images, out
 
 
 def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layout: Layout, cfg: Config, corrections: list[Correction]) -> StyledDoc:
@@ -151,6 +196,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
             text_boxes.append(StyledTextBox(id=tb.id, box=box, z=tb.z, paragraphs=sps, wrap=wrap, first_baseline_pt=first_baseline))
 
         images = [StyledImage(id=im.id, box=_box(im.quad, w, el.production_line.value == "image"), z=im.z, image=im.image) for im in el.images]
+        images, vectors = _vectors(el, images, w)
         if any(im.kind.value == ImageKind.SHADOW for im in el.images):
             notes.append(f"第 {spec.page_index + 1} 頁：形狀的陰影在來源檔中是點陣圖，照原樣保留為圖片，不是可調整的陰影效果。")
         shapes = []
@@ -184,7 +230,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
             StyledPage(
                 page_index=spec.page_index, width_pt=w, height_pt=h,
                 background_color=bg.color if (bg.color and bg.color.hex != "FFFFFF") else None, background_image=bg.image,
-                text_boxes=text_boxes, images=images, shapes=shapes, reading_order=pl.reading_order, tables=tables,
+                text_boxes=text_boxes, images=images, shapes=shapes, reading_order=pl.reading_order, tables=tables, vectors=vectors,
             )
         )
         notes.extend(f"第 {spec.page_index + 1} 頁：{n}" for n in el.notes)

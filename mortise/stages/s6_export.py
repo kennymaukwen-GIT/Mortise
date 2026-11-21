@@ -14,7 +14,7 @@ from ..config import Config
 from ..pipeline.store import Store
 
 NAME = "s6"
-VERSION = "3"
+VERSION = "4"
 
 # 格式 → 輸出器模組（mortise.exporters 底下的模組名稱）
 EXPORTERS: dict[OutputFormat, str] = {
@@ -26,6 +26,9 @@ EXPORTERS: dict[OutputFormat, str] = {
     OutputFormat.AI_PDF: "ai_pdf",
     OutputFormat.IDML: "idml",
     OutputFormat.TEMPLATE: "template",
+    OutputFormat.PDF: "pdf_editable",
+    OutputFormat.SVG: "svg",
+    OutputFormat.SVG_ASSETS: "svg_assets",
 }
 
 

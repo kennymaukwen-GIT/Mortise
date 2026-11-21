@@ -111,6 +111,70 @@ class ShapeElement(Model):
     fit_error: Optional[float] = None  # 認成基本幾何時的擬合誤差（相對單位）
 
 
+class GradientStop(Model):
+    offset: float  # 0 到 1
+    color: Color
+
+
+class Gradient(Model):
+    """漸層填色。座標與所屬路徑用同一個座標系、同一種單位。"""
+
+    kind: str  # "linear"、"radial"
+    coords: list[float]  # linear：[x0, y0, x1, y1]；radial：[cx, cy, r]
+    stops: list[GradientStop]
+
+
+class VectorPrimitive(Model):
+    """這條路徑其實是哪一種基本圖形。有填的話，輸出 SVG 時寫成 <rect>、<circle>、<ellipse>、<line>、<polygon>，比路徑好編輯。
+    座標與所屬路徑用同一個座標系、同一種單位；路徑本身（path）仍要完整保留，兩者描述同一個形狀。"""
+
+    kind: str  # "rect"、"rounded_rect"、"ellipse"、"circle"、"line"、"polygon"
+    cx: float  # 中心
+    cy: float
+    w: float  # 沿自身方向的寬（line 為長度）
+    h: float  # 沿自身方向的高（line 為 0）
+    angle_deg: float = 0.0  # 順時針為正
+    corner_radius: float = 0.0  # rounded_rect 才有
+    points: list[list[float]] = []  # polygon 的頂點 [[x, y], ...]
+
+
+class VectorPath(Model):
+    """向量圖裡的一條路徑。"""
+
+    path: list[list[float]]  # 與 ShapeElement.path 同一種編碼：每段 [種類, x, y, ...]；種類 0 起筆、1 直線、2 三次貝茲（後接 3 個點共 6 個數）、3 閉合。頁面相對座標
+    fill: Optional[Color] = None
+    fill_rule: str = "nonzero"  # "nonzero"、"evenodd"
+    gradient: Optional[Gradient] = None  # 有漸層時 fill 填漸層的平均色（給不支援漸層的輸出器用）
+    stroke: Optional[Color] = None
+    stroke_width: Optional[float] = None  # 相對單位
+    stroke_cap: str = "butt"  # butt、round、square
+    stroke_join: str = "miter"  # miter、round、bevel
+    primitive: Optional[VectorPrimitive] = None
+    fit_error: Optional[float] = None  # 描圖才有：路徑與原始像素邊界的平均距離（相對單位）；精確擷取的留空
+
+
+class VectorGraphic(Model):
+    """一組屬於同一個圖形的向量路徑（標誌、圖示、插畫、圖表）。
+
+    來源有兩種（寫在 origin）：
+      "pdf_paths"：原生 PDF 裡本來就是向量，直接讀出來（來源類型 exact）。
+      "traced"：已經被壓成像素（扁平化），由描圖重建（來源類型 measured）。
+    每個向量圖都有一張對應的點陣圖，放在同一份 ElementList 的 images 裡（image_id 指向它，quad 與 z 與它相同）：
+      ④結構只看那張圖片（閱讀順序、圖層），不必認識向量圖；
+      不支援向量的輸出器照常輸出那張圖片；支援的輸出器改畫向量、跳過那張圖片。
+    """
+
+    id: str
+    image_id: str  # 對應的 ImageElement 編號
+    quad: Quad  # 與對應的圖片相同
+    z: int
+    paths: list[VectorPath]  # 由下到上
+    origin: Measured[str]  # 值為 "pdf_paths" 或 "traced"
+    kind: str = "unknown"  # "logo"、"icon"、"chart"、"illustration"、"unknown"（只是標籤，不影響輸出）
+    render_error: Optional[float] = None  # 描圖才有：把向量重新畫出來與原始像素比較的平均色差（ΔE）；精確擷取的留空
+    notes: list[str] = []
+
+
 class TableRegion(Model):
     """表格區：③只找區域與格線，列欄結構在④。"""
 
@@ -146,3 +210,4 @@ class ElementList(Model):
     table_regions: list[TableRegion] = []
     background: Background = Background()
     notes: list[str] = []
+    vectors: list[VectorGraphic] = []  # 向量圖（每個都對應 images 裡的一張圖片）
