@@ -79,7 +79,7 @@ FORMAT_LABELS = {
 }
 
 # 修正欄位 → 送給哪個階段
-FIELD_STAGE = {"size": 2, "corners": 2, "role": 4, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
+FIELD_STAGE = {"size": 2, "corners": 2, "role": 4, "formula": 5, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
 
 
 def _job(job_id: str):
@@ -321,7 +321,8 @@ def page_elements(job_id: str, n: int) -> dict[str, Any]:
         "text_boxes": [{"id": t.id, "box": box(t.box), "z": t.z, "paragraphs": [para(p) for p in t.paragraphs], **meta(t.id)} for t in sp.text_boxes],
         "tables": [{"id": t.id, "box": box(t.box), "z": t.z, "rows": len(t.row_heights_pt), "cols": len(t.col_widths_pt), "header_rows": t.header_rows,
                     "cells": [{"row": c.row, "col": c.col, "row_span": c.row_span, "col_span": c.col_span, "paragraphs": [para(p) for p in c.paragraphs],
-                               "value": c.value, "number_format": c.number_format} for c in t.cells], **meta(t.id)} for t in sp.tables],
+                               "id": f"{t.id}#{c.row},{c.col}", "value": c.value, "number_format": c.number_format,
+                               "formula": c.formula, "formula_candidate": c.formula_candidate} for c in t.cells], **meta(t.id)} for t in sp.tables],
         "images": [{"id": i.id, "box": box(i.box), "z": i.z, "url": None, **meta(i.id)} for i in sp.images],
         "shapes": [{"id": s.id, "box": box(s.box), "z": s.z, "geometry": s.geometry, "fill": "#" + s.fill.hex if s.fill else None, **meta(s.id)} for s in sp.shapes],
         "styles": [{"id": s.id, "name": s.name, "font": s.font_family, "size_pt": s.size_pt, "bold": s.bold, "italic": s.italic, "color": "#" + s.color.hex} for s in styled.styles],
@@ -332,9 +333,9 @@ def page_elements(job_id: str, n: int) -> dict[str, Any]:
 
 
 class CorrectionIn(BaseModel):
-    field: Literal["size", "corners", "text", "role", "align", "font_family", "font_size_pt", "color"]
+    field: Literal["size", "corners", "text", "role", "align", "font_family", "font_size_pt", "color", "formula"]
     value: Any = Field(..., description="size 為 {width, height, unit}；corners 為原圖像素座標的四個點 [[x,y]×4]（左上、右上、右下、左下）；color 為 #RRGGBB；其他為字串或數字")
-    element_id: Optional[str] = Field(None, description="文字框、段落或文字行的編號；size 不需要")
+    element_id: Optional[str] = Field(None, description="文字框、段落或文字行的編號；表格儲存格為「表格編號#列,欄」；size 不需要")
     page: Optional[int] = Field(None, description="頁碼（從 1 起算）；size 可省略表示整份文件")
 
 

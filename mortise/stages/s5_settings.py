@@ -11,7 +11,8 @@
   s5.styles       歸納樣式表與主題色
   s5.tables       表格：欄寬、列高、儲存格邊距與垂直對齊、底色、框線、數字格式推論（千分位、百分比、貨幣）
   s5.masters      母片：每一頁相同位置都出現的元素
-尚未實作：Excel 公式推論、顏色吸附、比例尺一致性檢查。
+  s5.formula      Excel 公式推論（只當候選，使用者確認才寫入）
+尚未實作：顏色吸附、比例尺一致性檢查。
 """
 
 from __future__ import annotations
@@ -312,10 +313,69 @@ def _table(t, el: ElementList, pl, lines: dict, w: float, c: dict, subs: dict, s
             v_align=v_align, margins_pt=[round(v, 2) for v in margins], header=cl.header,
             value=num[0] if num else None, number_format=num[1] if num else None,
         ))
+    cells = _formula_candidates(cells)
     return StyledTable(
         id=t.id, box=_box(t.quad, w), z=t.z, col_widths_pt=[(b - a) * w for a, b in zip(xs, xs[1:])],
         row_heights_pt=[(b - a) * w for a, b in zip(ys, ys[1:])], cells=cells, header_rows=t.header_rows,
     )
+
+
+_TOTAL_WORDS = ("合計", "總計", "小計", "總和", "共計", "total", "sum", "subtotal")
+
+
+def _col_letter(c: int) -> str:
+    out = ""
+    c += 1
+    while c:
+        c, r = divmod(c - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def _formula_candidates(cells):
+    """s5.formula：數值儲存格若等於正上方（或正左方）連續兩格以上數值的總和，推論為 =SUM(...)。
+    只當候選（formula_candidate）；使用者確認後才寫成公式，未確認的 Excel 輸出純數值。
+    容差是顯示位數的一半（1,250 與 1,249.6 不算相等）；同列有「合計」「Total」之類的字時才收列方向的加總。"""
+    by_pos = {(c.row, c.col): c for c in cells if c.row_span == 1 and c.col_span == 1}
+
+    def decimals(c) -> int:
+        f = c.number_format or ""
+        body = f.split(";")[0]
+        return len(body.split(".")[1].rstrip("%")) if "." in body else 0
+
+    def label(r: int) -> str:
+        first = by_pos.get((r, 0))
+        return "".join(rn.text for p in first.paragraphs for rn in p.runs).lower() if first else ""
+
+    out = []
+    for c in cells:
+        cand = None
+        if c.value is not None and not c.header:
+            tol = 0.5 * 10 ** (-decimals(c)) + 1e-9
+            if "%" in (c.number_format or ""):
+                tol /= 100
+            for axis in ("col", "row"):
+                run = []
+                k = 1
+                while True:
+                    pos = (c.row - k, c.col) if axis == "col" else (c.row, c.col - k)
+                    other = by_pos.get(pos)
+                    if other is None or other.value is None or other.header:
+                        break
+                    run.append(other)
+                    k += 1
+                if len(run) < 2:
+                    continue
+                if axis == "row" and not any(wd in label(c.row) for wd in _TOTAL_WORDS):
+                    continue
+                if abs(sum(o.value for o in run) - c.value) <= tol:
+                    if axis == "col":
+                        cand = f"=SUM({_col_letter(c.col)}{c.row - len(run) + 1}:{_col_letter(c.col)}{c.row})"
+                    else:
+                        cand = f"=SUM({_col_letter(c.col - len(run))}{c.row + 1}:{_col_letter(c.col - 1)}{c.row + 1})"
+                    break
+        out.append(c.model_copy(update={"formula_candidate": cand}) if cand else c)
+    return out
 
 
 def _covered_edge(segments, vertical: bool, at: float, lo: float, hi: float, tol: float) -> bool:
@@ -409,12 +469,29 @@ def _tag_styles(page: StyledPage, sig_to_id: dict[tuple, str]) -> StyledPage:
 def _apply_corrections(doc: StyledDoc, corrections: list[Correction], subs: dict[str, str]) -> StyledDoc:
     """⑤接受的修正（指定文字框或段落的編號）：
     font_family、font_size_pt、color（十六進位）、align、text（改一段的文字，指名段落編號）；
-    以及⑦驗證開的 width_adjust_pt（修正斷行）、offset_pt（平移文字框）。
+    以及⑦驗證開的 width_adjust_pt（修正斷行）、offset_pt（平移文字框）；
+    表格儲存格（編號為「表格編號#列,欄」）的 formula：值為 accept 表示採用推論的公式，或直接給公式，空值表示不用公式。
     """
     if not corrections:
         return doc
     pages = []
     for page in doc.pages:
+        tables = []
+        for t in page.tables:
+            cells = list(t.cells)
+            for c in corrections:
+                if c.field != "formula" or not c.element_id or "#" not in c.element_id:
+                    continue
+                tid, pos = c.element_id.split("#", 1)
+                if tid != t.id:
+                    continue
+                r, k = (int(v) for v in pos.split(","))
+                for i, cell in enumerate(cells):
+                    if (cell.row, cell.col) == (r, k):
+                        value = cell.formula_candidate if c.new_value in (True, "accept") else (str(c.new_value) if c.new_value else None)
+                        cells[i] = cell.model_copy(update={"formula": value})
+            tables.append(t.model_copy(update={"cells": cells}))
+        page = page.model_copy(update={"tables": tables})
         boxes = []
         for tb in page.text_boxes:
             box = tb.box

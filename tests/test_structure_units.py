@@ -28,3 +28,23 @@ def test_number_formats(text, value, fmt):
 @pytest.mark.parametrize("text", ["1,2,3", "abc", "2027年", ""])
 def test_not_numbers(text):
     assert infer_number(text) is None
+
+
+def test_formula_candidates_and_confirmation():
+    from mortise.artifacts import Box, Provenance, StyledCell, StyledDoc, StyledPage, StyledTable, TargetMode, measured
+    from mortise.pipeline.runner import user_correction
+    from mortise.stages.s5_settings import _apply_corrections, _formula_candidates
+
+    cells = _formula_candidates([
+        StyledCell(row=0, col=0, header=True), StyledCell(row=0, col=1, header=True),
+        StyledCell(row=1, col=1, value=1250, number_format="#,##0"), StyledCell(row=2, col=1, value=1480, number_format="#,##0"),
+        StyledCell(row=3, col=1, value=2730, number_format="#,##0"), StyledCell(row=3, col=2, value=2731, number_format="#,##0"),
+    ])
+    total = next(c for c in cells if (c.row, c.col) == (3, 1))
+    assert total.formula_candidate == "=SUM(B2:B3)" and total.formula is None  # 只是候選，沒確認不寫公式
+    assert next(c for c in cells if (c.row, c.col) == (3, 2)).formula_candidate is None  # 加總不符
+    table = StyledTable(id="p001-table-x", box=Box(x=0, y=0, w=100, h=100), z=0, col_widths_pt=[30, 30, 40], row_heights_pt=[20] * 4, cells=cells)
+    doc = StyledDoc(target_mode=measured(TargetMode.CROSS_SOURCE, 0.5, Provenance.INFERRED, "t"), source_app=measured("unknown", 0.0, Provenance.INFERRED, "t"),
+                    pages=[StyledPage(page_index=0, width_pt=600, height_pt=800, tables=[table])])
+    fixed = _apply_corrections(doc, [user_correction(5, "formula", "accept", "p001-table-x#3,1")], {})
+    assert next(c for c in fixed.pages[0].tables[0].cells if (c.row, c.col) == (3, 1)).formula == "=SUM(B2:B3)"

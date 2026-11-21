@@ -111,6 +111,7 @@ class StyledCell(Model):
     value: Optional[float] = None  # 數字儲存格的數值（⑤推論；給 Excel 用）
     number_format: Optional[str] = None  # Excel 數字格式，例如 "#,##0"、"0%"
     formula: Optional[str] = None  # 只有使用者確認過的公式才會填
+    formula_candidate: Optional[str] = None  # ⑤推論的公式（例如 =SUM(B2:B4)），要使用者確認才會變成 formula
 
 
 class StyledTable(Model):
