@@ -189,7 +189,8 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
 
     # ---------- s4.order ----------
     items = [(b.quad, b.id, b.z) for b in text_boxes] + [(i.quad, i.id, i.z) for i in elements.images] + [(s.quad, s.id, s.z) for s in elements.shapes] + [(t.quad, t.id, t.z) for t in tables]
-    reading = [i[1] for i in sorted(items, key=lambda i: (round(i[0].bbox[1], 2), i[0].bbox[0]))]
+    reading = xy_cut([(i[1], i[0].bbox) for i in items if not i[1].split("-")[1].startswith("shp")], c.get("xy_cut_min_gap", 0.006))
+    reading += [i[1] for i in sorted(items, key=lambda i: (i[0].bbox[1], i[0].bbox[0])) if i[1] not in reading]
     z_order = [i[1] for i in sorted(items, key=lambda i: i[2])]
     guides_x = _guides([i[0].bbox[0] for i in items] + [i[0].bbox[2] for i in items], c["left_align_tolerance"])
     guides_y = _guides([i[0].bbox[1] for i in items] + [i[0].bbox[3] for i in items], c["left_align_tolerance"])
@@ -438,6 +439,34 @@ def _ai_roles_order(ai, page_image, paragraphs, text_boxes, elements, tables, re
             order.append(eid)
     order += [eid for eid in reading if eid not in order]
     return new_pars, order, "段落角色與閱讀順序由大型 AI 依編號標記圖判斷。"
+
+
+def xy_cut(items: list[tuple[str, tuple[float, float, float, float]]], min_gap: float = 0.006) -> list[str]:
+    """閱讀順序：遞迴 XY 切割。先找能把元素分成上下兩群的水平空白帶（最寬者），找不到再找左右兩群的垂直空白帶；
+    上群先於下群、左群先於右群。這樣兩欄的頁面會先讀完左欄再讀右欄，而跨欄的標題仍在最前面。"""
+    if len(items) <= 1:
+        return [i[0] for i in items]
+
+    def gaps(axis: int) -> list[tuple[float, float]]:
+        spans = sorted((b[axis], b[axis + 2]) for _, b in items)
+        out, end = [], spans[0][1]
+        for a, b2 in spans[1:]:
+            if a - end > min_gap:
+                out.append((end, a))
+            end = max(end, b2)
+        return out
+
+    for axis in (1, 0):  # 先上下（y），再左右（x）
+        g = gaps(axis)
+        if g:
+            lo, hi = max(g, key=lambda t: t[1] - t[0])
+            cut = (lo + hi) / 2
+            first = [i for i in items if (i[1][axis] + i[1][axis + 2]) / 2 < cut]
+            second = [i for i in items if (i[1][axis] + i[1][axis + 2]) / 2 >= cut]
+            if first and second:
+                return xy_cut(first, min_gap) + xy_cut(second, min_gap)
+    # 切不開（元素互相重疊）：由上而下、由左而右
+    return [i[0] for i in sorted(items, key=lambda i: (round(i[1][1], 3), i[1][0]))]
 
 
 def _guides(values: list[float], tol: float) -> list[float]:
