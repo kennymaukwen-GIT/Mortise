@@ -60,6 +60,7 @@ from .docx_common import (
     el,
     emu,
     empty_paragraph,
+    font_first_baseline_em,
     image_descriptor,
     line_props,
     make_ctx,
@@ -83,6 +84,7 @@ DEFAULT_PARAMS = {
     "relative_height_base": 251658240,  # relativeHeight 的起始值（Word 自己寫的值也從這附近開始）
     "max_page_pt": MAX_PAGE_PT,  # Word 頁面邊長上限（pt）；超過時整頁等比縮小
     "textbox_autofit": True,  # 文字方塊寫 spAutoFit：目標軟體的字比較寬、行比較高時框往下長，不裁掉文字
+    "baseline_compensation": True,  # 單倍行距的文字框依驗證字型的上緣量度微調 y，讓第一行基線落在「框上緣 + 字級」
     "nowrap_slack_ratio": 0.15,  # 不換行的文字方塊加寬這個比例（往對齊基準的反方向加，字的位置不變）。
     # 實測：LibreOffice 24.2 不理會 wrap="none"，字寬略大時仍會折行，折下去的那行被框高裁掉
 }
@@ -132,6 +134,25 @@ def _shape_wsp(shape, w: float, h: float, ctx: Ctx):
     line_props(sp, shape.stroke, (shape.stroke_width_pt or 1.0) * ctx.scale if shape.stroke else None)
     body_pr(wsp)
     return wsp
+
+
+def _baseline_shift(tb) -> float:
+    """成品文件的約定：單倍行距時第一行基線在「框上緣 + 該行最大字級」。目標引擎把基線放在
+    「框上緣 + 字型上緣量度」，兩者差多少就把框移多少（pt）。只處理單倍（或未指定）行距。"""
+    if not tb.paragraphs or not tb.paragraphs[0].runs:
+        return 0.0
+    sp = tb.paragraphs[0]
+    ls = sp.line_spacing.value if sp.line_spacing else None
+    if ls is not None and not (ls.mode.value == "multiple" and abs(ls.value - 1.0) < 1e-6):
+        return 0.0
+    size = max(r.size_pt.value for r in sp.runs)
+    preds = []
+    for r in sp.runs:
+        em = font_first_baseline_em(r.font.verification_family or r.font.family.value)
+        if em is None:
+            return 0.0
+        preds.append(em * r.size_pt.value)
+    return size - max(preds)
 
 
 def _page_items(page: StyledPage) -> list[tuple[int, int, str, object]]:
@@ -189,9 +210,11 @@ def _add_page(docx_doc, page: StyledPage, ctx: Ctx, styles: dict[str, WordStyle]
             if not item.wrap and params["nowrap_slack_ratio"]:
                 extra = w * params["nowrap_slack_ratio"]
                 aligns = {sp.align for sp in item.paragraphs}
-                shift = extra / 2 if aligns == {Align.CENTER} else (extra if aligns == {Align.RIGHT} else 0.0)
-                if not rot:  # 旋轉的框以中心旋轉，加寬會移動中心，不加
-                    x, w = x - shift, w + extra
+                # 只加寬靠左（含左右對齊）的框；置中與靠右的框實測在 LibreOffice 加寬後位置會偏
+                if not rot and aligns <= {Align.LEFT, Align.JUSTIFY}:  # 旋轉的框以中心旋轉，加寬會移動中心，不加
+                    w = w + extra
+            if params["baseline_compensation"] and not rot:
+                y += _baseline_shift(item) * s
             fb = vml_textbox_fallback(blocks, x=x, y=y, w=w, h=h, rot=rot, z_index=rel[0] + 2) if params["vml_fallback"] else None
             place(textbox_wsp(blocks, w, h, rot, item.wrap, params["textbox_autofit"]), URI_WPS, item.id, x, y, w, h, rot, behind, True, fb)
             expect_texts.extend("".join(r.text for r in sp.runs) for sp in item.paragraphs)

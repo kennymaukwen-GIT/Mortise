@@ -261,13 +261,15 @@ def test_fixed_text_fonts_size_color_position(synth):
     x = int(a.find(f"{q('wp:positionH')}/{q('wp:posOffset')}").text)
     y = int(a.find(f"{q('wp:positionV')}/{q('wp:posOffset')}").text)
     ext = a.find(q("wp:extent"))
-    assert abs(x / 12700 - 72) < 0.5 and abs(y / 12700 - 72) < 0.5
+    shift = docx_fixed._baseline_shift(synth["doc"].pages[0].text_boxes[0])  # 基線補償（依驗證字型的上緣量度）
+    assert abs(shift) < 0.1 * 24
+    assert abs(x / 12700 - 72) < 0.5 and abs(y / 12700 - (72 + shift)) < 0.5
     assert int(ext.get("cx")) == emu(400 * 1.15) and int(ext.get("cy")) == emu(30)  # 不換行的框往右加寬 15%（靠左對齊，x 不變）
     assert a.find(f".//{q('wps:bodyPr')}").get("wrap") == "none"  # 單行文字框不換行
     runs = runs_of(a)
     assert [t for _, t in runs] == ["年度報告 ", "Annual Report"]
     (r0, _), (r1, _) = runs
-    assert rfonts_of(r0) == {"ascii": CJK, "hAnsi": CJK, "eastAsia": CJK, "cs": CJK}
+    assert rfonts_of(r0) == {"ascii": LAT, "hAnsi": LAT, "eastAsia": CJK, "cs": LAT}  # 中文段：東亞欄位寫中文字型
     assert rfonts_of(r1) == {"ascii": LAT, "hAnsi": LAT, "eastAsia": CJK, "cs": LAT}  # 拉丁段的東亞欄位寫鄰近的中文字型
     for r in (r0, r1):
         rpr = r.find(q("w:rPr"))
@@ -420,8 +422,9 @@ def test_flow_styles_and_direct_formatting(synth):
     assert body.style.name == "內文"
     # 與樣式相同的屬性不寫直接格式；中文段只寫字型
     assert body.runs[0]._r.find(q("w:rPr")) is None
-    assert rfonts_of(body.runs[1]._r) == {"ascii": CJK, "hAnsi": CJK, "eastAsia": CJK, "cs": CJK}
-    assert body.runs[1]._r.find(f"{q('w:rPr')}/{q('w:sz')}") is None
+    assert body.runs[1]._r.find(q("w:rPr")) is None  # 中文段的字型欄位也與樣式相同（樣式的 eastAsia 是中文字型）
+    s1 = d.styles["內文"].element.find(f"{q('w:rPr')}/{q('w:rFonts')}")
+    assert (s1.get(q("w:ascii")), s1.get(q("w:hAnsi")), s1.get(q("w:eastAsia"))) == (LAT, LAT, CJK)
     sec = d.sections[0]
     assert (round(sec.page_width.pt), round(sec.page_height.pt)) == (612, 792)  # 取第一頁
     assert round(sec.left_margin.pt) == 72 and round(sec.top_margin.pt) == 72
@@ -505,8 +508,11 @@ def test_real_fixtures_selfcheck(real, name):
                     assert t in allt, (mode, t)
 
 
-def _position_errors(src_pdf: Path, out_pdf: bytes, doc: StyledDoc) -> list[float]:
-    """原 PDF 與 LibreOffice 渲染結果中，同一段落第一個字的基線起點距離（pt）。
+def _position_errors(src_pdf: Path, out_pdf: bytes, doc: StyledDoc, first_only: bool = True, aligns=(Align.LEFT, Align.JUSTIFY)) -> list[float]:
+    """原 PDF 與 LibreOffice 渲染結果中，同一段落第一個字的基線起點距離（pt，取 x、y 較大者）。
+    first_only：只量每個文字框的第一段（文字框位置）；否則每段都量（含行距推論造成的累積誤差）。
+    aligns：只量這些對齊方式的段落。置中、靠右的字起點取決於整行寬度；成品文件沒有字距欄位，
+    來源與目標引擎的行寬差多少，起點就差一半或全部（slide_dark 的置中標題行寬差 10.8 pt），那不是框的位置誤差。
     以段落開頭 4 個非空白字元在兩邊各只出現一次為準，避免配錯。"""
     src, got = pdf_pages(src_pdf.read_bytes()), pdf_pages(out_pdf)
     errs = []
@@ -516,7 +522,9 @@ def _position_errors(src_pdf: Path, out_pdf: bytes, doc: StyledDoc) -> list[floa
         for tb in page.text_boxes:
             if tb.box.rotation:
                 continue
-            for sp in tb.paragraphs:
+            for sp in tb.paragraphs[:1] if first_only else tb.paragraphs:
+                if sp.align not in aligns:
+                    continue
                 key = norm_text("".join(r.text for r in sp.runs))[:4]
                 if len(key) < 2 or stext.count(key) != 1 or gtext.count(key) != 1:
                     continue
@@ -541,7 +549,10 @@ def test_real_fixtures_libreoffice(real):
                         t = norm_text(flow_text(sp) if mode == "flow" else "".join(x.text for x in sp.runs))
                         assert t in got or (mode == "flow" and sp.role == Role.PAGE_NUMBER), (name, mode, t)
         all_errs[name] = _position_errors(FIXTURES / f"{name}.pdf", r["fixed_pdf"], doc)
+        para_errs = _position_errors(FIXTURES / f"{name}.pdf", r["fixed_pdf"], doc, first_only=False, aligns=tuple(Align))
+        print(f"\n{name} 每段、各種對齊（含行距累積與行寬差）：n={len(para_errs)} 中位數 {statistics.median(para_errs):.2f} 最大 {max(para_errs):.2f}")
     flat = [e for v in all_errs.values() for e in v]
-    print("\n位置誤差（pt）：", {k: (len(v), round(statistics.median(v), 2) if v else None, round(max(v), 2) if v else None) for k, v in all_errs.items()})
+    print("\n文字框位置誤差（pt）（數量, 中位數, 最大）：", {k: (len(v), round(statistics.median(v), 2) if v else None, round(max(v), 2) if v else None) for k, v in all_errs.items()})
+    print(f"全部：n={len(flat)} 中位數 {statistics.median(flat):.2f} 最大 {max(flat):.2f}")
     assert len(flat) >= 10
     assert max(flat) < 2.0, all_errs

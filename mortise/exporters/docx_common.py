@@ -222,11 +222,13 @@ class WordStyle:
 
 
 def run_format(sr: StyledRun, latin: str, ea: str, scale: float = 1.0) -> RunFmt:
-    """字型欄位：東亞文字段四欄都寫它自己的字型（原件裡這段的英數字也是用它畫的）；
-    拉丁文字段的東亞欄位寫鄰近的東亞字型，使用者在這裡打中文時才不會落回預設字型。"""
+    """字型欄位：東亞文字段的 eastAsia 寫它自己的字型、ascii／hAnsi 寫鄰近的拉丁字型；
+    拉丁文字段的 ascii／hAnsi 寫它自己的字型、eastAsia 寫鄰近的東亞字型。
+    實測：東亞段尾的半形空白若用中文字型畫，空白寬約 0.5 em，置中的標題因此偏移 5 pt 以上；
+    交給拉丁字型（Word 本來就依字元範圍選欄位）後誤差消失。使用者在任何位置打中文或英文都不會落回預設字型。"""
     fam = sr.font.family.value
     return RunFmt(
-        ascii=fam,
+        ascii=(latin or fam) if sr.font.east_asian else fam,
         east_asia=fam if sr.font.east_asian else (ea or fam),
         size_half=half_pt(sr.size_pt.value * scale),
         bold=sr.bold,
@@ -976,3 +978,30 @@ def save_bytes(docx_doc) -> bytes:
 
 def table_texts(tbl: StyledTable) -> list[str]:
     return ["".join(r.text for r in sp.runs) for c in tbl.cells for sp in c.paragraphs]
+
+
+# ---------- 字型量度（基線補償用） ----------
+
+_ASCENT_CACHE: dict[str, Optional[float]] = {}
+
+
+def font_first_baseline_em(family: str) -> Optional[float]:
+    """文字引擎（LibreOffice）放第一行基線的位置，以 em 為單位：hhea 上緣加行距間隙。
+    用伺服器上實際的字型檔（fc-match 找檔、fontTools 讀量度）；找不到就回傳 None。"""
+    if family in _ASCENT_CACHE:
+        return _ASCENT_CACHE[family]
+    val = None
+    try:
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        path = subprocess.run(["fc-match", "-f", "%{file}", family], capture_output=True, text=True, timeout=10).stdout.strip()
+        if path:
+            f = TTFont(path, fontNumber=0, lazy=True)
+            hhea, upm = f["hhea"], f["head"].unitsPerEm
+            val = (hhea.ascent + max(0, hhea.lineGap)) / upm
+    except Exception:
+        val = None
+    _ASCENT_CACHE[family] = val
+    return val

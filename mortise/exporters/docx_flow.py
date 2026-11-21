@@ -93,7 +93,8 @@ DEFAULT_PARAMS = {
     "column_min_height_ratio": 0.2,  # 每一欄的高度至少佔頁高此比例
     "center_tolerance": 0.1,  # 頁首頁尾的框中心離版心中線在此比例內，視為置中
     "min_gap_pt": 0.5,  # 小於此值的空隙不寫段前距離
-    "bottom_slack_pt": 12.0,  # 下邊界比內容外框少留這麼多，Word 的行高略大時最後一行才不會被擠到下一頁
+    "bottom_slack_pt": 12.0,  # 下邊界比內容外框少留這麼多（取這個值與頁高比例的較大者）：
+    "bottom_slack_ratio": 0.03,  # 目標軟體的行高略大時誤差會累積，最後一段（連同標題的「與下段同頁」）才不會被擠到下一頁
     "float_side_images": True,  # 上緣在目前文字流底部之上的圖片改成浮動圖片（錨在最近的段落），不往下堆疊
     "float_offflow_boxes": True,  # 同理，這類文字框（側欄、壓在圖上的說明）改成浮動文字方塊
     "nowrap_slack_ratio": 0.15,  # 浮動文字方塊不換行時加寬的比例（同版面固定模式）
@@ -569,7 +570,7 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     left = clamp(min(xs0, default=72.0), W)
     right = clamp(W - max(xs1, default=W - 72.0), W)
     top = clamp(min(ys0, default=72.0), H)
-    bottom = clamp(H - max(ys1, default=H - 72.0) - params["bottom_slack_pt"], H)
+    bottom = clamp(H - max(ys1, default=H - 72.0) - max(params["bottom_slack_pt"], params["bottom_slack_ratio"] * H), H)
     right_x = W - right
     expect: list[str] = []
     hdr, ftr = _write_header_footer(docx_doc, doc, ctx, styles, s, left, right_x, params, expect)
