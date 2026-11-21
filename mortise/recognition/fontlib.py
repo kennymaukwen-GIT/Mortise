@@ -45,7 +45,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+import logging
+
 import numpy as np
+
+logging.getLogger("fontTools").setLevel(logging.ERROR)  # 部分字型的時間戳記欄位會觸發無害的警告
 
 DEFAULT_PARAMS: dict = {
     # 額外的字型目錄（字串清單）；會遞迴掃描其中的 .ttf/.otf/.ttc
@@ -413,7 +417,7 @@ class FontFace:
     # ------------------------------------------------------------ 衍生量度
 
     def stem_ratio(self, cjk: bool = False) -> float:
-        """筆畫粗細 ÷ 字級（以探針字串量；距離轉換的脊線中位數 × 2）。"""
+        """筆畫粗細 ÷ 字級（以探針字串量；2 × 面積 ÷ 輪廓總長，見 stroke_width_soft）。"""
         key = "cjk" if cjk else "latin"
         if key not in self._stem:
             probe = self.params.get("stem_probe_cjk" if cjk else "stem_probe_latin", "nmhuil")
@@ -423,7 +427,7 @@ class FontFace:
                 self._stem[key] = 0.08
             else:
                 m = self.render_layout(probe, size).mask
-                self._stem[key] = stroke_width_px(m >= 0.5) / size
+                self._stem[key] = stroke_width_soft(m) / size
         return self._stem[key]
 
     @property
@@ -460,6 +464,24 @@ def _paste_max(canvas: np.ndarray, arr: np.ndarray, x0: int, y0: int) -> None:
         return
     sub = arr[cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0]
     np.maximum(canvas[cy0:cy1, cx0:cx1], sub, out=canvas[cy0:cy1, cx0:cx1])
+
+
+def stroke_width_soft(cov: np.ndarray) -> float:
+    """筆畫粗細（像素）的次像素估計：2 × 墨跡面積 ÷ 輪廓總長（總變差）。
+
+    對細長筆畫，面積 = 寬 × 長、輪廓 ≈ 2 × 長，所以寬 = 2A ÷ P。面積與總變差在對稱模糊下都不變，
+    所以這個估計不受模糊影響（模糊讓相鄰筆畫黏在一起時才會偏小）。
+    """
+    import cv2
+
+    c = np.asarray(cov, np.float32)
+    if c.size == 0 or c.max() <= 0:
+        return 0.0
+    c = np.pad(c, 1)
+    gx = cv2.Sobel(c, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    gy = cv2.Sobel(c, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    tv = float(np.hypot(gx, gy).sum())
+    return 2.0 * float(c.sum()) / tv if tv > 0 else 0.0
 
 
 def stroke_width_px(binary: np.ndarray) -> float:

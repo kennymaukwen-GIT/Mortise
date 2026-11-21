@@ -13,6 +13,8 @@
 3. 屬性（字級、字型、顏色、粗斜體）以「標準答案的樣式段」為單位比較：用第 2 步的逐字對齊，
    找出這個樣式段的字大多對到預測的哪一段，再比兩段的屬性。字型名稱先正規化
    （去子集前綴、去標點空白、去結尾的 Bold／Italic／MT 等樣式字、套別名表）。顏色差用 CIE76 ΔE（sRGB → Lab，D65）。
+   位置誤差取四角四種循環對應中最小的平均距離（與方向無關）；方向另外以「上邊角度差 < 45°」算正確率，
+   這樣旋轉 90° 的文字被讀成水平框時，會反映在方向正確率，而不是一個巨大的位置誤差。
 4. 圖片與形狀：同樣以 IoU＋匈牙利法配對；形狀另外比幾何種類。預設忽略整頁底圖與整頁底色矩形。
 5. 結構：段落分組的成對 F1（任兩條「已配對」的行：標準答案是否同段 vs 預測是否同段）；
    文字框數 ÷ 段落數（分母優先用標準答案的段落數，才看得出過碎）；閱讀順序的成對一致率（Kendall 式）。
@@ -50,6 +52,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "text_iou_threshold": 0.5,  # 文字行配對的最低 IoU（0 到 1）
     "region_iou_threshold": 0.5,  # 圖片與形狀配對的最低 IoU（0 到 1）
     "min_box_thickness_pt": 2.0,  # 算 IoU 前，寬或高小於此值的框撐到此厚度（pt；直線形狀需要）
+    "orientation_tolerance_deg": 45.0,  # 文字方向（四角的上邊角度）與標準答案相差小於此值才算方向正確（度）
     "cer_ignore_spaces": True,  # 字元錯誤率是否忽略空白（OCR 的空白很不穩定，且不影響可編輯性）
     "cer_nfkc": True,  # 比較文字前是否做 NFKC 正規化（全形半形標點視為相同）
     "ignore_full_page_images": True,  # 圖片指標是否忽略「整頁底圖」
@@ -102,7 +105,8 @@ METRICS: dict[str, MetricInfo] = {
     "cer_zh": MetricInfo("字元錯誤率（中文）", "比例", False, "文字", 0.005),
     "cer_en": MetricInfo("字元錯誤率（英文與數字標點）", "比例", False, "文字", 0.005),
     "page_cer": MetricInfo("整頁字元錯誤率（含漏抓多抓）", "比例", False, "文字", 0.01),
-    "position_error_pt": MetricInfo("文字行位置誤差（四角平均）", "pt", False, "文字", 0.25),
+    "position_error_pt": MetricInfo("文字行位置誤差（四角平均，與方向無關）", "pt", False, "文字", 0.25),
+    "orientation_accuracy": MetricInfo("文字方向正確率", "比例", True, "文字", 0.01),
     "baseline_error_pt": MetricInfo("基線偏移", "pt", False, "文字", 0.25),
     "size_error_pt": MetricInfo("字級誤差", "pt", False, "文字", 0.1),
     "size_error_pct": MetricInfo("字級相對誤差", "%", False, "文字", 0.5),
@@ -293,16 +297,19 @@ def char_class(ch: str) -> str:
     return "zh" if is_cjk(ch) else "en"
 
 
-def _norm_chars(line: TextLine, p: dict) -> list[tuple[str, int]]:
-    """把一行拆成（字、樣式段索引）；依參數做 NFKC 與去空白。"""
+def _norm_chars(line: TextLine, p: dict) -> list[tuple[str, int, str]]:
+    """把一行拆成（字、樣式段索引、文字類別）；依參數做 NFKC 與去空白。
+
+    文字類別依「正規化之前」的字判斷：全形逗號 NFKC 後變成半形，但仍算中文的錯誤。"""
     out = []
     for ri, r in enumerate(line.runs):
         for ch in r.text:
+            cls = char_class(ch)
             s = unicodedata.normalize("NFKC", ch) if p["cer_nfkc"] else ch
             for c in s:
                 if p["cer_ignore_spaces"] and c.isspace():
                     continue
-                out.append((c, ri))
+                out.append((c, ri, cls))
     return out
 
 
@@ -413,7 +420,7 @@ class Accumulator:
             out["page_cer"] = c("page_err", 0) / c("page_chars", 0)
         for k in ("position_error_pt", "baseline_error_pt", "size_error_pt", "size_error_pct", "color_delta_e"):
             out[k] = _mean(L(k, []))
-        for k in ("font_top1", "font_top3", "bold_accuracy", "italic_accuracy", "shape_kind_accuracy", "reading_order"):
+        for k in ("orientation_accuracy", "font_top1", "font_top3", "bold_accuracy", "italic_accuracy", "shape_kind_accuracy", "reading_order"):
             out[k] = _mean(L(k, []))
         for kind in ("image", "shape"):
             t, pr, m = c(f"{kind}_truth", 0), c(f"{kind}_pred", 0), c(f"{kind}_matched", 0)
@@ -475,12 +482,12 @@ def compare_texts(pred: ElementList, truth: ElementList, page_width_pt: float, p
     page_err = 0
     for i, j, _ in pairs:
         tc, pc = tchars[i], pchars[j]
-        path = align([c for c, _ in tc], [c for c, _ in pc])
+        path = align([c[0] for c in tc], [c[0] for c in pc])
         errs = 0
         run_votes: dict[int, list[int]] = {}
         for a, b in path:
             if a is not None:
-                cls = char_class(tc[a][0])
+                cls = tc[a][2]
                 acc.add("chars_all")
                 acc.add(f"chars_{cls}")
                 wrong = b is None or tc[a][0] != pc[b][0]
@@ -491,15 +498,19 @@ def compare_texts(pred: ElementList, truth: ElementList, page_width_pt: float, p
                 if b is not None:
                     run_votes.setdefault(tc[a][1], []).append(pc[b][1])
             else:  # 插入：依插入的字歸類
-                cls = char_class(pc[b][0])
+                cls = pc[b][2]
                 errs += 1
                 acc.add("err_all")
                 acc.add(f"err_{cls}")
         page_err += errs
         # 位置
         t, q = tl[i], pl[j]
-        d = [math.hypot(a.x - b.x, a.y - b.y) for a, b in zip(t.quad.points, q.quad.points)]
-        acc.push("position_error_pt", float(np.mean(d)) * page_width_pt)
+        # 位置：四角平均距離，取四種循環對應中最小的（與方向無關；方向另外算）
+        tp, qp = t.quad.points, q.quad.points
+        d = min(float(np.mean([math.hypot(tp[k].x - qp[(k + r) % 4].x, tp[k].y - qp[(k + r) % 4].y) for k in range(4)])) for r in range(4))
+        acc.push("position_error_pt", d * page_width_pt)
+        diff = (q.quad.angle_deg - t.quad.angle_deg + 180.0) % 360.0 - 180.0
+        acc.push("orientation_accuracy", float(abs(diff) < p["orientation_tolerance_deg"]))
         mid = ((t.baseline[0].x + t.baseline[1].x) / 2, (t.baseline[0].y + t.baseline[1].y) / 2)
         if use_baseline:
             acc.push("baseline_error_pt", _perp_dist(mid, q.baseline[0], q.baseline[1]) * page_width_pt)

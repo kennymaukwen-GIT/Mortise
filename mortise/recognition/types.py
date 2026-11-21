@@ -35,6 +35,7 @@ class OcrChar:
     x0: float  # 這個字沿文字行方向的起點（像素，以行四角的左上角為 0）
     x1: float  # 終點
     candidates: list[CharCandidate] = field(default_factory=list)  # 含第一名，機率由高到低
+    x_error: float = 0.0  # x0、x1 的誤差範圍（像素，約一個標準差）
 
 
 @dataclass
@@ -44,6 +45,9 @@ class OcrLine:
     score: float  # 整行的信心值
     chars: list[OcrChar] = field(default_factory=list)  # 與 text 的字元一一對應（空白也算一個字）
     vertical: bool = False  # 直排
+    quad_error: float = 0.0  # 四角位置的誤差範圍（像素，約一個標準差）
+    angle_error_deg: float = 0.0  # 行角度的誤差範圍（度）
+    notes: list[str] = field(default_factory=list)  # 量測旗標，例如「低解析度」「旋轉 90 度的橫排文字」
 
 
 # ---------------------------------------------------------------- 文字屬性（text_attributes.py）
@@ -74,6 +78,11 @@ class RunAttributes:
     strikethrough: bool = False
     char_spacing_px: Optional[Estimate] = None  # 額外字距；量不出來就留空
     notes: list[str] = field(default_factory=list)  # 例如「有外框特效，字級量測不可靠」
+    # ---- 以下為 text_attributes.py 追加的欄位（皆有預設值）
+    slant_deg: Optional[Estimate] = None  # 傾斜角（度，向右傾為正）原始量測
+    stroke_width_px: Optional[Estimate] = None  # 筆畫粗細（像素）原始量測
+    x_scale: Optional[Estimate] = None  # 水平縮放倍率原始量測（偵測到水平縮放時才有）
+    size_evidence: dict[str, Estimate] = field(default_factory=dict)  # 各項字級證據（像素）：height、width、pitch 等
 
 
 @dataclass
@@ -85,6 +94,10 @@ class LineAttributes:
     mask: np.ndarray  # 筆畫遮罩（bool），在「攤平的行」座標系中：x 沿基線、y 垂直基線
     mask_to_image: np.ndarray  # 3×3 矩陣：攤平座標 → 工作影像座標
     notes: list[str] = field(default_factory=list)
+    # ---- 以下為 text_attributes.py 追加的欄位（皆有預設值）
+    baseline_error_px: float = 0.0  # 基線位置的誤差（像素，約一個標準差）
+    polarity: str = ""  # "dark_on_light"（深字淺底）或 "light_on_dark"（淺字深底）
+    blur_px: float = 0.0  # 估計的模糊程度（高斯 σ，工作影像像素）
 
 
 # ---------------------------------------------------------------- 區域（regions.py）
