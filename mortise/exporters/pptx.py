@@ -71,6 +71,25 @@ def _fill_paragraphs(tf, paragraphs, element_id: str, degradations: list[Degrada
                 degradations.append(Degradation(element_id=tb_id, concept="文字透明度", action="以不透明顏色輸出", lossy=True))
 
 
+def _background_picture(slide, path) -> None:
+    """投影片背景設成一張圖（p:bg 的 blipFill，拉伸填滿）。"""
+    _, rid = slide.part.get_or_add_image_part(str(path))
+    cSld = slide._element.cSld
+    old = cSld.find(qn("p:bg"))
+    if old is not None:
+        cSld.remove(old)
+    bg = etree.Element(qn("p:bg"))
+    bgPr = etree.SubElement(bg, qn("p:bgPr"))
+    blipFill = etree.SubElement(bgPr, qn("a:blipFill"))
+    blipFill.set("dpi", "0")
+    blipFill.set("rotWithShape", "1")
+    blip = etree.SubElement(blipFill, qn("a:blip"))
+    blip.set(qn("r:embed"), rid)
+    etree.SubElement(etree.SubElement(blipFill, qn("a:stretch")), qn("a:fillRect"))
+    etree.SubElement(bgPr, qn("a:effectLst"))
+    cSld.insert(0, bg)
+
+
 def _drop_style(shape) -> None:
     """拿掉形狀的主題樣式參照（p:style）。填色與線條都已明確寫出；留著它，
     LibreOffice 會依 effectRef 畫出主題陰影，PowerPoint 則不會，兩邊看起來就不一樣。"""
@@ -101,9 +120,14 @@ def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradatio
         fill.solid()
         fill.fore_color.rgb = RGBColor(page.background_color.r, page.background_color.g, page.background_color.b)
     if page.background_image is not None:
-        pic = slide.shapes.add_picture(str(store.blob_path(page.background_image)), 0, 0, prs.slide_width, prs.slide_height)
-        pic.name = f"background-{page.page_index + 1}"
-        degradations.append(Degradation(element_id=pic.name, concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))
+        name = f"background-{page.page_index + 1}"
+        if layout is not None:
+            # 有母片時，底圖要放在投影片背景（畫在母片之下），不能是投影片上的圖片（會蓋住母片元素）
+            _background_picture(slide, store.blob_path(page.background_image))
+        else:
+            pic = slide.shapes.add_picture(str(store.blob_path(page.background_image)), 0, 0, prs.slide_width, prs.slide_height)
+            pic.name = name
+        degradations.append(Degradation(element_id=name, concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))
     _add_elements(slide, page, store, degradations, fonts, skip)
 
 
