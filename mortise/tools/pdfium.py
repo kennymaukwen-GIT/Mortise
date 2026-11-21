@@ -175,9 +175,15 @@ class PageReader:
                             descent = d.value
                 m = raw.FS_MATRIX()
                 vscale = hscale = 1.0
+                # PDFium 回報的字元角度是順時針的；這裡統一成 PDF 空間中逆時針為正
+                angle = -float(raw.FPDFText_GetCharAngle(tp, i)) % (2 * math.pi)
                 if raw.FPDFText_GetMatrix(tp, i, ctypes.byref(m)):
                     vscale = math.hypot(m.c, m.d) or 1.0
                     hscale = (math.hypot(m.a, m.b) or 1.0) / vscale
+                    if abs(m.a) + abs(m.b) > 1e-9:
+                        angle = math.atan2(m.b, m.a)  # 文字矩陣的 x 軸方向最可靠
+                if angle > math.pi:
+                    angle -= 2 * math.pi
                 size = raw_size * vscale
                 out.append(
                     RawChar(
@@ -185,7 +191,7 @@ class PageReader:
                         loose_box=(rect.left, rect.bottom, rect.right, rect.top),
                         font_base=base, font_family=family, font_weight=weight, font_italic_angle=italic_angle,
                         size=size, fill=_rgba(raw.FPDFText_GetFillColor, tp, i), stroke=_rgba(raw.FPDFText_GetStrokeColor, tp, i),
-                        render_mode=mode, angle=float(raw.FPDFText_GetCharAngle(tp, i)), generated=generated,
+                        render_mode=mode, angle=angle, generated=generated,
                         map_error=bool(raw.FPDFText_HasUnicodeMapError(tp, i)), obj_key=_key(obj) if obj else 0,
                         ascent=(ascent * vscale) or size * 0.9, descent=(descent * vscale) or -size * 0.2, hscale=hscale,
                     )

@@ -131,7 +131,12 @@ def read_text_lines(reader: pdf.PageReader, page_index: int, m: list[float], src
             ux, uy = math.cos(prev.angle), math.sin(prev.angle)
             dx, dy = ch.origin[0] - prev.origin[0], ch.origin[1] - prev.origin[1]
             along, across = dx * ux + dy * uy, -dx * uy + dy * ux
-            prev_adv = (prev.loose_box[2] - prev.loose_box[0]) if abs(prev.angle) < 1e-3 else prev.size * 0.5
+            if abs(uy) < 0.02:
+                prev_adv = prev.loose_box[2] - prev.loose_box[0]
+            elif abs(ux) < 0.02:
+                prev_adv = prev.loose_box[3] - prev.loose_box[1]
+            else:
+                prev_adv = prev.size * 0.5
             size = max(prev.size, ch.size)
             if (
                 abs(ch.angle - prev.angle) > math.radians(1.0)
