@@ -46,6 +46,8 @@ uvicorn mortise.api.app:app --host 0.0.0.0 --port 8000
 python -m mortise.eval run 樣本目錄 --out 報表目錄
 ```
 
+用真實樣本與回饋提升精準度的完整流程：[docs/accuracy-loop.md](docs/accuracy-loop.md)。
+
 ## 大型 AI
 
 設定檔 `mortise/config/default.toml` 的 `[ai]` 一節。預設用 Claude（`claude-opus-5-5`），只有在有憑證（`ANTHROPIC_API_KEY` 或 `ant auth login`）時才會呼叫；沒有憑證時全部用規則判斷。AI 只回答編號、標籤或在候選中選擇，座標與數值一律由演算法量測。每頁、每份文件都有呼叫次數與花費上限。
