@@ -1,7 +1,7 @@
 """⑦ 驗證：收輸出檔與工作影像，交出還原度報告 FidelityReport 與修正單。
 
 放在輸出之後，分兩道：
-  7A 中性驗證（s7.neutral）：用自家確定性的渲染把成品文件畫出來，檢查③④⑤對不對。尚未實作。
+  7A 中性驗證（s7.neutral）：用自家確定性的渲染（ai_pdf 輸出器）把成品文件畫出來，與原圖比相似度，檢查③④⑤對不對。
   7B 目標驗證（s7.target）：用目標軟體或替身引擎渲染輸出檔，檢查轉檔後有沒有跑版。
      目前的替身引擎是 LibreOffice（不是使用者手上的 PowerPoint，報告中會註明）。
 其他步驟：
@@ -56,8 +56,14 @@ def run(
     outputs: list[OutputFile], cfg: Config, store: Store, round_no: int = 0,
 ) -> FidelityReport:
     c = cfg.section("verify")
-    notes: list[str] = ["7A 中性驗證尚未實作；目前的分數全部來自 7B 目標驗證。"]
+    notes: list[str] = []
     pages = [_field_report(spec, el, layout, styled) for spec, el in zip(specs, elements)]
+    neutral_engine = None
+    if c.get("neutral", True):
+        try:
+            pages, neutral_engine = _neutral_verify(specs, elements, layout, styled, pages, cfg, store)
+        except Exception as e:  # 中性渲染失敗不影響其他驗證
+            notes.append(f"7A 中性驗證沒有執行：{type(e).__name__}: {e}")
     target_engine = None
     target_render = None
     proposals: list[Correction] = []
@@ -82,6 +88,8 @@ def run(
     scores = []
     for p in pages:
         if p.target_similarity is None:
+            if p.neutral_similarity is not None:
+                scores.append(p.neutral_similarity)
             continue
         boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
         good = [e for e in boxes if e.text_match and e.linebreak_match and (e.position_error_pt or 0.0) <= c["position_tolerance_pt"]]
@@ -92,7 +100,7 @@ def run(
             notes.append(f"{o.format.value}：{d.concept} → {d.action}")
     notes.extend(styled.notes)
     return FidelityReport(
-        target_engine=target_engine, pages=pages, overall_score=(sum(scores) / len(scores)) if scores else None,
+        neutral_engine=neutral_engine, target_engine=target_engine, pages=pages, overall_score=(sum(scores) / len(scores)) if scores else None,
         field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes, target_render=target_render,
     )
 
@@ -150,6 +158,42 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
     for n in el.notes + spec.notes:
         issues.append(Issue(severity=Severity.INFO, code="note", message=n))
     return PageReport(page_index=page, elements=reports, issues=issues)
+
+
+# ---------- s7.neutral（7A）----------
+
+
+def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store):
+    """7A 中性驗證：用自家確定性的渲染（給 Illustrator 的 PDF 輸出器，ReportLab 加開放字型）把成品文件畫出來，
+    與工作影像比對。它不依賴任何辦公軟體，所以檢查的是③④⑤的結果本身：位置、字級、字型寬度、斷行。
+    不能檢查目標軟體的重新斷行（那是 7B 的工作）。"""
+    from . import s6_export
+    from ..artifacts import OutputFormat
+
+    c = cfg.section("verify")
+    out = s6_export.run(styled, OutputFormat.AI_PDF, "neutral", cfg, store)
+    engine = "Mortise 中性渲染（ReportLab，開放授權字型）"
+    new_pages = []
+    pdoc = pdf.open_document(str(store.blob_path(out.file)))
+    try:
+        for spec, report in zip(specs, pages):
+            if spec.page_index >= len(pdoc):
+                new_pages.append(report)
+                continue
+            reader = pdf.PageReader(pdoc, spec.page_index)
+            try:
+                image = reader.render(c["render_dpi"])
+            finally:
+                reader.close()
+            working = Image.open(store.blob_path(spec.working_image))
+            sim = similarity(working, image)
+            issues = list(report.issues)
+            if sim < c.get("neutral_similarity_pass", 0.95):
+                issues.append(Issue(severity=Severity.WARNING, code="neutral_low_similarity", message=f"中性渲染與原圖的相似度 {sim:.3f} 偏低：辨識、結構或設定可能有誤。"))
+            new_pages.append(report.model_copy(update={"neutral_similarity": sim, "issues": issues}))
+    finally:
+        pdoc.close()
+    return new_pages, engine
 
 
 # ---------- s7.target、s7.compare、s7.propose ----------

@@ -67,6 +67,8 @@ position_fix_threshold_pt = 0.3      # 位置誤差超過此值就開修正單�
 similarity_pass = 0.97               # 整頁相似度合格線（0 到 1，初始值）
 max_rounds = 2                       # 修正迴圈最多幾輪
 low_confidence = 0.7                 # 信心值低於此值的元素，在預覽中標出來請使用者確認（初始值）
+neutral = true                       # 7A 中性驗證（需要 ai_pdf 輸出器）
+neutral_similarity_pass = 0.95       # 中性渲染與原圖的相似度合格線（初始值）
 libreoffice_timeout_s = 120          # 目標渲染逾時（秒）
 
 [ai]                                 # 大型 AI（只回答編號、標籤、或在候選中選擇）
