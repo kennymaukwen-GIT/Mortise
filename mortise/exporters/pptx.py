@@ -330,7 +330,33 @@ def _build_master(prs, doc: StyledDoc, store: Store, degradations: list[Degradat
     return layout, frozenset(master.member_ids)
 
 
-def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFile:
+def apply_adjustments(doc: StyledDoc, adjust: dict[str, dict]) -> StyledDoc:
+    """套用⑦為 PowerPoint 開的渲染修正（只在這個輸出器內，成品文件本身不變）：
+    width_adjust_pt 依對齊方式加寬或縮窄文字框；offset_pt 平移文字框。"""
+    if not adjust:
+        return doc
+    pages = []
+    for page in doc.pages:
+        boxes = []
+        for tb in page.text_boxes:
+            a = adjust.get(tb.id)
+            if a:
+                box = tb.box
+                if "width_adjust_pt" in a:
+                    delta = float(a["width_adjust_pt"])
+                    align = tb.paragraphs[0].align if tb.paragraphs else Align.LEFT
+                    dx = 0.0 if align in (Align.LEFT, Align.JUSTIFY) else (-delta if align == Align.RIGHT else -delta / 2)
+                    box = box.model_copy(update={"x": box.x + dx, "w": max(1.0, box.w + delta)})
+                if "offset_pt" in a:
+                    box = box.model_copy(update={"x": box.x + float(a["offset_pt"][0]), "y": box.y + float(a["offset_pt"][1])})
+                tb = tb.model_copy(update={"box": box})
+            boxes.append(tb)
+        pages.append(page.model_copy(update={"text_boxes": boxes}))
+    return doc.model_copy(update={"pages": pages})
+
+
+def export(doc: StyledDoc, basename: str, cfg: Config, store: Store, adjust: dict | None = None) -> OutputFile:
+    doc = apply_adjustments(doc, adjust or {})
     prs = Presentation()
     first = doc.pages[0]
     prs.slide_width = Emu(pt_to_emu(first.width_pt))

@@ -7,7 +7,7 @@
 其他步驟：
   s7.compare   逐區比對：位置誤差、文字是否一致、斷行是否一致、整頁相似度
   s7.fields    每個元素每個欄位標示 精確擷取／量測吸附／AI 判斷／生成／使用者／無法還原
-  s7.propose   開修正單（目前只有：斷行不一致 → 調整文字框寬度，送給⑤）
+  s7.propose   開修正單：斷行不一致 → 調整文字框寬度；位置偏移 → 平移。這是目標軟體的渲染差異，送給⑥該格式的輸出器，不改成品文件
 """
 
 from __future__ import annotations
@@ -276,8 +276,8 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                             size = max((r.size_pt.value for p in next(t for t in sp.text_boxes if t.id == e.element_id).paragraphs for r in p.runs), default=12.0)
                             delta = (0.35 if len(got) > len(expect) else -0.35) * size * (round_no + 1)
                             proposals.append(Correction(
-                                id=f"v{round_no + 1}-{e.element_id}", target_stage=5, target_step="s5.box", page_index=spec.page_index, element_id=e.element_id,
-                                field="width_adjust_pt", new_value=round(delta, 2), instruction="斷行與原圖不一致，調整文字框寬度後重試。",
+                                id=f"v{round_no + 1}-{e.element_id}", target_stage=6, target_step="s6.pptx", page_index=spec.page_index, element_id=e.element_id,
+                                field="pptx.width_adjust_pt", new_value=round(delta, 2), instruction="斷行與原圖不一致，調整文字框寬度後重試。",
                                 source=CorrectionSource.VERIFY, round=round_no + 1,
                             ))
                     elif pos is not None and pos > c["position_tolerance_pt"]:
@@ -285,8 +285,8 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                     if breaks_ok and pos is not None and pos > c["position_fix_threshold_pt"] and round_no < c["max_rounds"]:
                         # 文字與斷行都對，只是整個框偏了（各引擎放第一行的位置不同）：把框移回去
                         proposals.append(Correction(
-                            id=f"v{round_no + 1}-{e.element_id}-offset", target_stage=5, target_step="s5.box", page_index=spec.page_index, element_id=e.element_id,
-                            field="offset_pt", new_value=[round(dx, 3), round(dy, 3)], instruction="渲染後第一行基線與原圖有偏移，平移文字框補正。",
+                            id=f"v{round_no + 1}-{e.element_id}-offset", target_stage=6, target_step="s6.pptx", page_index=spec.page_index, element_id=e.element_id,
+                            field="pptx.offset_pt", new_value=[round(dx, 3), round(dy, 3)], instruction="渲染後第一行基線與原圖有偏移，平移文字框補正。",
                             source=CorrectionSource.VERIFY, round=round_no + 1,
                         ))
                 if sim < c["similarity_pass"]:

@@ -429,7 +429,8 @@ class _Spread:
 
     def text_box(self, tb: StyledTextBox) -> None:
         single = not tb.wrap
-        self.text_frame(tb.id, tb.box, lambda st: self.d.paragraphs(st, tb.paragraphs, tb.id), self.d.first_baseline(tb.paragraphs), single, tb.paragraphs[0].align if tb.paragraphs else Align.LEFT)
+        fb = tb.first_baseline_pt if getattr(tb, "first_baseline_pt", None) is not None else self.d.first_baseline(tb.paragraphs)
+        self.text_frame(tb.id, tb.box, lambda st: self.d.paragraphs(st, tb.paragraphs, tb.id), fb, single, tb.paragraphs[0].align if tb.paragraphs else Align.LEFT)
 
     # ---------- 表格
     def table(self, t: StyledTable) -> None:

@@ -181,9 +181,11 @@ class Pipeline:
         outputs: list[OutputFile] = []
         h6s = []
         base = Path(self.state["filename"]).stem
+        c6 = self._for_stage(6)
         for fmt in intent.outputs:
-            k6 = _digest(s6_export.VERSION, cfg.key("export"), h5, fmt.value)
-            out, h6 = self._cached(6, f"s6/{fmt.value}", OutputFile, k6, lambda: s6_export.run(styled, fmt, base, cfg, store))
+            c6f = [c for c in c6 if c.field.startswith(fmt.value + ".")]
+            k6 = _digest(s6_export.VERSION, cfg.key("export"), h5, fmt.value, [c.model_dump(mode="json") for c in c6f])
+            out, h6 = self._cached(6, f"s6/{fmt.value}", OutputFile, k6, lambda: s6_export.run(styled, fmt, base, cfg, store, c6f))
             outputs.append(out)
             h6s.append(h6)
         # ⑦ 驗證

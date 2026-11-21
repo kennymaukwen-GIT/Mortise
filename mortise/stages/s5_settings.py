@@ -136,7 +136,19 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                 align = sps[0].align
                 dx = 0.0 if align in (Align.LEFT, Align.JUSTIFY) else (-slack if align == Align.RIGHT else -slack / 2)
                 box = box.model_copy(update={"x": box.x + dx, "w": box.w + slack})
-            text_boxes.append(StyledTextBox(id=tb.id, box=box, z=tb.z, paragraphs=sps, wrap=wrap))
+            first_line = lines[pars[tb.paragraph_ids[0]].line_ids[0]] if tb.paragraph_ids else None
+            first_baseline = None
+            if first_line is not None and abs(box.rotation) < 1e-9:
+                first_baseline = round(first_line.baseline[0].y * w - box.y, 3)
+            elif first_line is not None:
+                # 旋轉的框：基線到框上緣的距離沿框自身的方向量
+                import math as _m
+
+                a = _m.radians(box.rotation)
+                cx, cy = box.x + box.w / 2, box.y + box.h / 2
+                bx, by = first_line.baseline[0].x * w - cx, first_line.baseline[0].y * w - cy
+                first_baseline = round(-bx * _m.sin(a) + by * _m.cos(a) + box.h / 2, 3)
+            text_boxes.append(StyledTextBox(id=tb.id, box=box, z=tb.z, paragraphs=sps, wrap=wrap, first_baseline_pt=first_baseline))
 
         images = [StyledImage(id=im.id, box=_box(im.quad, w, el.production_line.value == "image"), z=im.z, image=im.image) for im in el.images]
         if any(im.kind.value == ImageKind.SHADOW for im in el.images):
@@ -685,7 +697,7 @@ def _tag_styles(page: StyledPage, sig_to_id: dict[tuple, str]) -> StyledPage:
 def _apply_corrections(doc: StyledDoc, corrections: list[Correction], subs: dict[str, str]) -> StyledDoc:
     """⑤接受的修正（指定文字框或段落的編號）：
     font_family、font_size_pt、color（十六進位）、align、text（改一段的文字，指名段落編號）；
-    以及⑦驗證開的 width_adjust_pt（修正斷行）、offset_pt（平移文字框）；
+    （⑦驗證為某個格式的渲染差異開的修正單，例如 PowerPoint 的框寬與位移，送給⑥該格式的輸出器，不改成品文件。）
     表格儲存格（編號為「表格編號#列,欄」）的 formula：值為 accept 表示採用推論的公式，或直接給公式，空值表示不用公式。
     """
     if not corrections:
@@ -714,15 +726,6 @@ def _apply_corrections(doc: StyledDoc, corrections: list[Correction], subs: dict
             paragraphs = list(tb.paragraphs)
             for c in corrections:
                 hits_box = c.element_id == tb.id
-                if c.field == "width_adjust_pt" and hits_box:
-                    delta = float(c.new_value)
-                    align = paragraphs[0].align if paragraphs else Align.LEFT
-                    dx = 0.0 if align in (Align.LEFT, Align.JUSTIFY) else (-delta if align == Align.RIGHT else -delta / 2)
-                    box = box.model_copy(update={"x": box.x + dx, "w": max(1.0, box.w + delta)})
-                    continue
-                if c.field == "offset_pt" and hits_box:
-                    box = box.model_copy(update={"x": box.x + float(c.new_value[0]), "y": box.y + float(c.new_value[1])})
-                    continue
                 for i, p in enumerate(paragraphs):
                     if not (hits_box or c.element_id == p.id):
                         continue

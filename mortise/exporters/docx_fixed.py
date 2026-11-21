@@ -137,22 +137,28 @@ def _shape_wsp(shape, w: float, h: float, ctx: Ctx):
 
 
 def _baseline_shift(tb) -> float:
-    """成品文件的約定：單倍行距時第一行基線在「框上緣 + 該行最大字級」。目標引擎把基線放在
-    「框上緣 + 字型上緣量度」，兩者差多少就把框移多少（pt）。只處理單倍（或未指定）行距。"""
+    """第一行基線應在「框上緣 + first_baseline_pt」（成品文件明寫；沒有時沿用舊約定「框上緣 + 字級」）。
+    目標引擎把基線放在「框上緣 + 字型上緣量度（+ 固定行高多出的行距）」，兩者差多少就把框移多少（pt）。"""
     if not tb.paragraphs or not tb.paragraphs[0].runs:
         return 0.0
     sp = tb.paragraphs[0]
     ls = sp.line_spacing.value if sp.line_spacing else None
-    if ls is not None and not (ls.mode.value == "multiple" and abs(ls.value - 1.0) < 1e-6):
-        return 0.0
     size = max(r.size_pt.value for r in sp.runs)
+    explicit = getattr(tb, "first_baseline_pt", None)
+    exact = ls is not None and ls.mode.value == "exact"
+    if ls is not None and not exact and not (ls.mode.value == "multiple" and abs(ls.value - 1.0) < 1e-6) and explicit is None:
+        return 0.0
+    target = explicit if explicit is not None else size  # 成品文件明寫了第一行基線的位置：以它為準
+    if exact:
+        # 固定行高：LibreOffice 把第一行基線放在框上緣 + 0.8 × 行高（實測 20、30、40、48 pt 都精確成立）
+        return target - 0.8 * ls.value
     preds = []
     for r in sp.runs:
         em = font_first_baseline_em(r.font.verification_family or r.font.family.value)
         if em is None:
             return 0.0
         preds.append(em * r.size_pt.value)
-    return size - max(preds)
+    return target - max(preds)  # 倍數行距：第一行上方不加行距（實測 1.0、1.5 倍相同）
 
 
 def _page_items(page: StyledPage) -> list[tuple[int, int, str, object]]:

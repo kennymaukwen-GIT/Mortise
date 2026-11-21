@@ -499,7 +499,7 @@ class _Layout:
         self.votes[best] += 1
         return best
 
-    def block(self, paragraphs: list[StyledParagraph], width: float, wrap: bool, element_id: str, slack: float = 0.0, height: Optional[float] = None) -> list[_Line]:
+    def block(self, paragraphs: list[StyledParagraph], width: float, wrap: bool, element_id: str, slack: float = 0.0, height: Optional[float] = None, first_baseline: Optional[float] = None) -> list[_Line]:
         """一個文字區（文字框或儲存格）中所有段落的行，含基線位置。
         height 是文字框的高度（用來選首行上緣的量度）；儲存格傳 None，沿用多數文字框的選擇。"""
         out: list[_Line] = []
@@ -518,10 +518,15 @@ class _Layout:
                 out.append(ln)
             prev_sp = sp
         metric = self._fit(out, height)
-        if out and metric != "hhea":
-            shift = out[0].asc_by[metric] - out[0].asc_by["hhea"]
+        if out and first_baseline is not None:
+            shift = first_baseline - out[0].baseline  # 成品文件明寫了第一行基線：直接對齊
             for ln in out:
                 ln.baseline += shift
+        else:
+            if out and metric != "hhea":
+                shift = out[0].asc_by[metric] - out[0].asc_by["hhea"]
+                for ln in out:
+                    ln.baseline += shift
         for ln in out:
             ln.ascent, ln.descent = ln.asc_by[metric], ln.desc_by[metric]
         return out
@@ -631,7 +636,7 @@ class _Painter:
 
     def text_box(self, tb: StyledTextBox) -> None:
         frame = _Frame(tb.box, self.H)
-        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h)
+        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h, getattr(tb, "first_baseline_pt", None))
         if len(lines) > 1:
             self.deg.append(Degradation(element_id=tb.id, concept="段落與文字框", action=f"PDF 沒有段落與文字框，寫成 {sum(1 for ln in lines if ln.segs)} 個逐行的文字物件", lossy=True))
         if lines and lines[-1].baseline - lines[-1].descent > tb.box.h + 0.5 * lines[-1].size:

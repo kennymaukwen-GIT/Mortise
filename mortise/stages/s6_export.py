@@ -14,7 +14,7 @@ from ..config import Config
 from ..pipeline.store import Store
 
 NAME = "s6"
-VERSION = "2"
+VERSION = "3"
 
 # 格式 → 輸出器模組（mortise.exporters 底下的模組名稱）
 EXPORTERS: dict[OutputFormat, str] = {
@@ -58,5 +58,30 @@ def available() -> list[OutputFormat]:
     return out
 
 
-def run(doc: StyledDoc, fmt: OutputFormat, basename: str, cfg: Config, store: Store) -> OutputFile:
-    return exporter(fmt)(doc, basename, cfg, store)
+def adjustments(corrections, fmt: OutputFormat) -> dict[str, dict]:
+    """⑦為某個格式開的修正單（欄位名稱以「格式.」開頭，例如 pptx.offset_pt）→ {元素編號: {欄位: 值}}。
+    這些是目標軟體的渲染差異，只影響該格式的輸出器，不回流到成品文件（成品文件與格式無關）。"""
+    out: dict[str, dict] = {}
+    prefix = fmt.value + "."
+    for c in corrections or []:
+        if c.field.startswith(prefix) and c.element_id:
+            slot = out.setdefault(c.element_id, {})
+            key = c.field[len(prefix):]
+            if key == "offset_pt" and key in slot:  # 多輪的位移累加
+                slot[key] = [slot[key][0] + float(c.new_value[0]), slot[key][1] + float(c.new_value[1])]
+            elif key == "width_adjust_pt" and key in slot:
+                slot[key] = slot[key] + float(c.new_value)
+            else:
+                slot[key] = c.new_value
+    return out
+
+
+def run(doc: StyledDoc, fmt: OutputFormat, basename: str, cfg: Config, store: Store, corrections=None) -> OutputFile:
+    fn = exporter(fmt)
+    adjust = adjustments(corrections, fmt)
+    if adjust:
+        import inspect
+
+        if "adjust" in inspect.signature(fn).parameters:
+            return fn(doc, basename, cfg, store, adjust=adjust)
+    return fn(doc, basename, cfg, store)

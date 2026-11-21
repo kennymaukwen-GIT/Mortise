@@ -71,6 +71,7 @@ class StyledTextBox(Model):
     z: int
     paragraphs: list[StyledParagraph]
     wrap: bool = True  # 是否自動換行（單行文字關掉，避免目標軟體字寬略大時被折行）
+    first_baseline_pt: Optional[float] = None  # 第一行基線距框上緣多少（pt）：量到的事實，各輸出器依它放第一行，不依賴各字型的上緣量度
 
 
 class StyledImage(Model):
