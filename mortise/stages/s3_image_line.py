@@ -85,12 +85,31 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
     page = spec.page_index
 
     # ---------- s3.ocr ----------
-    ocr_lines = _engine(c.get("ocr_params")).read(work)
+    ocr_lines = _drop_implausible(_engine(c.get("ocr_params")).read(work), c, notes)
+    bullets = _find_bullets(work, ocr_lines, c)
+    if bullets:
+        notes.append(f"有 {len(bullets)} 行左側的小圓點、方塊或短線認成項目符號。")
     ai_chars: dict[int, list[int]] = {}
     if ai is not None and ai.feature("ocr_arbitration"):
         ai_chars = _arbitrate(ai, Image.fromarray(work), ocr_lines, spec, c)
         if ai_chars:
             notes.append(f"有 {sum(len(v) for v in ai_chars.values())} 個不確定的字由大型 AI 在候選字中挑選。")
+    # 繁體文件：辨識模型讀成的簡體字改回繁體（字形幾乎相同的「内／內」「参／參」）
+    from ..recognition import script_prior
+
+    trad_fixed: dict[int, list[int]] = {}
+    if c.get("traditional_prior", True) and script_prior.available() and script_prior.page_is_traditional([ol.text for ol in ocr_lines]):
+        for i, ol in enumerate(ocr_lines):
+            if len(ol.chars) != len(ol.text):
+                continue
+            new_text, changed = script_prior.to_traditional(ol.text, [[cd.text for cd in ch.candidates] for ch in ol.chars])
+            if changed:
+                for k in changed:
+                    ol.chars[k].text = new_text[k]
+                ol.text = new_text
+                trad_fixed[i] = changed
+        if trad_fixed:
+            notes.append(f"有 {sum(len(v) for v in trad_fixed.values())} 個字依繁體文件的先驗由簡體改回繁體（例如「内」改「內」），請確認。")
     fonts = _fonts()
 
     # ---------- s3.text_attr ----------
@@ -109,6 +128,8 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         line = _text_line(page, i, ol, attrs, W)
         if i in ai_chars:
             line = line.model_copy(update={"ai_chars": ai_chars[i]})
+        if i in bullets:
+            line = _prepend_bullet(line, *bullets[i], W)
         texts.append(line)
         if (ol.score or 0) < c.get("ocr_low_score", 0.8):
             low_text += 1
@@ -335,3 +356,105 @@ def _arbitrate(ai, page_image: Image.Image, ocr_lines, spec: PageSpec, c: dict) 
             out.setdefault(ln["line"], []).append(sl["index"])
         ol.text = "".join(text)
     return out
+
+
+def _drop_implausible(lines, c: dict, notes: list[str]):
+    """去掉不像文字的偵測：只有一兩個字、高度遠大於頁面上其他文字、而且信心不夠高（例如照片裡的圓被讀成「D」）。"""
+    import numpy as np
+
+    if len(lines) < 3:
+        return lines
+    heights = []
+    for ol in lines:
+        q = np.asarray(ol.quad, dtype=np.float64)
+        heights.append(float(np.hypot(*(q[3] - q[0]))))
+    median = float(np.median(heights))
+    keep, dropped = [], 0
+    for ol, h in zip(lines, heights):
+        short = len(ol.text.strip()) <= int(c.get("implausible_max_chars", 2))
+        if short and h > float(c.get("implausible_height_ratio", 4.0)) * median and (ol.score or 0.0) < float(c.get("implausible_min_score", 0.97)):
+            dropped += 1
+            continue
+        keep.append(ol)
+    if dropped:
+        notes.append(f"有 {dropped} 個偵測結果不像文字（字很少、尺寸遠大於其他文字、信心不高），已當成圖形處理。")
+    return keep
+
+
+def _find_bullets(work: np.ndarray, lines, c: dict) -> dict:
+    """項目符號：文字辨識常漏掉行首的小圓點。在每行左側兩個字高的範圍內找一個獨立的小色塊；
+    接近圓形填滿 → 「•」，方形 → 「▪」，扁長 → 「–」。回傳（行序號 → （符號、符號左緣到行首的距離、符號寬，像素））。
+    文字行本身不改（字級與字型照原行量），符號在組成文字行時接在最前面。"""
+    import cv2
+
+    if not c.get("bullet_detection", True):
+        return {}
+    H, W = work.shape[:2]
+    gray = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    out = {}
+    for i, ol in enumerate(lines):
+        if not ol.text.strip() or ol.text.strip()[0] in "•‧·●○■□▪◆◇▶➤-–—*":
+            continue
+        q = np.asarray(ol.quad, dtype=np.float64)
+        u = q[1] - q[0]
+        length = float(np.hypot(*u))
+        if length <= 0 or abs(np.degrees(np.arctan2(u[1], u[0]))) > 2.0:
+            continue  # 只處理橫排、接近水平的行
+        h = float(np.hypot(*(q[3] - q[0])))
+        left = min(q[0][0], q[3][0])
+        x0 = int(max(0, np.floor(left - 2.2 * h)))
+        x1 = int(max(0, np.floor(left - 0.15 * h)))
+        y0 = int(max(0, np.floor(min(q[0][1], q[1][1]))))
+        y1 = int(min(H, np.ceil(max(q[2][1], q[3][1]))))
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            continue
+        patch = gray[y0:y1, x0:x1]
+        bg = float(np.median(np.concatenate([patch[:, :2].ravel(), patch[:, -2:].ravel(), patch[:2, :].ravel()])))
+        mask = (np.abs(patch - bg) > 40.0).astype(np.uint8)
+        n, _, stats, cents = cv2.connectedComponentsWithStats(mask, 8)
+        blobs = [(stats[k], cents[k]) for k in range(1, n) if stats[k][cv2.CC_STAT_AREA] >= 4]
+        if len(blobs) != 1:
+            continue
+        st, cen = blobs[0]
+        bw, bh, area = st[cv2.CC_STAT_WIDTH], st[cv2.CC_STAT_HEIGHT], st[cv2.CC_STAT_AREA]
+        if not (0.12 * h <= max(bw, bh) <= 0.7 * h):
+            continue
+        cy = y0 + cen[1]
+        if not (q[0][1] + 0.2 * h <= cy <= q[3][1] - 0.1 * h):
+            continue  # 項目符號在行的中段，不在上緣或下緣
+        fill = area / max(1, bw * bh)
+        aspect = bw / max(1, bh)
+        if aspect > 2.2 and bh <= 0.25 * h:
+            glyph = "–"
+        elif fill > 0.9 and 0.8 <= aspect <= 1.25:
+            glyph = "▪"
+        elif fill > 0.55 and 0.7 <= aspect <= 1.4:
+            glyph = "•"
+        else:
+            continue
+        dx = float(left - (x0 + st[cv2.CC_STAT_LEFT]))
+        if dx > 0:
+            out[i] = (glyph, dx, float(bw))
+    return out
+
+
+def _prepend_bullet(line: TextLine, glyph: str, dx_px: float, bw_px: float, W: float) -> TextLine:
+    """把項目符號接到文字行最前面：四角與基線往左延伸，第一段的樣式沿用（符號的字級與顏色跟著這一行）。"""
+    import math
+
+    dx = dx_px / W
+    ang = math.radians(line.quad.angle_deg)
+    ux, uy = math.cos(ang), math.sin(ang)
+
+    def shift(pt):
+        return Point(x=pt.x - ux * dx, y=pt.y - uy * dx)
+
+    q = Quad(tl=shift(line.quad.tl), tr=line.quad.tr, br=line.quad.br, bl=shift(line.quad.bl))
+    first = line.runs[0]
+    rq = Quad(tl=q.tl, tr=Point(x=q.tl.x + ux * bw_px / W, y=q.tl.y + uy * bw_px / W), br=Point(x=q.bl.x + ux * bw_px / W, y=q.bl.y + uy * bw_px / W), bl=q.bl)
+    bullet = first.model_copy(update={"text": glyph + " ", "quad": rq, "char_x": [0.0], "font_candidates": first.font_candidates})
+    runs = [bullet] + [r.model_copy(update={"char_x": [x + dx for x in r.char_x]}) for r in line.runs]
+    b0 = line.baseline[0]
+    return line.model_copy(update={"quad": q, "runs": runs, "baseline": (Point(x=b0.x - ux * dx, y=b0.y - uy * dx), line.baseline[1]),
+                                   "char_candidates": [[(glyph, 0.8)], [(" ", 0.8)]] + list(line.char_candidates),
+                                   "notes": list(line.notes) + ["行首的項目符號由影像偵測補上"]})

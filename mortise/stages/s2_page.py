@@ -102,7 +102,7 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
         notes += geo_notes
         rotation, box_used = 0, None
         pw = image.size[0]
-        size_candidates = _size_candidates(aspect, ref, image.size, cfg, c)
+        size_candidates = _size_candidates(aspect, ref, image.size, cfg, c, _ASPECT_ERR.pop(id(image), None))
         top = size_candidates[0] if size_candidates else None
         if top and top["confidence"] >= c.get("size_auto_accept", 0.6):
             file_width = measured(top["width_pt"], top["confidence"], Provenance.INFERRED, w_step)
@@ -147,6 +147,9 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
 # ---------- 影像輸入：s2.corners、s2.rectify、s2.enhance ----------
 
 
+_ASPECT_ERR: dict[int, Optional[float]] = {}  # 工作影像 → 透視反推的長寬比誤差（給尺寸判斷用）
+
+
 def _user_corners(corrections: list[Correction]):
     for c in reversed(corrections):
         if c.field == "corners" and c.new_value:
@@ -162,6 +165,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
     raw = ImageOps.exif_transpose(Image.open(store.blob_path(doc.source))).convert("RGB")
     pw, ph = raw.size
     notes: list[str] = []
+    aspect_err = None
     full = ([1 / pw, 0, 0, 0, 1 / pw, 0, 0, 0, 1], [(0, 0), (pw, 0), (pw, ph), (0, ph)], ph / pw)
     user = _user_corners(corrections)
     kind = ref.input_type.value
@@ -176,7 +180,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             corners = np.array(user, dtype=np.float64)
             quad = PageQuad(corners=corners, confidence=1.0, method="user", aspect_ratio=_aspect_from_corners(corners))
         elif kind == InputType.PHOTO:
-            quad = pg.find_page_quad(arr)
+            quad = pg.find_page_quad(arr, {"input_type": kind.value})
         else:
             quad = None
         if quad is None or quad.method == "full_image":
@@ -193,6 +197,8 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             matrix = [float(v) for v in (Hn / Hn[2, 2]).ravel()]
             corners_l = [tuple(map(float, pt)) for pt in quad.corners]
             aspect = flat.shape[0] / flat.shape[1]
+            if getattr(quad, "aspect", None) is not None:
+                aspect_err = float(quad.aspect.error)
             method, conf = quad.method, quad.confidence
             notes += list(getattr(quad, "notes", []))
             notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
@@ -201,6 +207,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
         else:
             work = color
+        _ASPECT_ERR[id(work)] = aspect_err
         return work, color, matrix, corners_l, aspect, method, conf, notes
     except Exception as e:  # 幾何處理失敗不中斷：退回整張圖
         return raw, raw, *full, "full_image", 0.3, [f"頁面幾何處理失敗（{e}），以整張圖為頁面。"]
@@ -216,19 +223,30 @@ def _aspect_from_corners(corners) -> float:
     return ((left + right) / 2) / max((top + bottom) / 2, 1e-6)
 
 
-def _size_candidates(aspect: float, ref, pixel_size, cfg: Config, c: dict) -> list[dict]:
+def _size_candidates(aspect: float, ref, pixel_size, cfg: Config, c: dict, aspect_err: Optional[float] = None) -> list[dict]:
+    """依長寬比（與可用的尺度線索）列出尺寸候選，並依 judge() 判定：clear 可自動採用；
+    ambiguous 要請使用者在前幾名中選；nonstandard 表示不是常見規格。dpi 只對掃描檔有意義，照片與截圖不傳。"""
     try:
         from ..recognition import page_size
     except Exception:
         return []
     sizes = {k: tuple(v) for k, v in cfg.section("page_sizes").items()}
-    hints = {"pixel_size": tuple(pixel_size), "dpi": ref.dpi_hint, "input_type": ref.input_type.value.value}
+    hints: dict = {"page_px": tuple(pixel_size)}
+    if aspect_err:
+        hints["aspect_error"] = aspect_err
+    if ref.input_type.value == InputType.SCANNED_PDF and ref.dpi_hint:
+        hints["dpi"] = ref.dpi_hint
     try:
         cands = page_size.infer_size(aspect, sizes, hints)
+        verdict = page_size.judge(cands)
     except Exception:
         return []
-    return [{"name": x.name, "width_pt": x.width_pt, "height_pt": x.height_pt, "confidence": round(x.confidence, 3), "reason": x.reason} for x in cands[:5]]
-
+    out = [{"name": x.name, "width_pt": x.width_pt, "height_pt": x.height_pt, "confidence": round(x.confidence, 3), "reason": x.reason, "family": getattr(x, "family", "")} for x in cands[:5]]
+    if out:
+        out[0]["verdict"] = verdict.get("verdict")
+        if verdict.get("verdict") != "clear":
+            out[0]["confidence"] = min(out[0]["confidence"], 0.5)  # 不能自動採用：請使用者選
+    return out
 
 def geometry_key(spec: PageSpec) -> str:
     """③只依賴頁面幾何與工作影像，不依賴比例尺：改尺寸不必重跑辨識。"""

@@ -31,7 +31,7 @@ from ..config import Config
 from ..tools.fonts import has_cjk, verification_font
 
 NAME = "s5"
-VERSION = "2"
+VERSION = "3"
 
 _APPS = [
     ("powerpoint", "powerpoint"), ("impress", "libreoffice_impress"), ("keynote", "keynote"), ("google slides", "google_slides"),
@@ -47,12 +47,25 @@ _FORMAT_FAMILY = {OutputFormat.PPTX: "slides", OutputFormat.GOOGLE_SLIDES: "slid
 _ROLE_NAMES = {Role.TITLE: "標題", Role.SUBTITLE: "副標", Role.BODY: "內文", Role.CAPTION: "圖說", Role.HEADER: "頁首", Role.FOOTER: "頁尾", Role.PAGE_NUMBER: "頁碼", Role.FOOTNOTE: "註腳", Role.UNKNOWN: "文字"}
 
 
-def _box(q: Quad, w: float) -> Box:
-    """四角 → 位置與大小（pt）。旋轉的元素以中心為準還原成未旋轉的框加角度。"""
+_ROT_SNAP = {"exact": 0.05, "measured": 1.0}  # 旋轉角吸附到 0、±90、180 度的容差（度）：量測值容許較大的誤差
+
+
+def _box(q: Quad, w: float, measured_input: bool = False) -> Box:
+    """四角 → 位置與大小（pt）。旋轉的元素以中心為準還原成未旋轉的框加角度；接近直角倍數的角度吸附過去。"""
     cx, cy = q.center.x * w, q.center.y * w
     bw, bh = q.width * w, q.height * w
     angle = q.angle_deg
-    return Box(x=cx - bw / 2, y=cy - bh / 2, w=bw, h=bh, rotation=0.0 if abs(angle) < 0.05 else angle)
+    tol = _ROT_SNAP["measured" if measured_input else "exact"]
+    nearest = round(angle / 90.0) * 90.0
+    if abs(angle - nearest) < tol:
+        angle = nearest
+        if nearest in (90.0, -90.0, 270.0, -270.0):
+            pass
+    rotation = 0.0 if abs(angle) < 1e-9 else angle
+    if rotation == 0.0 and measured_input:
+        l, t, r, b = q.bbox  # 量測產線：微小傾斜視為水平，用外接矩形
+        return Box(x=l * w, y=t * w, w=(r - l) * w, h=(b - t) * w)
+    return Box(x=cx - bw / 2, y=cy - bh / 2, w=bw, h=bh, rotation=rotation)
 
 
 def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layout: Layout, cfg: Config, corrections: list[Correction]) -> StyledDoc:
@@ -71,6 +84,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
     same = app != "unknown" and _FAMILY.get(app) in wanted
     target_mode = measured(TargetMode.SAME_SOURCE if same else TargetMode.CROSS_SOURCE, 0.8 if app != "unknown" else 0.5, Provenance.INFERRED, f"{NAME}.target_mode@{VERSION}")
 
+    doc_fonts = document_fonts(elements)
     pages: list[StyledPage] = []
     style_counter: Counter = Counter()
     style_role: dict[tuple, Role] = {}
@@ -93,7 +107,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
             for i, pid in enumerate(tb.paragraph_ids):
                 p = pars[pid]
                 p_lines = [lines[i2] for i2 in p.line_ids]
-                runs = _runs(p_lines, p.joiners, w, c, subs)
+                runs = _runs(p_lines, p.joiners, w, c, subs, doc_fonts)
                 for r in runs:
                     sig = (r.font.family.value, r.size_pt.value, r.bold, r.italic, r.color.hex)
                     style_counter[sig] += len(r.text)
@@ -108,7 +122,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                         role=p.role.value, source_line_count=len(p.line_ids),
                     )
                 )
-            box = _box(tb.quad, w)
+            box = _box(tb.quad, w, el.production_line.value == "image")
             single = sum(sp.source_line_count for sp in sps) == 1
             wrap = not (single and c["single_line_no_wrap"])
             if wrap:
@@ -119,7 +133,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                 box = box.model_copy(update={"x": box.x + dx, "w": box.w + slack})
             text_boxes.append(StyledTextBox(id=tb.id, box=box, z=tb.z, paragraphs=sps, wrap=wrap))
 
-        images = [StyledImage(id=im.id, box=_box(im.quad, w), z=im.z, image=im.image) for im in el.images]
+        images = [StyledImage(id=im.id, box=_box(im.quad, w, el.production_line.value == "image"), z=im.z, image=im.image) for im in el.images]
         if any(im.kind.value == ImageKind.SHADOW for im in el.images):
             notes.append(f"第 {spec.page_index + 1} 頁：形狀的陰影在來源檔中是點陣圖，照原樣保留為圖片，不是可調整的陰影效果。")
         shapes = []
@@ -132,7 +146,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                 # 用 rotation 記方向：0 表示左上到右下，1 表示左下到右上
                 bx = bx.model_copy(update={"rotation": 1.0 if (x1 - x0) * (y1 - y0) < 0 else 0.0})
             else:
-                bx = _box(s.quad, w)
+                bx = _box(s.quad, w, el.production_line.value == "image")
             if s.fill:
                 color_counter[s.fill.hex] += 50
             path_pt: list[list[float]] = []
@@ -147,7 +161,7 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                 stroke_width_pt=(s.stroke_width * w) if s.stroke_width else None,
                 corner_radius_pt=(s.corner_radius * w) if s.corner_radius else None, path=path_pt,
             ))
-        tables = [_table(t, el, pl, lines, w, c, subs, same, style_counter, style_role, color_counter) for t in pl.tables]
+        tables = [_table(t, el, pl, lines, w, c, subs, same, style_counter, style_role, color_counter, doc_fonts) for t in pl.tables]
         bg = el.background
         pages.append(
             StyledPage(
@@ -254,7 +268,7 @@ def infer_number(text: str) -> tuple[float, str] | None:
     return (-value if neg else value), fmt
 
 
-def _table(t, el: ElementList, pl, lines: dict, w: float, c: dict, subs: dict, same: bool, style_counter, style_role, color_counter):
+def _table(t, el: ElementList, pl, lines: dict, w: float, c: dict, subs: dict, same: bool, style_counter, style_role, color_counter, doc_fonts=None):
     """④的表格結構 → 成品表格：欄寬、列高、儲存格的段落、底色、框線、邊距、垂直對齊、數字格式。"""
     from ..artifacts import Border, StyledCell, StyledTable
 
@@ -274,7 +288,7 @@ def _table(t, el: ElementList, pl, lines: dict, w: float, c: dict, subs: dict, s
             p = pars[pid]
             p_lines = [lines[i] for i in p.line_ids]
             cell_lines += p_lines
-            runs = _runs(p_lines, p.joiners, w, c, subs)
+            runs = _runs(p_lines, p.joiners, w, c, subs, doc_fonts)
             for rn in runs:
                 sig = (rn.font.family.value, rn.size_pt.value, rn.bold, rn.italic, rn.color.hex)
                 style_counter[sig] += len(rn.text)
@@ -394,41 +408,133 @@ def _covered_edge(segments, vertical: bool, at: float, lo: float, hi: float, tol
 # ---------- s5.font_size、s5.font ----------
 
 
-def _snap_size(pt: float, c: dict, source: Measured, step: str) -> Measured:
-    grid = c["size_snap_step_pt"]
-    snapped = round(pt / grid) * grid
-    if abs(snapped - pt) <= c["size_snap_tolerance_pt"]:
-        if abs(snapped - pt) < 1e-6 and source.source == Provenance.EXACT:
-            return measured(float(snapped), 1.0, Provenance.EXACT, step)
-        return measured(float(snapped), min(source.confidence, 0.95), Provenance.SNAPPED, step, error=abs(snapped - pt))
-    return measured(round(pt, 3), source.confidence, source.source, step)  # 不吸附：保留原值
+def _snap_size(pt: float, c: dict, source: Measured, step: str, error_pt: float = 0.0) -> Measured:
+    """字級吸附。精確擷取的值只容許極小的差距（37.2 pt 保留原值）；量測值的容差隨量測誤差放大
+    （量不準的 18.06 ± 0.26 pt 吸到 18 pt）。先試整數，再試半點；都不符就不吸附。"""
+    tol = c["size_snap_tolerance_pt"]
+    if source.source != Provenance.EXACT:
+        tol = max(tol, c.get("size_snap_sigma", 1.5) * max(error_pt, 0.0))
+    for grid in (1.0, c["size_snap_step_pt"]):
+        snapped = round(pt / grid) * grid
+        if abs(snapped - pt) <= tol:
+            if abs(snapped - pt) < 1e-6 and source.source == Provenance.EXACT:
+                return measured(float(snapped), 1.0, Provenance.EXACT, step)
+            return measured(float(snapped), min(source.confidence, 0.95), Provenance.SNAPPED, step, error=abs(snapped - pt))
+    return measured(round(pt, 3), source.confidence, source.source, step, error=error_pt or None)  # 不吸附：保留原值
 
 
-def _font(run: TextRun, subs: dict[str, str]) -> FontChoice:
+def _font(run: TextRun, subs: dict[str, str], family: str | None = None, confidence: float | None = None) -> FontChoice:
     step = f"{NAME}.font@{VERSION}"
-    family = run.font_candidates[0].name if run.font_candidates else "unknown"
+    if family is None:
+        family = run.font_candidates[0].name if run.font_candidates else "unknown"
+    if confidence is None:
+        confidence = 1.0 if run.font_size.source == Provenance.EXACT else (run.font_candidates[0].score if run.font_candidates else 0.0)
     ea = has_cjk(run.text)
     vf, substituted = verification_font(family, subs, ea)
-    return FontChoice(family=measured(family, 1.0 if run.font_candidates else 0.0, run.font_size.source, step), verification_family=vf, is_substituted=substituted, east_asian=ea)
+    return FontChoice(family=measured(family, float(confidence), run.font_size.source, step), verification_family=vf, is_substituted=substituted, east_asian=ea)
 
 
-def _runs(lines: list[TextLine], joiners: list[str], w: float, c: dict, subs: dict[str, str]) -> list[StyledRun]:
-    """把一段的各行接起來，樣式相同的相鄰文字併成一段。"""
+def _script(text: str) -> str:
+    return "cjk" if has_cjk(text) else "latin"
+
+
+def document_fonts(elements: list[ElementList]) -> dict[str, str]:
+    """整份文件各書寫系統最可靠的字型（量測產線用）：信心值夠高的段落，依「字數 × 信心值 × 候選分數」投票。"""
+    votes: dict[str, Counter] = {"cjk": Counter(), "latin": Counter()}
+    for el in elements:
+        for t in el.texts:
+            for r in t.runs:
+                if r.font_size.source == Provenance.EXACT or not r.font_candidates:
+                    continue
+                top = r.font_candidates[0]
+                if r.font_size.confidence >= 0.5:
+                    votes[_script(r.text)][top.name] += len(r.text.strip()) * r.font_size.confidence * max(top.score, 0.05)
+    return {k: v.most_common(1)[0][0] for k, v in votes.items() if v}
+
+
+def _settle(lines: list[TextLine], w: float, c: dict, doc_fonts: dict[str, str]) -> dict[int, tuple[float, float, str, float, bool, bool]]:
+    """量測產線的段落內定案（s5.font、s5.font_size 的「同段投票」）：
+    - 字級：段落內依「字數 × 信心值」取加權中位數；誤差範圍內（或差距小於 6%）的段一律用中位數，真的不同才保留。
+    - 字型：同一書寫系統的段投票；某段自己的第一名信心低、或投票結果在它的前三名候選裡，就改用投票結果；
+      整段都不可靠時用整份文件的字型。
+    - 粗體與斜體：信心低的段跟隨段落多數。
+    回傳（段的 id → 字級 pt、字級誤差 pt、字型、字型信心、粗體、斜體）。精確擷取的段不處理。"""
+    runs = [r for ln in lines for r in ln.runs if r.font_size.source != Provenance.EXACT and r.text.strip()]
+    if not runs:
+        return {}
+    sizes = sorted((r.font_size.value * w, len(r.text.strip()) * max(r.font_size.confidence, 0.05)) for r in runs)
+    total = sum(wt for _, wt in sizes)
+    acc, median = 0.0, sizes[-1][0]
+    for v, wt in sizes:
+        acc += wt
+        if acc >= total / 2:
+            median = v
+            break
+    votes: dict[str, Counter] = {"cjk": Counter(), "latin": Counter()}
+    for r in runs:
+        if r.font_candidates:
+            top = r.font_candidates[0]
+            votes[_script(r.text)][top.name] += len(r.text.strip()) * max(r.font_size.confidence, 0.05) * max(top.score, 0.05)
+    bold_votes = sum((1 if r.bold.value else -1) * r.bold.confidence * len(r.text.strip()) for r in runs)
+    out = {}
+    for r in runs:
+        pt = r.font_size.value * w
+        err = (r.font_size.error or 0.0) * w
+        few = len(r.text.strip()) <= 3 or r.font_size.confidence < 0.5  # 字太少或量不準：容許差距放寬
+        rel = c.get("settle_size_rel", 0.06) * (2.5 if few else 1.0)
+        if abs(pt - median) <= max(2 * err, rel * median):
+            pt, err = median, min(err, 0.5 * median * c.get("settle_size_rel", 0.06))
+        script = _script(r.text)
+        own = r.font_candidates[0].name if r.font_candidates else None
+        own_conf = r.font_candidates[0].score if r.font_candidates else 0.0
+        winner = votes[script].most_common(1)[0][0] if votes[script] else None
+        backers = [x for x in runs if _script(x.text) == script and x.font_candidates and x.font_candidates[0].name == winner]
+        weak_vote = not backers or max(x.font_candidates[0].score for x in backers) < 0.3
+        names = [fc.name for fc in r.font_candidates[:3]]
+        family, conf = own, own_conf
+        if winner and not weak_vote and (winner in names or own_conf < c.get("settle_font_conf", 0.5) or r.font_size.confidence < 0.5):
+            family, conf = winner, max(own_conf, 0.5)
+        if (family is None or (weak_vote and conf < 0.3)) and doc_fonts.get(script):
+            family, conf = doc_fonts[script], 0.4  # 整段都不可靠（例如單獨一個頁碼）：用整份文件的字型
+        bold = r.bold.value if r.bold.confidence >= 0.7 else bold_votes > 0
+        italic = r.italic.value
+        out[id(r)] = (pt, err, family or "unknown", conf, bold, italic)
+    return out
+
+
+def _runs(lines: list[TextLine], joiners: list[str], w: float, c: dict, subs: dict[str, str], doc_fonts: dict[str, str] | None = None) -> list[StyledRun]:
+    """把一段的各行接起來，樣式相同的相鄰文字併成一段。量測產線的值先做段落內定案（_settle）。"""
     step = f"{NAME}.font_size@{VERSION}"
+    settled = _settle(lines, w, c, doc_fonts or {})
     out: list[StyledRun] = []
     for i, line in enumerate(lines):
         for j, r in enumerate(line.runs):
             text = r.text
             if j == 0 and i > 0 and joiners[i - 1]:
                 text = joiners[i - 1] + text
-            sr = StyledRun(text=text, font=_font(r, subs), size_pt=_snap_size(r.font_size.value * w, c, r.font_size, step), bold=r.bold.value, italic=r.italic.value, color=r.color.value)
-            if out and (out[-1].font.family.value, out[-1].size_pt.value, out[-1].bold, out[-1].italic, out[-1].color) == (sr.font.family.value, sr.size_pt.value, sr.bold, sr.italic, sr.color):
+            if id(r) in settled:
+                pt, err, family, fconf, bold, italic = settled[id(r)]
+                size = _snap_size(pt, c, r.font_size, step, err)
+                font = _font(r, subs, family, fconf)
+            else:
+                size = _snap_size(r.font_size.value * w, c, r.font_size, step)
+                font = _font(r, subs)
+                bold, italic = r.bold.value, r.italic.value
+            sr = StyledRun(text=text, font=font, size_pt=size, bold=bold, italic=italic, color=r.color.value)
+            if out and (out[-1].font.family.value, out[-1].size_pt.value, out[-1].bold, out[-1].italic) == (sr.font.family.value, sr.size_pt.value, sr.bold, sr.italic) and _same_color(out[-1].color, sr.color, r.color.source):
                 out[-1] = out[-1].model_copy(update={"text": out[-1].text + text})
             else:
                 out.append(sr)
     if out:  # 段尾的空白沒有意義
         out[-1] = out[-1].model_copy(update={"text": out[-1].text.rstrip()})
     return [r for r in out if r.text]
+
+
+def _same_color(a: Color, b: Color, source: Provenance) -> bool:
+    """精確擷取要完全相同；量測值差距在 ΔRGB 12 以內視為同色（反鋸齒與壓縮的雜訊）。"""
+    if source == Provenance.EXACT:
+        return a == b
+    return max(abs(a.r - b.r), abs(a.g - b.g), abs(a.b - b.b)) <= 12
 
 
 # ---------- s5.paragraph ----------

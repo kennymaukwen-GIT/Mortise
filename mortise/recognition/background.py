@@ -139,14 +139,21 @@ def _basis(u: np.ndarray, v: np.ndarray, deg: int) -> np.ndarray:
     return np.stack(cols, axis=1)
 
 
+def _wls(A: np.ndarray, y: np.ndarray, w: Optional[np.ndarray] = None) -> np.ndarray:
+    """加權最小平方（正規方程式，比 lstsq 的 SVD 快很多；欄位已正規化到 [−1, 1]，條件數可接受）。"""
+    Aw = A if w is None else A * w[:, None]
+    G = Aw.T @ A
+    G += np.eye(G.shape[0]) * (1e-9 * np.trace(G) / G.shape[0] + 1e-12)
+    return np.linalg.solve(G, Aw.T @ y)
+
+
 def _robust_poly(u, v, rgb, deg, p) -> tuple[np.ndarray, np.ndarray]:
     """RGB 三通道的二元多項式 Tukey IRLS 擬合。回傳（係數 (k, 3)、擬合值 (N, 3)）。"""
     A = _basis(u, v, deg)
     w = np.ones(len(u))
     coef = np.zeros((A.shape[1], 3))
     for _ in range(p["irls_iters"]):
-        sw = np.sqrt(w)[:, None]
-        coef, *_ = np.linalg.lstsq(A * sw, rgb * sw, rcond=None)
+        coef = _wls(A, rgb, w)
         r = np.linalg.norm(rgb - A @ coef, axis=1)
         s = max(1.4826 * float(np.median(r)), 1.0)
         z = r / (p["tukey_c"] * s)
@@ -168,7 +175,7 @@ def _fit_radial(xs, ys, rgb, W, H, p) -> Optional[dict]:
     def cost(cx, cy, Xa, Ya, Ca):
         r = np.hypot(Xa - cx, Ya - cy)
         A = np.stack([np.ones_like(r), r, r * r], axis=1)
-        coef, *_ = np.linalg.lstsq(A, Ca, rcond=None)
+        coef = _wls(A, Ca)
         return float(np.abs(Ca - A @ coef).sum()), coef
 
     g = p["radial_grid"]
@@ -191,8 +198,7 @@ def _fit_radial(xs, ys, rgb, W, H, p) -> Optional[dict]:
     w = np.ones(n)
     coef = np.zeros((3, 3))
     for _ in range(p["irls_iters"]):
-        sw = np.sqrt(w)[:, None]
-        coef, *_ = np.linalg.lstsq(A * sw, rgb * sw, rcond=None)
+        coef = _wls(A, rgb, w)
         res = np.linalg.norm(rgb - A @ coef, axis=1)
         s_ = max(1.4826 * float(np.median(res)), 1.0)
         z = res / (p["tukey_c"] * s_)

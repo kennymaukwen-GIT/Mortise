@@ -423,3 +423,30 @@ def report() -> None:  # pragma: no cover - 供手動量測用
 
 if __name__ == "__main__":  # pragma: no cover
     report()
+
+
+def test_blur_error_is_reported_honestly():
+    """嚴重模糊：搜尋半徑隨邊緣寬度放大；回報的四角誤差不可低於實際誤差，信心值隨模糊下降。"""
+    page = page_image("doc_a4")
+    confs = []
+    for blur, lim in ((6, 0.5), (16, 2.0)):  # 實測：模糊 σ=6 最大 0.28 px、σ=16 最大 1.38 px
+        photo, G, corners = make_photo(page, 1200, 1600, "wood", seed=2, f_frac=0.7, rx=20, ry=8, rz=4)
+        photo = degrade(photo, np.random.default_rng(2), blur=blur, noise=3.0, jpeg=80)
+        q = find_page_quad(photo)
+        assert q.method == "edge_fit"
+        e = np.linalg.norm(q.corners - corners, axis=1)
+        assert e.max() < lim, (blur, e)
+        assert q.corner_error_px.mean() >= e.mean(), (blur, q.corner_error_px, e)
+        confs.append(q.confidence)
+    assert confs[0] > confs[1] and confs[1] < 0.6
+
+
+def test_contour_fallback_when_refine_fails():
+    """精修全部失敗（以參數強制）：退回縮圖輪廓近似，method="contour"、低信心、誤差數像素。"""
+    page = page_image("slide_basic")
+    photo, G, corners = make_photo(page, 1600, 1200, "wood", seed=1, f_frac=0.7, rx=25, ry=-10, rz=5)
+    photo = degrade(photo, np.random.default_rng(1), blur=1.0, noise=3.0, jpeg=85)
+    q = find_page_quad(photo, {"rel_edge_grad": 1e9})
+    assert q.method == "contour" and q.confidence < 0.5
+    e = np.linalg.norm(q.corners - corners, axis=1)
+    assert e.max() < 6.0 and q.corner_error_px.min() >= 2.0, e

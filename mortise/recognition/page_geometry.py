@@ -17,9 +17,12 @@
       2. 精修（原圖解析度）：對每條邊等距取樣，沿法線方向用雙線性內插取剖面，
          以「內側→外側」的色差方向投影的一階導數找邊緣峰值，拋物線內插到次像素；
          每條邊對這些邊緣點做 Tukey 雙權重的迭代加權總體最小平方直線擬合（排除手指、文字等離群點），
-         四條直線兩兩相交得四角。搜尋半徑由大到小迭代三輪。
+         四條直線兩兩相交得四角。搜尋半徑由大到小迭代四輪；每輪由導數剖面的半高寬量出邊緣模糊 σ，
+         嚴重模糊時自動放大搜尋半徑（radius_per_sigma × σ），並把 blur_err_coef × σ 計入四角誤差。
       3. 判定與信心值：四邊都要有足夠的邊緣支持率；四角誤差由直線擬合的協方差傳播到交點。
          四邊都與影像軸平行（axis_tol_deg 內）且影像幾乎沒有感光雜訊時，視為截圖裡的色塊或表格而不是紙張。
+         精修全部失敗但縮圖輪廓的四邊梯度支持率都夠高時，退回輪廓近似（method="contour"，低信心、誤差數像素）。
+         畫面中有傾斜的長直邊（透視線索）卻湊不成四邊時，判為照片且頁面超出畫面或被遮住。
          找不到可信的四邊：回傳 method="full_image"。若影像像截圖或掃描（無雜訊，或四周邊條是均勻的頁邊色）
          給高信心；否則給低信心（交給上層請使用者手動拉四角），並在 notes 記下找到了哪幾邊。
       4. 長寬比：Zhang 與 He（2007, "Whiteboard scanning and image enhancement"）的方法——
@@ -78,7 +81,11 @@ DEFAULT_PARAMS: dict = {
     "corner_out_max_frac": 0.12,  # 允許角落落在畫面外的距離上限（佔影像對角線的比例）
     # ---- 精修（原圖解析度）----
     "refine_sigma": 1.0,  # 精修前的高斯模糊 σ（像素）
-    "refine_radii": [None, 4.0, 2.5],  # 各輪沿法線的搜尋半徑（像素）；None 表示依縮圖比例自動決定
+    "refine_radii": [None, 4.0, 2.5, 2.5],  # 各輪沿法線的搜尋半徑（像素）；None 表示依縮圖比例自動決定
+    "radius_per_sigma": 2.5,  # 搜尋半徑至少是上一輪量到的邊緣模糊 σ 的幾倍
+    "max_search_radius": 48.0,  # 搜尋半徑上限（像素）
+    "blur_err_coef": 0.06,  # 四角誤差另加「邊緣模糊 σ × 這個係數」（像素）
+    "err_conf_px": 1.5,  # 四角平均誤差達到這個（像素）時，信心值的誤差項降為一半
     "profile_step": 0.5,  # 剖面取樣間距（像素）
     "sample_step": 4.0,  # 沿邊取樣間距（像素）
     "max_samples_per_side": 400,  # 每條邊取樣點上限
@@ -107,6 +114,9 @@ DEFAULT_PARAMS: dict = {
     "conf_full_digital": 0.9,  # 判為截圖（無雜訊）時 full_image 的信心值
     "conf_full_margin": 0.7,  # 四周是均勻頁邊色時 full_image 的信心值
     "conf_full_fail": 0.15,  # 找不到可信四邊時 full_image 的信心值
+    "contour_min_support": 0.6,  # 退路：縮圖上四邊的快速梯度支持率都達到這個，才可用輪廓近似當答案
+    "contour_corner_err_px": 2.0,  # 退路：輪廓近似的四角誤差（縮圖像素）
+    "conf_contour": 0.35,  # 退路（method="contour"）的信心值
     # ---- 長寬比 ----
     "mc_samples": 64,  # 蒙地卡羅傳播的樣本數
     "mc_min_corner_sigma": 0.3,  # 蒙地卡羅擾動四角時的 σ 下限（像素）
@@ -457,9 +467,12 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict) -> Optional[d
     H, W = img.shape[:2]
     q = quad.astype(np.float64).copy()
     radii = [r0 if r is None else float(r) for r in p["refine_radii"]]
+    edge_sigma = 0.0  # 上一輪量到的邊緣模糊寬度（像素）
     hstep = p["profile_step"]
     res = None
     for R in radii:
+        # 搜尋半徑要涵蓋邊緣的模糊寬度（嚴重模糊時自動放大）
+        R = float(min(p["max_search_radius"], max(R, p["radius_per_sigma"] * edge_sigma)))
         cen = q.mean(axis=0)
         lines, info = [], []
         for k in range(4):
@@ -502,6 +515,12 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict) -> Optional[d
             delta = np.clip(delta, -0.5, 0.5)
             s_hat = so[j] + delta * hstep
             peak = y1
+            # 邊緣寬度：導數剖面在峰值一半以上的連續寬度（FWHM），換算成高斯 σ
+            above = g >= 0.5 * peak[:, None]
+            jj = np.arange(g.shape[1])[None, :]
+            left_edge = np.where(~above & (jj < j[:, None]), jj, -1).max(axis=1)
+            right_edge = np.where(~above & (jj > j[:, None]), jj, g.shape[1]).min(axis=1)
+            fwhm = (right_edge - left_edge - 1) * hstep
             pts = base + s_hat[:, None] * nout[None, :]
             medpk = np.median(peak[valid]) if valid.any() else 0.0
             keep = valid & (peak >= p["min_edge_grad"]) & (peak >= p["rel_edge_grad"] * medpk)
@@ -524,6 +543,7 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict) -> Optional[d
                     "visible": float(valid.mean()),
                     "contrast": contrast,
                     "n_pts": int(keep.sum()),
+                    "edge_sigma": float(np.median(fwhm[keep])) / 2.355 if keep.sum() >= 6 else 0.0,
                 }
             )
         newq = []
@@ -536,7 +556,8 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict) -> Optional[d
         if not _is_convex(newq):
             return None
         q = newq
-        res = {"corners": q, "lines": lines, "info": info}
+        edge_sigma = float(np.median([i["edge_sigma"] for i in info]))
+        res = {"corners": q, "lines": lines, "info": info, "edge_sigma": edge_sigma, "radius": R}
     return res
 
 
@@ -553,6 +574,8 @@ def _corner_errors(res: dict, p: dict) -> np.ndarray:
         n1, n2 = info[(k - 1) % 4]["fit"]["n"], info[k]["fit"]["n"]
         sin_phi = abs(float(n1[0] * n2[1] - n1[1] * n2[0]))
         errs[k] = math.sqrt(e_sq) / max(sin_phi, 0.2)
+    # 模糊造成的系統誤差（角落變圓、邊緣兩側內容不對稱）：與邊緣寬度成正比
+    errs = np.hypot(errs, p["blur_err_coef"] * res.get("edge_sigma", 0.0))
     return np.maximum(errs, p["corner_err_floor"])
 
 
@@ -717,7 +740,18 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
 
     persp_sides = 0  # 有邊緣支持、且不與影像軸平行的長直邊數（透視線索：照片才會有）
 
+    contour_cand = None
+
     def fallback(reason: str) -> PageQuad:
+        if contour_cand is not None and not digital:
+            qc = _order_corners(contour_cand)
+            err = np.full(4, p["contour_corner_err_px"] / min(sx, sy))
+            est, amethod, focal = estimate_aspect(qc, (W, H), err, p)
+            return PageQuad(
+                corners=qc, confidence=p["conf_contour"], method="contour", aspect_ratio=float(est.value),
+                notes=notes + [reason, f"邊緣精修失敗（可能嚴重模糊），四角取自縮圖輪廓近似，誤差約 {err[0]:.1f} 像素；建議請使用者確認四角"],
+                corner_error_px=err, aspect=est, aspect_method=amethod, focal_px=focal, edge_support=None,
+            )
         if persp_sides >= 1:
             return _full_image(img, p["conf_full_fail"], notes + [reason, "畫面中有傾斜的長直邊（透視線索），應是照片；找不到完整四邊，以整張圖為頁面；建議請使用者手動拉四角"])
         if digital:
@@ -742,7 +776,7 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
             continue
         sup = _quick_support(mag, q, thr)
         score = float(np.mean(sup)) * min(1.0, float(np.min(sup)) / 0.5) * math.sqrt(af)
-        scored.append((score, q))
+        scored.append((score, q, sup))
     if not scored:
         return fallback("候選四邊形面積都太小")
     scored.sort(key=lambda t: -t[0])
@@ -751,7 +785,10 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
     r0 = 3.0 / min(sx, sy) + 4.0
     best = None
     diag = math.hypot(W, H)
-    for _, qs in scored[: p["max_candidates_refined"]]:
+    contour_cand = None  # 退路：精修全部失敗時，用縮圖輪廓近似的四邊形
+    for _, qs, qsup in scored[: p["max_candidates_refined"]]:
+        if contour_cand is None and float(np.min(qsup)) >= p["contour_min_support"]:
+            contour_cand = qs / np.array([sx, sy])
         qf = qs / np.array([sx, sy])
         res = _refine(img_f, qf, r0, p)
         if res is None:
@@ -813,12 +850,14 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
     cerr = _corner_errors(best, p)
     est, amethod, focal = estimate_aspect(q, (W, H), cerr, p)
     contrast = min(i["contrast"] for i in best["info"])
-    resid = max(i["fit"]["sigma"] for i in best["info"])
+    # 信心值：邊緣支持率 × 對比 × 四角誤差（已含擬合殘差、邊緣彎曲與模糊）× 是否有角落在畫面外
     f_sup = float(np.clip((sup.min() - 0.3) / 0.5, 0.0, 1.0))
     f_con = float(np.clip(contrast / p["good_contrast"], 0.3, 1.0))
-    f_res = 1.0 / (1.0 + (resid / 1.0) ** 2)
+    f_err = 1.0 / (1.0 + (float(np.mean(cerr)) / p["err_conf_px"]) ** 2)
     f_vis = 0.6 if best["out_d"] > 0.5 else 1.0
-    conf = 0.05 + 0.93 * f_sup * math.sqrt(f_con) * f_res * f_vis
+    if best.get("edge_sigma", 0.0) > 4.0:
+        notes.append(f"影像模糊（邊緣寬度 σ≈{best['edge_sigma']:.1f} 像素），四角誤差放大")
+    conf = 0.05 + 0.93 * f_sup * math.sqrt(f_con) * f_err * f_vis
     if best["out_d"] > 0.5:
         notes.append("有角落落在畫面外，由邊線延長相交推得")
     if sup.min() < 0.75:

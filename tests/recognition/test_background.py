@@ -140,7 +140,7 @@ def test_flat_background():
         r = run_case("flat", 1, noisy)
         assert r["model"] == "flat" and r["is_blank"]
         assert r["res"].flat_color is not None and r["gen_boxes"] == 0 and r["gen_frac"] == 0.0
-        assert r["mae_masked"] < (0.6 if not noisy else 1.0), r  # 實測：乾淨 0.33、干擾 0.33（中位色取整）
+        assert r["mae_masked"] < (0.1 if not noisy else 0.5), r  # 實測：乾淨 0.00、干擾 0.33（雜訊下中位色差 1 色階）
 
 
 def test_gradient_backgrounds():
@@ -150,7 +150,8 @@ def test_gradient_backgrounds():
             assert r["model"] == "gradient", (kind, noisy, r["res"].notes)
             assert not r["is_blank"] and r["gen_boxes"] == 0
             assert r["res"].gradient is not None
-            lim = {"linear": 0.8, "radial": 2.0}[kind]
+            # 實測：線性 乾淨 0.003、干擾 0.50；放射 乾淨 0.13、干擾 0.57
+            lim = {"linear": 0.1, "radial": 0.3}[kind] if not noisy else {"linear": 0.7, "radial": 0.8}[kind]
             assert r["mae_masked"] < lim, (kind, noisy, r["mae_masked"])
 
 
@@ -163,9 +164,9 @@ def test_textured_backgrounds_are_inpainted_and_reported():
         assert r["conf"] < 0.6  # 紋理上的修補品質有限，要照實降信心
         g = r["res"].generated_mask
         assert g is not None and g.sum() > 0 and not (g & ~r["mask"]).any()  # 只有遮罩內的像素可能是生成的
-    # 品質上限：紙紋 MAE 實測約 7.4、照片約 27
-    assert run_case("paper", 1, False)["mae_masked"] < 9.5
-    assert run_case("photo", 1, False)["mae_masked"] < 32
+    # 品質上限（OpenCV Telea）：遮罩內 MAE 實測 紙紋 7.3、照片 14.8
+    assert run_case("paper", 1, False)["mae_masked"] < 8.5
+    assert run_case("photo", 1, False)["mae_masked"] < 17
 
 
 def test_mixed_background():
@@ -183,7 +184,7 @@ def test_mixed_background():
 
 def test_model_accuracy():
     """model 判斷正確率：乾淨與干擾各 12 例（6 種底 × 2 個亂數種子）。"""
-    for noisy, need in ((False, 1.0), (True, 0.9)):
+    for noisy, need in ((False, 1.0), (True, 1.0)):  # 實測：乾淨 12/12、干擾 12/12
         cases = all_cases(noisy)
         acc = np.mean([c["model"] == c["expected"] for c in cases])
         assert acc >= need, (noisy, [(c["kind"], c["model"]) for c in cases])

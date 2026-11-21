@@ -30,6 +30,10 @@ ocr_low_score = 0.8                  # 文字辨識信心值低於此值的行�
 ai_char_prob = 0.6                   # 第一名候選字的機率低於此值、且與第二名相差不到 ai_char_margin，請 AI 在候選中挑
 ai_char_margin = 0.25
 ai_max_lines = 12                    # 一頁最多送幾行給 AI 挑字
+traditional_prior = true             # 繁體文件中把讀成簡體的字改回繁體（OpenCC 對照表）
+bullet_detection = true              # 找出文字辨識漏掉的行首項目符號
+implausible_height_ratio = 4.0       # 一兩個字、高度超過其他文字此倍數、信心不高的偵測，當成圖形
+implausible_min_score = 0.97
 join_max_gap_factor = 4.0            # 同一基線上相距不超過幾個字寬的片段，可能接成同一行
 max_vector_paths = 300               # 一頁的複雜向量路徑超過這個數量，整批留在底圖（避免插畫被拆成上千個形狀）
 max_path_segments = 400              # 單一路徑的線段超過這個數量，留在底圖
@@ -49,7 +53,10 @@ ai_min_paragraphs = 2                # 段落少於此數不必問 AI
 
 [settings]                           # ⑤ 設定
 size_snap_step_pt = 0.5              # 字級吸附的格距（pt）
-size_snap_tolerance_pt = 0.06        # 距離格點在此值以內才吸附；否則保留原值（「不吸附」永遠是候選）
+size_snap_tolerance_pt = 0.06        # 精確擷取的值距離格點在此值以內才吸附；否則保留原值（「不吸附」永遠是候選）
+size_snap_sigma = 1.5                # 量測值的吸附容差 = 此倍數 × 量測誤差（初始值）
+settle_size_rel = 0.06               # 同一段內字級差距小於此比例視為同一字級（量測產線，初始值）
+settle_font_conf = 0.5               # 某段自己的字型信心低於此值，就改用同段投票的字型（初始值）
 page_snap_tolerance_pt = 0.5         # 頁面尺寸吸附到標準規格的容差（pt）
 line_spacing_candidates = [1.0, 1.15, 1.2, 1.5, 2.0]  # 行距倍數候選
 line_spacing_tolerance = 0.03        # 行距倍數吸附的容差

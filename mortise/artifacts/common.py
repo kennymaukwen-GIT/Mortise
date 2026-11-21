@@ -169,8 +169,8 @@ def oriented_union(quads: list[Quad]) -> Quad:
     """多個同方向四角的外接矩形，保留方向（旋轉的文字框不能用軸對齊的外接矩形）。
     方向不一致或接近水平時，退回軸對齊的外接矩形。"""
     angles = [q.angle_deg for q in quads]
-    if not quads or max(angles) - min(angles) > 0.5 or abs(angles[0]) < 0.05:
-        return union_quad(quads)
+    if not quads or max(angles) - min(angles) > 1.0 or abs(sum(angles) / len(angles)) < 1.0:
+        return union_quad(quads)  # 接近水平（含量測的小誤差）或方向不一致：軸對齊
     a = math.radians(sum(angles) / len(angles))
     ux, uy = math.cos(a), math.sin(a)  # 沿文字方向
     nx, ny = -uy, ux  # 垂直文字方向（y 向下的座標系中，指向文字的下方）

@@ -37,7 +37,13 @@
 11. 填色取內縮後區域的中位數（避開邊緣與文字）；外框線分開量線色與線寬（面積 ÷ 平均周長）。
 12. 圖層：每對區域在「補全後遮罩」的重疊處，看得到誰的像素誰就在上；巢狀時內層自然在上。
     以拓撲排序給 z，無關係者面積大的在下。
-13. 無框線表格：由 text_quads 分列、找跨列貫通的空白帶（欄間河道），至少兩欄三列，信心值較低。
+13. 無框線表格：由 text_quads 分列、找跨列貫通的空白帶（欄間河道），至少兩欄三列，信心值較低；
+    儲存格幾乎填滿整欄（分欄長文）者不算。
+附加的清理步驟：相鄰同色平坦區塊合併（JPEG 區塊邊界會切開色塊）；外框線碎段（平坦段＋轉角紋理）
+連成環狀就併成一個候選；緊貼色塊、顏色接近色塊或背景的薄紋理視為邊緣殘影（JPEG 振鈴、模糊殘邊）；
+像素其實是背景色的候選（平滑造成的殘影）丟棄；緊貼文字遮罩的小塊視為文字殘渣丟棄；
+表格內的小塊記在表格 notes（可能是漏抓的文字）。
+除錯／調參：params["_debug"] 若給一個 list，會附上背景模型、門檻與每個候選的角色與特徵。
 14. crop_region：裁切成 RGBA；有外形擬合者以 4× 超取樣畫出反鋸齒的透明度，否則以遮罩羽化。
 
 座標：工作影像像素，原點左上、y 向下；像素 i 佔 [i, i+1)，中心在 i+0.5。
@@ -46,7 +52,12 @@ quad 一律為「左上、右上、右下、左下」（以形狀自身方向為
 
 已知限制
 --------
-- 半透明色塊壓在照片上、照片內部疊加的形狀：目前一律當照片內容，不拆出來。
+- 半透明色塊壓在照片上、照片內部疊加的形狀：目前一律當照片內容，不拆出來（已實測確認）。
+- 與背景同色、疊在其他色塊上的形狀（藍卡片上的白框）看起來是洞，不會成為區域。
+- 純色加簡單幾何組成的「圖片」會被讀成形狀（例如 slide_basic 的藍底黃橢圓）；類型歧義交⑤。
+- 由基本幾何拼成的插畫會被拆成多個形狀；只有擬合失敗的色塊才合併成插畫。
+- 漸層填色只回報中位色與「有漸層」的註記，還沒有擬合漸層參數。
+- 有外框線的橢圓，線寬約低估 0.5 px；模糊下外框線色會被稀釋（照實回報，不校正）。
 - 完全被照片包住的平坦色塊會併回照片（可能其實是疊在照片上的形狀；記在照片 notes）。
 - 照片與背景同色的邊界（白底商品圖放白底上）找不準；外形擬合不好時退回原始遮罩。
 - 同色相接的兩個形狀會連成一塊，擬合失敗後成為插畫（尚未做凹角切分）。
@@ -136,6 +147,7 @@ DEFAULT_PARAMS: dict = {
     "enclosed_by_photo": 0.85,  # 平坦區塊外圍有多少比例落在照片內時併入照片（比例）
     "illus_group_px": 4,  # 插畫碎塊合併的距離（像素）
     "shadow_max_contrast": 130.0,  # 陰影與背景的平均色差上限（色階）
+    "shadow_line_rel": 0.25,  # 細長的柔邊暗帶，對比低於鄰居的此比例才當陰影（否則當線；比例）
     "shadow_soft_frac": 0.5,  # 陰影須為柔邊：區內對比的（90 百分位 − 10 百分位）至少佔 90 百分位的比例
     "shadow_max_width_rel": 0.02,  # 陰影最大厚度（佔影像短邊比例）
     # ---------------- 形狀擬合 ----------------
@@ -155,6 +167,9 @@ DEFAULT_PARAMS: dict = {
     "stroke_max_rel": 0.03,  # 外框線寬上限（佔形狀短邊的比例，另與直線上限取大者）
     "ring_hole_frac": 0.35,  # 環狀判定：洞面積至少佔填滿後面積的比例
     "ring_fill_frac": 0.6,  # 洞內平坦區塊至少佔洞面積多少才當填色（比例）
+    "std_inflate": 2.0,  # 擬合參數標準差的放大倍數（相鄰輪廓點高度相關，共變異數會低估誤差；倍）
+    "radius_err_floor_px": 0.4,  # 圓角半徑誤差的下限（像素）
+    "radius_model_rel_err": 0.03,  # 圓角半徑的模型誤差下限（佔半徑比例；貝茲圓角、超橢圓與正圓弧的差）
     "max_fit_points": 800,  # 擬合時最多取多少輪廓點（點）
     "occlusion_dilate_px": 2,  # 文字與其他區域旁多少像素內的輪廓點視為被遮擋（像素）
     "outline_accept_k": 2.0,  # 照片／插畫外形擬合的容許偏差放寬倍數（倍）
@@ -175,6 +190,7 @@ DEFAULT_PARAMS: dict = {
     "bl_min_cols": 2,  # 最少欄數（欄）
     "bl_row_align_min": 0.8,  # 跨欄對齊的列所佔比例下限（比例）
     "bl_max_cell_frac": 0.6,  # 儲存格平均寬度上限（佔表格寬的比例；擋掉兩欄內文）
+    "bl_max_col_fill": 0.75,  # 儲存格寬 ÷ 欄寬的中位數上限（比例）；分欄長文每行幾乎填滿整欄
     "bl_conf_base": 0.25,  # 無框表格信心值基數
     "bl_conf_gain": 0.35,  # 無框表格信心值隨支持度增加的幅度
     # ---------------- 裁切 ----------------
@@ -478,7 +494,7 @@ def fit_shape(mask: np.ndarray, image: np.ndarray | None = None, params: dict | 
         px = image[Y0:Y1, X0:X1][er if er.sum() >= 5 else inner].reshape(-1, 3)
         if px.size:
             fill = _to_rgb(np.median(px, axis=0))
-    return _make_shapefit(fit, (X0, Y0), fill=fill)
+    return _make_shapefit(P, fit, (X0, Y0), fill=fill)
 
 
 # =====================================================================================
@@ -803,10 +819,10 @@ def _est(value: float, err: float, rel_scale: float = 1.0) -> Estimate:
     return Estimate(float(value), err, conf)
 
 
-def _make_shapefit(fit: _Fit, offset, fill=None, stroke=None, stroke_w: Optional[Estimate] = None, outline_only=False) -> ShapeFit:
+def _make_shapefit(P: dict, fit: _Fit, offset, fill=None, stroke=None, stroke_w: Optional[Estimate] = None, outline_only=False) -> ShapeFit:
     ox, oy = offset
     est: dict[str, Estimate] = {}
-    k_std = 2.0  # 相鄰輪廓點高度相關，共變異數低估誤差，放大兩倍
+    k_std = float(P["std_inflate"])  # 相鄰輪廓點高度相關，共變異數低估誤差
     if fit.geometry == "polygon":
         poly = _offset_poly(fit.poly, 0.5) + [ox, oy]
         (cx, cy), (rw, rh), ang = cv2.minAreaRect(poly.astype(np.float32))
@@ -853,7 +869,8 @@ def _make_shapefit(fit: _Fit, offset, fill=None, stroke=None, stroke_w: Optional
             sf = ShapeFit(fit.geometry, quad, fill=fill, stroke=stroke, fit_error_px=fit.err_mean)
             if fit.geometry == "rounded_rect":
                 sf.corner_radius_px = float(r)
-                est["corner_radius_px"] = _est(r, max(k_std * s.get("r", 0.0), 0.4))
+                # 真實設計的圓角常是貝茲近似或超橢圓，不是正圓弧：加上相對的模型誤差下限
+                est["corner_radius_px"] = _est(r, max(k_std * s.get("r", 0.0), float(P["radius_err_floor_px"]), float(P["radius_model_rel_err"]) * r))
             if stroke_w is not None and sw > 0:
                 sf.stroke_width_px = float(sw)
                 est["stroke_width_px"] = stroke_w
@@ -918,7 +935,7 @@ def _expand_box(box, m, H, W):
     return max(0, x0 - m), max(0, y0 - m), min(W, x1 + m), min(H, y1 + m)
 
 
-def _refine_flat(core_full_lab: np.ndarray, k: int, box, filled, smooth, unknown, F, P, sigma):
+def _refine_flat(core_full_lab: np.ndarray, k: int, box, filled, smooth, unknown, F, P, sigma, pred=None, fg_thr: float = 14.0):
     """以混色模型精修平坦區塊的外緣，回傳（局部框、可見遮罩、已解釋遮罩）。"""
     H, W = unknown.shape
     band = int(P["edge_band_px"])
@@ -942,15 +959,18 @@ def _refine_flat(core_full_lab: np.ndarray, k: int, box, filled, smooth, unknown
     over = np.abs(a_raw - alpha) * np.sqrt(den)
     resid = np.linalg.norm(I - (O + a_raw[..., None] * D), axis=2) + np.maximum(over - float(P["ringing_max"]), 0.0)
     lowc = den < float(P["contrast_min"]) ** 2
-    take = np.where(lowc, dist <= max(1.0, band / 2.0), alpha >= 0.5)
+    mix_tol = max(float(P["mix_tol"]), float(P["mix_noise_k"]) * sigma)
+    # 只收「看得出是區塊色與外側色混色」的像素；顏色不同的外框線、相鄰物件不併入
+    take = np.where(lowc, dist <= max(1.0, band / 2.0), (alpha >= 0.5) & (resid <= 2.0 * mix_tol))
     vis = core | (zone & take)
     # 只保留與核心相連的部分
     n, lab = cv2.connectedComponents(vis.astype(np.uint8), connectivity=8)
     if n > 2:
         keep = np.unique(lab[core])
         vis = np.isin(lab, keep[keep > 0])
-    mix_tol = max(float(P["mix_tol"]), float(P["mix_noise_k"]) * sigma)
-    expl = core | (zone & (resid <= mix_tol) & ~lowc) | (zone & lowc & (dist <= band))
+    # 已解釋：混色殘差小，而且含有區塊色成分（α > 0.1）或外側本來就是背景（背景側的振鈴）
+    o_is_bg = np.linalg.norm(O - pred[Y0:Y1, X0:X1], axis=2) <= fg_thr if pred is not None else np.ones(core.shape, bool)
+    expl = core | (zone & (resid <= mix_tol) & ~lowc & ((a_raw > 0.1) | o_is_bg)) | (zone & lowc & (dist <= band))
     return bx, vis, expl
 
 
@@ -1049,10 +1069,10 @@ def _line_segments(op: np.ndarray, diff: np.ndarray, horizontal: bool, max_th: f
             continue
         if horizontal:
             pos = float((wts.sum(1) * (np.arange(h) + y + 0.5)).sum() / tot)
-            segs.append({"pos": pos, "a0": float(x), "a1": float(x + w), "th": th_eff, "k": k})
+            segs.append({"pos": pos, "a0": float(x), "a1": float(x + w), "th": th_eff, "k": k, "peak": peak})
         else:
             pos = float((wts.sum(0) * (np.arange(w) + x + 0.5)).sum() / tot)
-            segs.append({"pos": pos, "a0": float(y), "a1": float(y + h), "th": th_eff, "k": k})
+            segs.append({"pos": pos, "a0": float(y), "a1": float(y + h), "th": th_eff, "k": k, "peak": peak})
     return segs, lab
 
 
@@ -1067,6 +1087,7 @@ def _merge_segments(segs, tol, gap_k):
                 o["pos"] = (o["pos"] * L1 + s["pos"] * L2) / max(L1 + L2, _EPS)
                 o["a0"], o["a1"] = min(o["a0"], s["a0"]), max(o["a1"], s["a1"])
                 o["th"] = max(o["th"], s["th"])
+                o["peak"] = max(o.get("peak", 0.0), s.get("peak", 0.0))
                 o["ks"].append(s["k"])
                 break
         else:
@@ -1122,6 +1143,9 @@ def _detect_ruled_tables(fg: np.ndarray, diff: np.ndarray, P: dict, text_quads):
         idx = np.nonzero(lab == c)[0]
         hh = [hs[i] for i in idx if i < nh]
         vv = [vs[i - nh] for i in idx if i >= nh]
+        pk = max([x["peak"] for x in hh + vv] + [_EPS])
+        hh = [x for x in hh if x["peak"] >= 0.4 * pk]  # 振鈴光暈、殘邊的對比遠低於真正的線
+        vv = [x for x in vv if x["peak"] >= 0.4 * pk]
         n_int = sum(1 for h in hh for v in vv if h["a0"] - tol <= v["pos"] <= h["a1"] + tol and v["a0"] - tol <= h["pos"] <= v["a1"] + tol)
         hl = _cluster_pos([h["pos"] for h in hh], tol)
         vl = _cluster_pos([v["pos"] for v in vv], tol)
@@ -1240,8 +1264,13 @@ def _borderless_tables(text_quads, taken, P: dict, H: int, W: int):
             aligned += len(occ) >= 2
         frac = aligned / len(run)
         mean_w = float(np.mean([c[2] - c[0] for c in allc]))
-        if frac < float(P["bl_row_align_min"]) or mean_w > float(P["bl_max_cell_frac"]) * (X1 - X0):
-            continue
+        fills = []
+        for c in allc:
+            ci = int(np.clip(np.searchsorted(edges, (c[0] + c[2]) / 2) - 1, 0, len(edges) - 2))
+            fills.append((c[2] - c[0]) / max(edges[ci + 1] - edges[ci], 1.0))
+        fill_med = float(np.median(fills))
+        if frac < float(P["bl_row_align_min"]) or mean_w > float(P["bl_max_cell_frac"]) * (X1 - X0) or fill_med > float(P["bl_max_col_fill"]):
+            continue  # 儲存格填滿整欄（長文分欄）不算表格
         box = (X0, int(math.floor(Y0)), X1, int(math.ceil(Y1)))
         if any(_box_iou(box, t) > 0.3 for t in taken):
             continue
@@ -1377,7 +1406,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         ys1 = max(fst[m[0]][1] + fst[m[0]][3] for m in members)
         big = max(members, key=lambda m: m[4])
         F = big[1]
-        bx, vis, expl = _refine_flat(flab, root, (xs0, ys0, xs1, ys1), filled, smooth, unknown, F.astype(np.float32), P, sigma)
+        bx, vis, expl = _refine_flat(flab, root, (xs0, ys0, xs1, ys1), filled, smooth, unknown, F.astype(np.float32), P, sigma, pred, thr)
         X0, Y0, X1, Y1 = bx
         explained[Y0:Y1, X0:X1] |= expl
         cands.append(_Cand(len(cands), "flat", bx, vis, F, spread=big[2], grad_amp=big[3]))
@@ -1426,6 +1455,51 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         c.feats.update({"raw_diff_med": raw_med, "area_px": float(area), "thickness_px": _thickness(c.vis), "short_px": short, "long_px": long_,
                         "hole_frac": float(hole.sum()) / max(float(filled_m.sum()), 1.0), "mean_diff_bg": dmean,
                         "darker_than_bg": float(_luma(c.color) < bgL)})
+    # ---- 細碎片組環：外框線常被切成好幾段（平坦段＋轉角紋理），連起來是環狀就併成一個候選 ----
+    stroke_cap = max(line_thick, float(P["stroke_max_rel"]) * min(H, W)) + 1.0
+    thin = [c for c in cands if not c.role and c.feats["thickness_px"] <= stroke_cap]
+    if len(thin) >= 2:
+        tu = np.zeros((H, W), bool)
+        for c in thin:
+            X0, Y0, X1, Y1 = c.box
+            tu[Y0:Y1, X0:X1] |= c.vis
+        tl = cv2.connectedComponents(_dilate(tu, 2).astype(np.uint8), connectivity=8)[1]
+        grp: dict[int, list] = {}
+        for c in thin:
+            X0, Y0, X1, Y1 = c.box
+            g = int(np.bincount(tl[Y0:Y1, X0:X1][c.vis]).argmax())
+            grp.setdefault(g, []).append(c)
+        for g, mem in grp.items():
+            if len(mem) < 2:
+                continue
+            merged = np.zeros((H, W), bool)
+            for c in mem:
+                X0, Y0, X1, Y1 = c.box
+                merged[Y0:Y1, X0:X1] |= c.vis
+            merged = cv2.morphologyEx(merged.astype(np.uint8), cv2.MORPH_CLOSE, _disk(2)).astype(bool)
+            bb = _bbox_of(merged)
+            loc = merged[bb[1] : bb[3], bb[0] : bb[2]]
+            fh = _fill_holes(loc)
+            if (fh & ~loc).sum() < float(P["ring_hole_frac"]) * fh.sum():
+                continue
+            areas = np.array([c.feats["area_px"] for c in mem])
+            cols = np.array([c.color for c in mem])
+            main = cols[int(areas.argmax())]
+            same = np.linalg.norm(cols - main, axis=1) <= 2 * max(float(P["merge_color_tol"]), 3 * sigma)
+            if areas[same].sum() < 0.8 * areas.sum():
+                continue
+            nc = _Cand(len(cands), "texture", bb, loc, main.copy())
+            for c in mem:
+                c.role, c.parent = "consumed", nc.id
+            cands.append(nc)
+            sub = L[bb[1] : bb[3], bb[0] : bb[2]]
+            sub[loc] = nc.id + 1
+            pts = np.column_stack(np.nonzero(loc)[::-1]).astype(np.float32)
+            (_, _), (rw, rh), _ = cv2.minAreaRect(pts)
+            nc.feats.update({"raw_diff_med": float(np.median(diff_raw[bb[1] : bb[3], bb[0] : bb[2]][loc])), "area_px": float(loc.sum()),
+                             "thickness_px": max(c.feats["thickness_px"] for c in mem), "short_px": min(rw, rh) + 1, "long_px": max(rw, rh) + 1,
+                             "hole_frac": float((fh & ~loc).sum()) / max(float(fh.sum()), 1.0), "mean_diff_bg": float(diff[bb[1] : bb[3], bb[0] : bb[2]][loc].mean()),
+                             "darker_than_bg": float(_luma(main) < bgL), "n_parts": float(len(mem))})
     # ---- 邊緣殘影：緊貼平坦區塊的薄紋理，顏色接近該區塊色或背景色（JPEG 振鈴、模糊殘邊） ----
     near_flat = _dilate(flat_union, 2 * band_px + 2) if flat_union.any() else flat_union
     for c in cands:
@@ -1457,10 +1531,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         X0, Y0, X1, Y1 = c.box
         dv = diff_raw[Y0:Y1, X0:X1][c.vis]
         p10, p90 = np.percentile(dv, [10, 90])
-        if p90 - p10 < float(P["shadow_soft_frac"]) * p90:
-            continue  # 對比均勻：是實心的細東西，不是柔邊陰影
-        if f["short_px"] <= line_thick + 1 and f["long_px"] >= float(P["line_min_aspect"]) * f["short_px"]:
-            continue  # 細長的是線，不是陰影
+        soft = p90 - p10 >= float(P["shadow_soft_frac"]) * p90  # 柔邊（對比由內往外遞減）
+        line_like = f["short_px"] <= line_thick + 1 and f["long_px"] >= float(P["line_min_aspect"]) * f["short_px"]
         bx = _expand_box(c.box, 3, H, W)
         ring = _dilate(_paste((H, W), c.box, c.vis)[bx[1] : bx[3], bx[0] : bx[2]], 3)
         nb = L[bx[1] : bx[3], bx[0] : bx[2]][ring]
@@ -1468,6 +1540,9 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         if nb.size == 0:
             continue
         other = cands[int(np.bincount(nb).argmax()) - 1]
+        faint = f["mean_diff_bg"] <= float(P["shadow_line_rel"]) * other.feats["mean_diff_bg"]  # 比鄰居淡得多
+        if (line_like and not faint) or not (soft or faint):
+            continue  # 細長而且對比不弱：是線；對比均勻又不淡：是實心的細東西
         if other.feats["area_px"] > f["area_px"]:
             c.role = "shadow"
             c.parent = other.id
@@ -1620,7 +1695,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             sw = Estimate(width, 0.5 if thin else 0.3, 0.3 if thin else 0.8)
             if thin:
                 notes.append("細線（< 2 px）：線寬與顏色無法分離，數值僅供參考")
-            sf = _make_shapefit(fit, (X0, Y0), stroke=col, stroke_w=sw)
+            sf = _make_shapefit(P, fit, (X0, Y0), stroke=col, stroke_w=sw)
             amodal = _raster_full(_shapefit_outer_poly(sf), H, W)
             if amodal.sum() < 0.5 * vis_full.sum():
                 amodal |= vis_full
@@ -1628,20 +1703,26 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             continue
         if c.role == "ring":
             ring_full = _paste((H, W), c.box, c.vis)
-            t_out = cv2.findContours(c.vis.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)[0]
-            per = sum(cv2.arcLength(t, True) for t in t_out)
-            sw_val = float(c.feats["area_px"] / max(per / 2.0, 1.0))
+            # 線寬＝環面積 ÷ 中心線長；環面積＝外輪廓內面積 − 最大內洞面積（不受碎縫影響）
+            outer_fill = _fill_holes(c.vis)
+            hl = cv2.connectedComponentsWithStats((outer_fill & ~c.vis).astype(np.uint8), connectivity=4)
+            inner = hl[1] == (1 + int(np.argmax(hl[2][1:, cv2.CC_STAT_AREA]))) if hl[0] > 1 else np.zeros_like(c.vis)
+            co = cv2.findContours(outer_fill.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+            ci = cv2.findContours(inner.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]
+            p_out = max((cv2.arcLength(t, True) for t in co), default=0.0)
+            p_in = max((cv2.arcLength(t, True) for t in ci), default=0.0)
+            sw_val = float((outer_fill.sum() - inner.sum()) / max((p_out + p_in) / 2.0, 1.0))
             sw = Estimate(sw_val, 0.5, float(np.clip(1.0 - 0.5 / max(sw_val, 0.5), 0.1, 0.9)))
             stroke_col, smad = _fill_of(ring_full & ~_dilate(~ring_full, 0), 0)
             fill_col = None
             if c.feats.get("fill_id", -1) >= 0:
                 fill_col, fmad = _fill_of(_paste((H, W), cands[c.feats["fill_id"]].box, cands[c.feats["fill_id"]].vis), band)
-            sf = _make_shapefit(fit, (X0, Y0), fill=fill_col, stroke=stroke_col, stroke_w=sw)
+            sf = _make_shapefit(P, fit, (X0, Y0), fill=fill_col, stroke=stroke_col, stroke_w=sw)
             sf.estimates["stroke_mad"] = Estimate(smad, smad, float(np.clip(1 - smad / 30, 0.05, 0.98)))
             notes.append("有外框線" + ("，無填色（中空）" if fill_col is None else ""))
         else:
             fill_col, fmad = _fill_of(vis_full, band)
-            sf = _make_shapefit(fit, (X0, Y0), fill=fill_col)
+            sf = _make_shapefit(P, fit, (X0, Y0), fill=fill_col)
             sf.estimates["fill_mad"] = Estimate(fmad, fmad, float(np.clip(1 - fmad / 30, 0.05, 0.98)))
             if c.grad_amp > 12.0:
                 notes.append(f"填色有漸層（跨區約 {c.grad_amp:.0f} 色階），fill 為中位色")
@@ -1769,7 +1850,7 @@ def _outline_fit(hull, vis_known, unknown, fg, L, own_ids, P, tol, H, W):
     fit = _fit_mask(loc, bad, dict(P, max_polygon_vertices=0), tol * k, allow_line=False, allowed=other)
     notes = []
     if fit is not None and fit.accepted and fit.geometry in ("rect", "rounded_rect", "ellipse"):
-        sf = _make_shapefit(fit, (X0, Y0))
+        sf = _make_shapefit(P, fit, (X0, Y0))
         amodal = _raster_full(_shapefit_outer_poly(sf), H, W)
         notes.append(f"外形：{fit.geometry}（平均誤差 {fit.err_mean:.2f} px）")
         return sf, amodal, notes

@@ -87,13 +87,15 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
     blocks: list[list[TextLine]] = []
     for line in lines:
         best, best_gap = None, None
-        if abs(line.quad.angle_deg) < 0.5:
+        max_angle = c.get("flow_max_angle_deg", 2.0)  # 量測產線的行框會有零點幾度的誤差
+        if abs(line.quad.angle_deg) < max_angle:
             for block in blocks:
                 last = block[-1]
-                if abs(last.quad.angle_deg) >= 0.5:
+                if abs(last.quad.angle_deg) >= max_angle or abs(last.quad.angle_deg - line.quad.angle_deg) > 1.0:
                     continue
                 size = last.font_size
-                if abs(line.font_size - size) > c["size_tolerance"] * size:
+                tol = max(c["size_tolerance"], 2.0 * max(line.font_size_rel_error, last.font_size_rel_error))  # 量測值的容差隨誤差放大
+                if abs(line.font_size - size) > tol * size:
                     continue
                 pitch = line.baseline[0].y - last.baseline[0].y
                 if pitch <= 0.3 * size:

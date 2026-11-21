@@ -52,11 +52,23 @@ class TextLine(Model):
 
     @property
     def font_size(self) -> float:
-        """行內佔最多字的字級（相對單位）。"""
-        best: dict[float, int] = {}
-        for r in self.runs:
-            best[r.font_size.value] = best.get(r.font_size.value, 0) + len(r.text)
-        return max(best, key=lambda k: best[k]) if best else 0.0
+        """行的代表字級（相對單位）：各段字級依字數與信心值加權的中位數（量測值有雜訊時比「最多字的段」穩）。"""
+        items = sorted((r.font_size.value, max(len(r.text.strip()), 1) * max(r.font_size.confidence, 0.05)) for r in self.runs)
+        if not items:
+            return 0.0
+        total = sum(w for _, w in items)
+        acc = 0.0
+        for v, w in items:
+            acc += w
+            if acc >= total / 2:
+                return v
+        return items[-1][0]
+
+    @property
+    def font_size_rel_error(self) -> float:
+        """代表字級的相對誤差（精確擷取為 0）。"""
+        errs = [(r.font_size.error or 0.0) / r.font_size.value for r in self.runs if r.font_size.value > 0]
+        return min(errs) if errs else 0.0
 
 
 class ImageKind(str, Enum):
