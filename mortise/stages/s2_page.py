@@ -137,6 +137,7 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
         extra = {
             "color_image": store.put_blob(_png(color), "image/png", "png") if color is not image else None,
             "size_candidates": size_candidates, "quad_method": quad_method, "quad_confidence": quad_conf,
+            "enhanced": color is not image,
         }
     else:
         extra = {"quad_method": "pdf_box", "quad_confidence": 1.0}

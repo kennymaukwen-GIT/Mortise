@@ -77,9 +77,9 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
 
     c = cfg.section("recognize")
     work = np.asarray(Image.open(store.blob_path(spec.working_image)).convert("RGB"))
-    color = np.asarray(Image.open(store.blob_path(spec.color_image or spec.working_image)).convert("RGB"))
-    if color.shape != work.shape:
-        color = work
+    # 量顏色、擦字、補底圖都用工作影像：只有白紙類頁面會被增強（白平衡、去光照），這時增強後的顏色反而比原圖準；
+    # 其他頁面工作影像就是原圖。未增強的原圖（spec.color_image）留給前端預覽。
+    color = work
     H, W = work.shape[:2]
     notes: list[str] = []
     page = spec.page_index
@@ -242,6 +242,7 @@ def _text_line(page: int, i: int, ol, attrs, W: float) -> TextLine:
             color=measured(_rgb(r.color), float(r.color_confidence), Provenance.MEASURED, STEP),
             char_spacing=(float(r.char_spacing_px.value) / W) if r.char_spacing_px is not None else None,
             char_x=char_x,
+            stroke_ratio=(float(r.stroke_width_px.value) / float(est.value)) if getattr(r, "stroke_width_px", None) is not None and est.value > 0 else None,
         ))
     if not runs:
         return _text_line(page, i, ol, None, W)

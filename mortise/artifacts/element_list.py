@@ -31,6 +31,7 @@ class TextRun(Model):
     color: Measured[Color]
     char_spacing: Optional[float] = None  # 額外字距（相對單位）；量不出來就留空
     char_x: list[float] = []  # 每個字起點的 x（相對單位，沿基線方向），供④⑤判斷對齊與字距
+    stroke_ratio: Optional[float] = None  # 筆畫粗細 ÷ 字級（影像產線才有）：⑤用它與整頁比較來判斷粗體，不受模糊影響
 
 
 class TextLine(Model):

@@ -57,6 +57,15 @@ size_snap_tolerance_pt = 0.06        # 精確擷取的值距離格點在此值�
 size_snap_sigma = 1.5                # 量測值的吸附容差 = 此倍數 × 量測誤差（初始值）
 settle_size_rel = 0.06               # 同一段內字級差距小於此比例視為同一字級（量測產線，初始值）
 settle_font_conf = 0.5               # 某段自己的字型信心低於此值，就改用同段投票的字型（初始值）
+bold_relative_ratio = 1.3            # 筆畫粗細比超過同字級（±25%）文字此倍數才算粗體（量測產線，初始值）
+bold_group_min_chars = 30            # 同字級群組至少要有這麼多字，才用相對比較；不夠就沿用③的判斷
+dark_text_conf = 0.6                 # 顏色信心低於此值、近乎無彩、亮度 L 低於 dark_text_max_l 的文字當成黑字
+dark_text_max_l = 60
+thin_stroke_px = 2.5                 # 筆畫細於此值（工作影像像素）時，量到的深灰當成黑字
+paper_small_text_pt = 14             # 白紙類照片上小於此字級的深灰字當成黑字
+font_skip_prefixes = ["Unifont"]     # 不當成字型候選的後備字型（名稱開頭）
+color_merge_delta_e = 12.0           # 文字顏色差距（ΔE）小於此值歸成同一色（量測產線，初始值）
+color_snap_black_white_delta_e = 10.0  # 接近純黑或純白（ΔE）就吸到純黑、純白
 page_snap_tolerance_pt = 0.5         # 頁面尺寸吸附到標準規格的容差（pt）
 line_spacing_candidates = [1.0, 1.15, 1.2, 1.5, 2.0]  # 行距倍數候選
 line_spacing_tolerance = 0.03        # 行距倍數吸附的容差

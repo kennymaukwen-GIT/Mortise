@@ -29,6 +29,7 @@ class PageSpec(Model):
     size_candidates: list[dict] = []  # 尺寸候選（名稱、寬 pt、高 pt、信心值、依據），前兩名接近時請使用者選
     quad_method: str = ""  # 頁面四角怎麼來的：pdf_box、edge_fit、contour、full_image、user
     quad_confidence: float = 1.0
+    enhanced: bool = False  # 工作影像做過白平衡與去光照（白紙類頁面）
 
     @property
     def page_height_pt(self) -> float:

@@ -31,7 +31,7 @@ from ..config import Config
 from ..tools.fonts import has_cjk, verification_font
 
 NAME = "s5"
-VERSION = "3"
+VERSION = "4"
 
 _APPS = [
     ("powerpoint", "powerpoint"), ("impress", "libreoffice_impress"), ("keynote", "keynote"), ("google slides", "google_slides"),
@@ -84,13 +84,18 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
     same = app != "unknown" and _FAMILY.get(app) in wanted
     target_mode = measured(TargetMode.SAME_SOURCE if same else TargetMode.CROSS_SOURCE, 0.8 if app != "unknown" else 0.5, Provenance.INFERRED, f"{NAME}.target_mode@{VERSION}")
 
-    doc_fonts = document_fonts(elements)
+    doc_fonts: dict = document_fonts(elements)
+    doc_fonts["_palette"] = text_palette(elements, c)  # 量測產線的顏色調色盤
+    doc_fonts["_bold_samples"] = bold_samples(elements, {sp.page_index: sp.page_width_pt.value for sp in specs})
     pages: list[StyledPage] = []
     style_counter: Counter = Counter()
     style_role: dict[tuple, Role] = {}
     color_counter: Counter = Counter()
 
     for spec, el, pl in zip(specs, elements, layout.pages):
+        doc_fonts["_page_px_w"] = spec.working_image_size[0]
+        doc_fonts["_page_paper"] = spec.enhanced
+        doc_fonts["_page_pt_w"] = spec.page_width_pt.value
         # ---------- s5.page_size ----------
         w = spec.page_width_pt.value
         h = w * spec.aspect_ratio
@@ -434,8 +439,96 @@ def _font(run: TextRun, subs: dict[str, str], family: str | None = None, confide
     return FontChoice(family=measured(family, float(confidence), run.font_size.source, step), verification_family=vf, is_substituted=substituted, east_asian=ea)
 
 
+_SKIP_FONTS = ("Unifont",)  # 點陣後備字型，設計文件不會用；量測時常被誤選
+
+
+def _candidates(r: TextRun, c: dict):
+    skip = tuple(c.get("font_skip_prefixes", _SKIP_FONTS))
+    return [fc for fc in r.font_candidates if not fc.name.startswith(skip)]
+
+
 def _script(text: str) -> str:
     return "cjk" if has_cjk(text) else "latin"
+
+
+def _lab(c: Color) -> tuple[float, float, float]:
+    def lin(v: float) -> float:
+        v /= 255.0
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = lin(c.r), lin(c.g), lin(c.b)
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+
+    def f(t: float) -> float:
+        return t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
+
+    return 116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))
+
+
+def _delta_e(a: Color, b: Color) -> float:
+    la, lb = _lab(a), _lab(b)
+    return sum((p - q) ** 2 for p, q in zip(la, lb)) ** 0.5
+
+
+def text_palette(elements: list[ElementList], c: dict) -> dict[str, Color]:
+    """s5.color：量測產線的文字顏色歸併成調色盤。光照與壓縮會讓同一個顏色量出一片相近的值；
+    ΔE 小於門檻的歸成一群，用字數最多的那個顏色代表；接近純黑或純白的再吸到純黑、純白。回傳（原色 → 定案色）。"""
+    counts: Counter = Counter()
+    for el in elements:
+        if el.production_line.value != "image":
+            continue
+        for t in el.texts:
+            for r in t.runs:
+                counts[r.color.value.hex] += len(r.text.strip())
+    tol = c.get("color_merge_delta_e", 12.0)
+    centers: list[Color] = []
+    out: dict[str, Color] = {}
+    for hx, _ in counts.most_common():
+        col = Color(r=int(hx[0:2], 16), g=int(hx[2:4], 16), b=int(hx[4:6], 16))
+        near = min(centers, key=lambda z: _delta_e(z, col), default=None)
+        if near is not None and _delta_e(near, col) <= tol:
+            out[hx] = near
+        else:
+            centers.append(col)
+            out[hx] = col
+    black, white = Color(r=0, g=0, b=0), Color(r=255, g=255, b=255)
+    snap = c.get("color_snap_black_white_delta_e", 10.0)
+    for hx, col in list(out.items()):
+        if _delta_e(col, black) <= snap:
+            out[hx] = black
+        elif _delta_e(col, white) <= snap:
+            out[hx] = white
+    return out
+
+
+def bold_samples(elements: list[ElementList], w_of: dict[int, float]) -> list[tuple[float, float, int]]:
+    """所有量測段的（字級 pt、筆畫粗細比、字數），給「同字級群組內」的相對粗體判斷用。
+    模糊會讓筆畫一起變粗，而且字越小加粗得越多，所以只跟字級相近的文字比。"""
+    out = []
+    for el in elements:
+        w = w_of.get(el.page_index, 1.0)
+        for t in el.texts:
+            for r in t.runs:
+                if r.stroke_ratio:
+                    out.append((r.font_size.value * w, r.stroke_ratio, len(r.text.strip())))
+    return out
+
+
+def _relative_bold(pt: float, ratio: float, samples, c: dict) -> bool | None:
+    """同字級群組（±25%）中，筆畫粗細比的加權中位數當作「一般粗細」；明顯更粗才算粗體。群組裡的其他字太少時回傳 None（交給③的判斷）。"""
+    group = sorted((r, n) for p_, r, n in samples if abs(p_ - pt) <= 0.25 * pt)
+    if sum(n for _, n in group) < c.get("bold_group_min_chars", 30):
+        return None
+    total = sum(n for _, n in group)
+    acc, median = 0.0, group[-1][0]
+    for r, n in group:
+        acc += n
+        if acc >= total / 2:
+            median = r
+            break
+    return ratio >= median * c.get("bold_relative_ratio", 1.3)
 
 
 def document_fonts(elements: list[ElementList]) -> dict[str, str]:
@@ -444,15 +537,16 @@ def document_fonts(elements: list[ElementList]) -> dict[str, str]:
     for el in elements:
         for t in el.texts:
             for r in t.runs:
-                if r.font_size.source == Provenance.EXACT or not r.font_candidates:
+                cands = [fc for fc in r.font_candidates if not fc.name.startswith(_SKIP_FONTS)]
+                if r.font_size.source == Provenance.EXACT or not cands:
                     continue
-                top = r.font_candidates[0]
+                top = cands[0]
                 if r.font_size.confidence >= 0.5:
                     votes[_script(r.text)][top.name] += len(r.text.strip()) * r.font_size.confidence * max(top.score, 0.05)
     return {k: v.most_common(1)[0][0] for k, v in votes.items() if v}
 
 
-def _settle(lines: list[TextLine], w: float, c: dict, doc_fonts: dict[str, str]) -> dict[int, tuple[float, float, str, float, bool, bool]]:
+def _settle(lines: list[TextLine], w: float, c: dict, doc_fonts: dict) -> dict[int, tuple[float, float, str, float, bool, bool]]:
     """量測產線的段落內定案（s5.font、s5.font_size 的「同段投票」）：
     - 字級：段落內依「字數 × 信心值」取加權中位數；誤差範圍內（或差距小於 6%）的段一律用中位數，真的不同才保留。
     - 字型：同一書寫系統的段投票；某段自己的第一名信心低、或投票結果在它的前三名候選裡，就改用投票結果；
@@ -472,8 +566,8 @@ def _settle(lines: list[TextLine], w: float, c: dict, doc_fonts: dict[str, str])
             break
     votes: dict[str, Counter] = {"cjk": Counter(), "latin": Counter()}
     for r in runs:
-        if r.font_candidates:
-            top = r.font_candidates[0]
+        if _candidates(r, c):
+            top = _candidates(r, c)[0]
             votes[_script(r.text)][top.name] += len(r.text.strip()) * max(r.font_size.confidence, 0.05) * max(top.score, 0.05)
     bold_votes = sum((1 if r.bold.value else -1) * r.bold.confidence * len(r.text.strip()) for r in runs)
     out = {}
@@ -485,18 +579,23 @@ def _settle(lines: list[TextLine], w: float, c: dict, doc_fonts: dict[str, str])
         if abs(pt - median) <= max(2 * err, rel * median):
             pt, err = median, min(err, 0.5 * median * c.get("settle_size_rel", 0.06))
         script = _script(r.text)
-        own = r.font_candidates[0].name if r.font_candidates else None
-        own_conf = r.font_candidates[0].score if r.font_candidates else 0.0
+        cands = _candidates(r, c)
+        own = cands[0].name if cands else None
+        own_conf = cands[0].score if cands else 0.0
         winner = votes[script].most_common(1)[0][0] if votes[script] else None
-        backers = [x for x in runs if _script(x.text) == script and x.font_candidates and x.font_candidates[0].name == winner]
-        weak_vote = not backers or max(x.font_candidates[0].score for x in backers) < 0.3
-        names = [fc.name for fc in r.font_candidates[:3]]
+        backers = [x for x in runs if _script(x.text) == script and _candidates(x, c) and _candidates(x, c)[0].name == winner]
+        weak_vote = not backers or max(_candidates(x, c)[0].score for x in backers) < 0.3
+        names = [fc.name for fc in cands[:3]]
         family, conf = own, own_conf
         if winner and not weak_vote and (winner in names or own_conf < c.get("settle_font_conf", 0.5) or r.font_size.confidence < 0.5):
             family, conf = winner, max(own_conf, 0.5)
         if (family is None or (weak_vote and conf < 0.3)) and doc_fonts.get(script):
             family, conf = doc_fonts[script], 0.4  # 整段都不可靠（例如單獨一個頁碼）：用整份文件的字型
         bold = r.bold.value if r.bold.confidence >= 0.7 else bold_votes > 0
+        if r.stroke_ratio and doc_fonts.get("_bold_samples"):
+            rel = _relative_bold(pt, r.stroke_ratio, doc_fonts["_bold_samples"], c)  # 相對同字級文字的筆畫粗細
+            if rel is not None:
+                bold = rel
         italic = r.italic.value
         out[id(r)] = (pt, err, family or "unknown", conf, bold, italic)
     return out
@@ -520,7 +619,18 @@ def _runs(lines: list[TextLine], joiners: list[str], w: float, c: dict, subs: di
                 size = _snap_size(r.font_size.value * w, c, r.font_size, step)
                 font = _font(r, subs)
                 bold, italic = r.bold.value, r.italic.value
-            sr = StyledRun(text=text, font=font, size_pt=size, bold=bold, italic=italic, color=r.color.value)
+            color = r.color.value
+            if r.color.source != Provenance.EXACT:
+                color = (doc_fonts or {}).get("_palette", {}).get(color.hex, color)
+                lab = _lab(color)
+                chroma = (lab[1] ** 2 + lab[2] ** 2) ** 0.5
+                stroke_px = (r.stroke_ratio or 0.0) * r.font_size.value * (doc_fonts or {}).get("_page_px_w", 0)
+                thin = 0 < stroke_px < c.get("thin_stroke_px", 2.5)  # 筆畫太細：核心顏色會被模糊與反鋸齒沖淡，量到的灰不可信
+                small_on_paper = (doc_fonts or {}).get("_page_paper") and r.font_size.value * (doc_fonts or {}).get("_page_pt_w", 0) < c.get("paper_small_text_pt", 14)
+                thin = thin or bool(small_on_paper)  # 白紙上的小字：照片解析度下筆畫只有一兩個像素，量到的灰多半是黑字被沖淡
+                if (thin or r.color.confidence < c.get("dark_text_conf", 0.6)) and chroma < 12 and lab[0] < c.get("dark_text_max_l", 60):
+                    color = Color(r=0, g=0, b=0)  # 細筆畫被模糊沖淡的深灰：當成黑字
+            sr = StyledRun(text=text, font=font, size_pt=size, bold=bold, italic=italic, color=color)
             if out and (out[-1].font.family.value, out[-1].size_pt.value, out[-1].bold, out[-1].italic) == (sr.font.family.value, sr.size_pt.value, sr.bold, sr.italic) and _same_color(out[-1].color, sr.color, r.color.source):
                 out[-1] = out[-1].model_copy(update={"text": out[-1].text + text})
             else:
