@@ -10,7 +10,8 @@
   s5.box          文字框、圖片、形狀的位置與大小
   s5.styles       歸納樣式表與主題色
   s5.tables       表格：欄寬、列高、儲存格邊距與垂直對齊、底色、框線、數字格式推論（千分位、百分比、貨幣）
-尚未實作：母片定案、Excel 公式推論、顏色吸附、比例尺一致性檢查。
+  s5.masters      母片：每一頁相同位置都出現的元素
+尚未實作：Excel 公式推論、顏色吸附、比例尺一致性檢查。
 """
 
 from __future__ import annotations
@@ -172,8 +173,53 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
     pages = [_tag_styles(p, sig_to_id) for p in pages]
     theme = [Color(r=int(hx[0:2], 16), g=int(hx[2:4], 16), b=int(hx[4:6], 16)) for hx, _ in color_counter.most_common(6)]
 
-    styled = StyledDoc(target_mode=target_mode, source_app=source_app, pages=pages, styles=styles, theme_colors=theme, notes=notes)
+    masters = _masters(layout, pages)
+    if masters:
+        notes.append(f"有 {sum(len(m.member_ids) for m in masters)} 個元素在每一頁都出現在相同位置，已放到母片上。")
+    styled = StyledDoc(target_mode=target_mode, source_app=source_app, pages=pages, styles=styles, theme_colors=theme, notes=notes, masters=masters)
     return _apply_corrections(styled, corrections, subs)
+
+
+# ---------- s5.masters ----------
+
+
+def _masters(layout: Layout, pages: list[StyledPage]):
+    """④的母片候選 → 母片。只收「每一頁都有」的候選（簡報的版面配置會套用到所有頁）；
+    文字只收單獨成框的（例如頁尾文字），框裡還有其他內容的不收。"""
+    from ..artifacts import StyledMaster
+
+    n = len(pages)
+    if n < 2 or not layout.master_candidates:
+        return []
+    line_box: dict[str, str] = {}
+    for pl in layout.pages:
+        pars = {p.id: p for p in pl.paragraphs}
+        for b in pl.text_boxes:
+            ids = [lid for pid in b.paragraph_ids for lid in pars[pid].line_ids]
+            if len(ids) == 1:
+                line_box[ids[0]] = b.id
+    tbs, ims, shs, members = [], [], [], []
+    for cand in layout.master_candidates:
+        if sorted(set(cand.page_indexes)) != list(range(n)) or len(cand.element_ids) != n:
+            continue
+        first_page = pages[cand.page_indexes[0]]
+        eid0 = cand.element_ids[0]
+        ids = [line_box.get(e, e) for e in cand.element_ids]
+        tb = next((t for t in first_page.text_boxes if t.id == ids[0]), None)
+        im = next((i for i in first_page.images if i.id == eid0), None)
+        sh = next((x for x in first_page.shapes if x.id == eid0), None)
+        if tb is not None:
+            tbs.append(tb)
+        elif im is not None:
+            ims.append(im)
+        elif sh is not None:
+            shs.append(sh)
+        else:
+            continue
+        members += ids
+    if not members:
+        return []
+    return [StyledMaster(id="master-1", text_boxes=tbs, images=ims, shapes=shs, member_ids=members, page_indexes=list(range(n)))]
 
 
 # ---------- s5.tables ----------

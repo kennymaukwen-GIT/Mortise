@@ -184,8 +184,50 @@ def poster() -> None:
     c.save()
 
 
+def deck() -> None:
+    """三頁簡報：每頁相同位置有標誌、頁尾文字與色帶（母片候選），頁碼每頁不同。"""
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches, Pt
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    logo = Image.new("RGB", (240, 80), (31, 58, 95))
+    ImageDraw.Draw(logo).ellipse((10, 10, 70, 70), fill=(242, 193, 78))
+    buf = io.BytesIO()
+    logo.save(buf, "PNG")
+    titles = ["市場概況 Market Overview", "產品策略 Product Strategy", "財務預測 Financial Outlook"]
+    bodies = ["今年的文件還原需求持續成長，企業客戶占比超過六成。", "第一階段專注檔案急救，第二階段推出靈感模板。", "預計明年營收成長百分之四十，毛利率維持在六成以上。"]
+    for i, (title, body) in enumerate(zip(titles, bodies), start=1):
+        s = prs.slides.add_slide(prs.slide_layouts[6])
+        band = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, Inches(7.1), prs.slide_width, Inches(0.4))
+        band.fill.solid()
+        band.fill.fore_color.rgb = RGBColor(0x1F, 0x3A, 0x5F)
+        band.line.fill.background()
+        band.shadow.inherit = False
+        buf.seek(0)
+        s.shapes.add_picture(buf, Inches(11.3), Inches(0.3), Inches(1.6), Inches(0.53))
+        for (x, y, w, h, text, size, bold, color) in [
+            (0.8, 0.4, 10.0, 1.0, title, 36, True, (0x1F, 0x3A, 0x5F)),
+            (0.8, 1.8, 11.5, 2.0, body, 20, False, (0x33, 0x33, 0x33)),
+            (0.8, 7.15, 6.0, 0.3, "Mortise 內部資料 Internal", 12, False, (0xFF, 0xFF, 0xFF)),
+            (12.3, 7.15, 0.6, 0.3, str(i), 12, False, (0xFF, 0xFF, 0xFF)),
+        ]:
+            tf = s.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h)).text_frame
+            tf.word_wrap = True
+            r = tf.paragraphs[0].add_run()
+            r.text, r.font.size, r.font.bold, r.font.name = text, Pt(size), bold, "Liberation Sans"
+            r.font.color.rgb = RGBColor(*color)
+    path = HERE / "deck.pptx"
+    prs.save(path)
+    _to_pdf(path)
+    path.unlink()
+
+
 if __name__ == "__main__":
     slide_dark()
     doc_a4()
     poster()
+    deck()
     print(sorted(p.name for p in HERE.glob("*.pdf")))

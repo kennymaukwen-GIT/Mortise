@@ -94,8 +94,8 @@ def _add_text_box(slide, tb: StyledTextBox, degradations: list[Degradation], fon
     _fill_paragraphs(tf, tb.paragraphs, tb.id, degradations, fonts)
 
 
-def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradation], fonts: set[str]) -> None:
-    slide = prs.slides.add_slide(prs.slide_layouts[6])  # 空白版面
+def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradation], fonts: set[str], skip: frozenset = frozenset(), layout=None) -> None:
+    slide = prs.slides.add_slide(layout if layout is not None else prs.slide_layouts[6])  # 空白版面
     if page.background_color is not None:
         fill = slide.background.fill
         fill.solid()
@@ -104,8 +104,14 @@ def _add_page(prs, page: StyledPage, store: Store, degradations: list[Degradatio
         pic = slide.shapes.add_picture(str(store.blob_path(page.background_image)), 0, 0, prs.slide_width, prs.slide_height)
         pic.name = f"background-{page.page_index + 1}"
         degradations.append(Degradation(element_id=pic.name, concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))
+    _add_elements(slide, page, store, degradations, fonts, skip)
+
+
+def _add_elements(slide, page: StyledPage, store: Store, degradations: list[Degradation], fonts: set[str], skip: frozenset = frozenset()) -> None:
     items = [(t.z, "text", t) for t in page.text_boxes] + [(i.z, "image", i) for i in page.images] + [(s.z, "shape", s) for s in page.shapes] + [(t.z, "table", t) for t in page.tables]
     for _, kind, item in sorted(items, key=lambda x: x[0]):
+        if item.id in skip:
+            continue  # 已經放在母片上
         b = item.box
         x, y, w, h = (Emu(pt_to_emu(v)) for v in (b.x, b.y, b.w, b.h))
         if kind == "text":
@@ -268,6 +274,38 @@ def _add_path(slide, shape, degradations: list[Degradation]) -> None:
         sp.line.fill.background()
 
 
+def _build_master(prs, doc: StyledDoc, store: Store, degradations: list[Degradation], fonts: set[str]):
+    """把母片元素畫在「空白」版面配置上：所有投影片都套用它，改一次全部跟著改。
+    做法是先畫在一張暫時的投影片上，再把物件搬到版面配置；圖片要在版面配置上重新建立關聯。"""
+    if not doc.masters:
+        return None, frozenset()
+    master = doc.masters[0]
+    layout = prs.slide_layouts[6]
+    temp = prs.slides.add_slide(layout)
+    page = StyledPage(page_index=-1, width_pt=doc.pages[0].width_pt, height_pt=doc.pages[0].height_pt, text_boxes=master.text_boxes, images=master.images, shapes=master.shapes)
+    before = len(temp.shapes)
+    sp_tree = temp.shapes._spTree
+    # 只畫元素，不畫底色與底圖
+    _add_elements(temp, page, store, degradations, fonts)
+    moved = list(sp_tree)[2 + before:]  # 前兩個是 nvGrpSpPr 與 grpSpPr
+    target = layout.shapes._spTree
+    for el in moved:
+        blips = el.findall(".//" + qn("a:blip"))
+        for blip in blips:
+            rid = blip.get(qn("r:embed"))
+            image_part = temp.part.related_part(rid)
+            new_rid = layout.part.relate_to(image_part, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image")
+            blip.set(qn("r:embed"), new_rid)
+        sp_tree.remove(el)
+        target.append(el)
+    # 刪掉暫時的投影片
+    sld_ids = prs.slides._sldIdLst
+    last = sld_ids[-1]
+    prs.part.drop_rel(last.get(qn("r:id")))
+    sld_ids.remove(last)
+    return layout, frozenset(master.member_ids)
+
+
 def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFile:
     prs = Presentation()
     first = doc.pages[0]
@@ -276,10 +314,11 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     degradations: list[Degradation] = []
     fonts: set[str] = set()
     notes: list[str] = []
+    layout, skip = _build_master(prs, doc, store, degradations, fonts)
     for page in doc.pages:
         if abs(page.width_pt - first.width_pt) > 0.5 or abs(page.height_pt - first.height_pt) > 0.5:
             degradations.append(Degradation(element_id=f"page-{page.page_index + 1}", concept="各頁尺寸不同", action="簡報只能有一種頁面尺寸，以第 1 頁為準", lossy=True))
-        _add_page(prs, page, store, degradations, fonts)
+        _add_page(prs, page, store, degradations, fonts, skip=skip, layout=layout)
     buf = io.BytesIO()
     prs.save(buf)
     data = buf.getvalue()

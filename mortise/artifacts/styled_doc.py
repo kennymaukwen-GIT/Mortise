@@ -136,6 +136,17 @@ class StyledPage(Model):
     tables: list[StyledTable] = []
 
 
+class StyledMaster(Model):
+    """母片：每一頁相同位置都出現的元素（標誌、頁尾文字），放到母片上只要改一次。"""
+
+    id: str
+    text_boxes: list[StyledTextBox] = []
+    images: list[StyledImage] = []
+    shapes: list[StyledShape] = []
+    member_ids: list[str] = []  # 各頁中被母片取代的元素編號（輸出時這些不再逐頁畫）
+    page_indexes: list[int] = []
+
+
 class Style(Model):
     """樣式表的一個樣式：一群段落共用的設定。"""
 
@@ -158,3 +169,4 @@ class StyledDoc(Model):
     styles: list[Style] = []
     theme_colors: list[Color] = []
     notes: list[str] = []
+    masters: list[StyledMaster] = []

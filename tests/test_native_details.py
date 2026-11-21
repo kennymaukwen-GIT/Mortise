@@ -87,3 +87,26 @@ def test_all_fixtures_verify_cleanly(doc_a4, poster, slide_dark):
         assert report.overall_score > 0.97
         for page in report.pages:
             assert all(e.text_match for e in page.elements if e.kind in ("text_box", "table"))
+
+
+@pytest.fixture(scope="module")
+def deck(tmp_path_factory):
+    return _run(tmp_path_factory, "deck")
+
+
+def test_repeated_elements_go_to_master(deck):
+    from pptx import Presentation
+
+    pipe, report = deck
+    styled = pipe.store.load("s5/styled_doc", StyledDoc)
+    assert styled.masters and len(styled.masters[0].member_ids) >= 9  # 標誌、色帶、頁尾文字 × 3 頁
+    out = pipe.store.load("s6/pptx", OutputFile)
+    prs = Presentation(str(pipe.store.blob_path(out.file)))
+    layout_names = [sh.name for sh in prs.slide_layouts[6].shapes]
+    assert any(n.endswith(tuple("0123456789abcdef")) and "-box-" in n for n in layout_names)  # 頁尾文字在母片上
+    for slide in prs.slides:
+        texts = ["".join(r.text for p in sh.text_frame.paragraphs for r in p.runs) for sh in slide.shapes if sh.has_text_frame]
+        assert not any("Internal" in t for t in texts)  # 頁尾不再逐頁重複
+        assert len(texts) == 3  # 標題、內文、頁碼（頁碼每頁不同，留在頁面上）
+    if libreoffice.available():
+        assert report.overall_score > 0.97
