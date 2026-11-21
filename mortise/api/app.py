@@ -7,6 +7,7 @@
     MORTISE_WORKERS   同時處理幾份檔案（預設 2）
     MORTISE_CORS      允許的前端來源，逗號分隔（預設不開放跨來源）
     MORTISE_RETENTION_DAYS  檔案保留天數（預設 30）
+    MORTISE_FEEDBACK  回饋資料庫的目錄（預設 工作目錄/_feedback）：只收上傳時同意用於改善辨識的檔案
 
 端點一覽（詳細說明見各函數）：
     GET  /api/health                         服務狀態
@@ -54,6 +55,7 @@ JOBS = JobManager(
     workers=int(os.environ.get("MORTISE_WORKERS", "2")),
     retention_days=float(os.environ.get("MORTISE_RETENTION_DAYS", "30")),
     cfg=CFG,
+    feedback_root=Path(os.environ.get("MORTISE_FEEDBACK", str(Path(os.environ.get("MORTISE_JOBS", "jobs")) / "_feedback"))),
 )
 
 @asynccontextmanager

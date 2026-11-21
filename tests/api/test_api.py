@@ -89,3 +89,28 @@ def test_feedback_and_delete(client, job):
     assert r.status_code == 201
     assert client.delete(f"/api/jobs/{job}").status_code == 204
     assert client.get(f"/api/jobs/{job}").status_code == 404
+
+
+def test_consented_feedback_flows_into_dataset(client):
+    import json
+    import os
+
+    with FIX.open("rb") as f:
+        r = client.post("/api/jobs", files={"file": ("slide_basic.pdf", f, "application/pdf")}, data={"outputs": "pptx", "allow_training": "true"})
+    job_id = r.json()["job_id"]
+    assert _wait(client, job_id)["status"] == "done"
+    el = client.get(f"/api/jobs/{job_id}/pages/1/elements").json()
+    box = el["text_boxes"][0]
+    client.post(f"/api/jobs/{job_id}/corrections", json=[{"field": "font_family", "value": "Carlito", "element_id": box["id"], "page": 1}])
+    _wait(client, job_id)
+    client.post(f"/api/jobs/{job_id}/feedback", json={"rating": 5, "comment": "很好", "page": 1})
+    root = os.environ["MORTISE_JOBS"] + "/_feedback/samples"
+    names = os.listdir(root)
+    assert any(n.endswith("slide_basic.pdf") for n in names)
+    fb = json.loads(open(os.path.join(root, next(n for n in names if n.endswith(".feedback.json"))), encoding="utf-8").read())
+    assert fb["schema"] == "mortise.feedback/1" and fb["corrections"][0]["field"] == "font_family"
+    assert fb["page_ratings"][0]["score"] == 5
+    from mortise.eval.feedback import load_feedback
+
+    parsed = load_feedback(os.path.join(root, next(n for n in names if n.endswith(".feedback.json"))))
+    assert parsed.corrections and parsed.corrections[0].new_value == "Carlito"

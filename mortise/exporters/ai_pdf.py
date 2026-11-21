@@ -75,19 +75,27 @@ from ..tools.fonts import is_cjk
 
 DEFAULT_PARAMS: dict[str, Any] = {
     "font_line_height": 1.2,  # 倍數行距的基準：一行高 = 字級 × 此值 × 倍數；沒有行距設定時取倍數 1
-    "ascent_metric": "hhea",  # 首行基線距文字框上緣的量度："hhea"（hhea 表 ascender）、"typo"（OS/2 sTypoAscender）、"win"（OS/2 usWinAscent）
+    # 首行基線距文字框上緣的量度。⑤的文字框上緣 = 原檔首行基線 − 原檔字型的上緣，而各家軟體寫的上緣不同
+    # （LibreOffice 用 hhea、ReportLab 用 OS/2 typo）。"auto"：用文字框高度反推最吻合的量度；
+    # 也可固定為 "hhea"（hhea 表 ascender）、"typo"（OS/2 sTypoAscender）、"win"（OS/2 usWinAscent）。
+    "ascent_metric": "auto",
+    "descriptor_metric": "hhea",  # 寫進 FontDescriptor /Ascent /Descent 的量度（ascent_metric 為 auto 時用）
+    "wrap_slack_from_settings": True,  # 斷行寬度扣掉⑤為了目標軟體多留的寬度（settings.box_width_slack_pt）；自家渲染的字寬是準的
+    "wrap_epsilon_pt": 0.05,  # 斷行寬度的容許誤差（pt），避免最長的一行因浮點誤差被折行
     "wrap_widen": [1.0, 1.01, 1.02, 1.04],  # 斷行寬度試算倍率：斷行數與原圖行數不符時依序放寬，取第一個相符的
     "basefont_name": "embedded",  # "embedded"：BaseFont 寫內嵌字型自己的名稱；"inferred"：改寫成推論的字型名稱（字形仍是替代字型）
     "cjk_fallback": "WenQuanYi Zen Hei",  # 中日韓文字的後備字型
     "latin_fallback": "DejaVu Sans",  # 其他文字的後備字型
     "layers": True,  # 是否寫入 OCG 圖層
     "layer_names": {"background": "背景", "image": "圖片", "shape": "形狀", "text": "文字"},
+    "justify_word_space": True,  # 左右對齊的行有空白時撐開空白（Tw）；否則整行一致的字距（Tc）
     "faux_bold_stroke_ratio": 0.03,  # 沒有粗體字型檔時以描邊模擬：描邊寬 = 字級 × 此值
     "compress": True,  # 內容串流是否壓縮
 }
 
 MIME = "application/pdf"
 _LAYER_ORDER = ("background", "image", "shape", "text")
+_METRICS = ("hhea", "typo", "win")
 _NO_START = set("，。、；：？！）」』】〕》〉…‥・ー,.;:?!)]}%")  # 不可放在行首的標點（簡化的禁則）
 _NO_END = set("（「『【〔《〈([{")  # 不可放在行尾的標點
 _BREAKS = "\n \v"
@@ -113,6 +121,7 @@ class _Face:
     descent: float  # 每 1 pt 字級的下緣（pt，負值）
     bold: bool  # 字型檔本身是否為粗體
     italic: bool
+    metrics: dict = field(default_factory=dict)  # 量度名稱 →（上緣, 下緣），每 1 pt 字級
     widths: dict = field(default_factory=dict)
 
     def width(self, ch: str) -> float:
@@ -199,12 +208,10 @@ def _load_face(m: _Match, metric: str, rename: Optional[str]) -> tuple[Optional[
         else:
             upm = ft["head"].unitsPerEm
             hhea, os2 = ft["hhea"], ft.get("OS/2")
-            if metric == "typo" and os2 is not None:
-                asc, desc = os2.sTypoAscender, os2.sTypoDescender
-            elif metric == "win" and os2 is not None:
-                asc, desc = os2.usWinAscent, -os2.usWinDescent
-            else:
-                asc, desc = hhea.ascent, hhea.descent
+            metrics = {"hhea": (hhea.ascent / upm, hhea.descent / upm)}
+            metrics["typo"] = (os2.sTypoAscender / upm, os2.sTypoDescender / upm) if os2 is not None else metrics["hhea"]
+            metrics["win"] = (os2.usWinAscent / upm, -os2.usWinDescent / upm) if os2 is not None else metrics["hhea"]
+            asc, desc = (v * upm for v in metrics.get(metric, metrics["hhea"]))
             family = ft["name"].getDebugName(16) or ft["name"].getDebugName(1) or Path(m.path).stem
             cmap = frozenset(ft.getBestCmap() or {})
             single = _single_font_file(m.path, m.index)
@@ -217,7 +224,7 @@ def _load_face(m: _Match, metric: str, rename: Optional[str]) -> tuple[Optional[
                 tt.face.name = rename.encode("latin-1", "ignore") if isinstance(tt.face.name, bytes) else rename
                 tt.face.familyName = tt.face.name
             pdfmetrics.registerFont(tt)
-            result = (_Face(key=key, family=rename_family(rename) or family, path=m.path, cmap=cmap, ascent=tt.face.ascent / 1000.0, descent=tt.face.descent / 1000.0, bold=m.weight >= 180, italic=m.slant > 0), "")
+            result = (_Face(key=key, family=rename_family(rename) or family, path=m.path, cmap=cmap, ascent=tt.face.ascent / 1000.0, descent=tt.face.descent / 1000.0, bold=m.weight >= 180, italic=m.slant > 0, metrics=metrics), "")
     except TTFError as e:
         result = (None, "cff" if "postscript" in str(e).lower() else f"ttf: {e}")
     except Exception as e:  # 壞檔、讀不到
@@ -245,7 +252,7 @@ class _Fonts:
     def __init__(self, params: dict, degradations: list[Degradation]):
         self.p = params
         self.deg = degradations
-        self.metric = params["ascent_metric"]
+        self.metric = params["descriptor_metric"] if params["ascent_metric"] == "auto" else params["ascent_metric"]
         self.used: dict[str, _Face] = {}  # 寫入檔案的字族 → 字型
         self.inferred: dict[str, str] = {}  # 推論字型 → 實際寫入的字族
         self._primary: dict[tuple, tuple[_Face, bool, bool]] = {}
@@ -349,9 +356,13 @@ class _Line:
     size: float
     ascent: float
     descent: float
+    asc_by: dict = field(default_factory=dict)  # 量度 → 這行的上緣（pt）
+    desc_by: dict = field(default_factory=dict)  # 量度 → 這行的下緣（pt，負值）
     x: float = 0.0  # 相對於文字區左上（pt，y 向下）
     baseline: float = 0.0
-    char_space: float = 0.0
+    char_space: float = 0.0  # 左右對齊：整行一致的字距（Tc），用於沒有空白的行（中日韓文字）
+    word_space: float = 0.0  # 左右對齊：整行一致的詞距（Tw），用於有空白的行（拉丁文字）
+    nspaces: int = 0  # 行內（不含行尾）的空白數
     paragraph: str = ""
 
 
@@ -392,10 +403,12 @@ def _break_lines(chars: list[tuple[str, float]], first_avail: float, avail: floa
 class _Layout:
     """把段落排成行，算出每行的起點與基線（相對於文字區左上，y 向下）。"""
 
-    def __init__(self, fonts: _Fonts, params: dict, degradations: list[Degradation]):
+    def __init__(self, fonts: _Fonts, params: dict, degradations: list[Degradation], slack: float = 0.0):
         self.fonts = fonts
         self.p = params
         self.deg = degradations
+        self.slack = slack  # 文字框寬度中⑤多留的餘裕（pt）
+        self.votes = {m: 0 for m in _METRICS}  # auto 模式下各量度被文字框選中的次數
 
     def _chars(self, sp: StyledParagraph, element_id: str) -> list[tuple[str, float, _Face, StyledRun, float, bool]]:
         out = []
@@ -415,15 +428,17 @@ class _Layout:
         ls = sp.line_spacing.value
         return float(ls.value) if ls.mode == LineSpacingMode.EXACT else base * float(ls.value)
 
-    def paragraph_lines(self, sp: StyledParagraph, width: float, wrap: bool, element_id: str) -> list[_Line]:
+    def paragraph_lines(self, sp: StyledParagraph, width: float, wrap: bool, element_id: str, slack: float = 0.0) -> list[_Line]:
+        """width 是對齊用的寬度；斷行用 width − slack（再加一點浮點容許誤差）。"""
         chars = self._chars(sp, element_id)
         widths = [(c[0], c[1]) for c in chars]
         indent = sp.first_line_indent_pt
-        spans = _break_lines(widths, width - indent, width, wrap)
+        bw = max(1.0, width - slack) + self.p["wrap_epsilon_pt"]
+        spans = _break_lines(widths, bw - indent, bw, wrap)
         want = sp.source_line_count
         if wrap and want > 0 and not sp.text_locked and len(spans) != want:
             for k in self.p["wrap_widen"]:
-                trial = _break_lines(widths, width * k - indent, width * k, wrap)
+                trial = _break_lines(widths, bw * k - indent, bw * k, wrap)
                 if len(trial) == want:
                     spans = trial
                     break
@@ -443,14 +458,16 @@ class _Layout:
                     segs.append(_Seg(text=ch, face=face, run=run, size=size, faux_bold=faux))
             if segs:
                 size = max(s.size for s in segs)
-                asc = max(s.face.ascent * s.size for s in segs)
-                desc = min(s.face.descent * s.size for s in segs)
+                pairs = [(s.face, s.size) for s in segs]
             else:  # 空行：沿用段落字級
                 size = last_size
                 face = self.fonts.primary(sp.runs[0].font, False, False, element_id)[0] if sp.runs else None
-                asc = (face.ascent if face else 0.9) * size
-                desc = (face.descent if face else -0.2) * size
-            lines.append(_Line(segs=segs, width=sum(c[1] for c in seg_chars), nchars=len(seg_chars), size=size, ascent=asc, descent=desc, paragraph=sp.id))
+                pairs = [(face, size)] if face else []
+            asc_by = {m: max((f.metrics[m][0] * z for f, z in pairs), default=0.9 * size) for m in _METRICS}
+            desc_by = {m: min((f.metrics[m][1] * z for f, z in pairs), default=-0.2 * size) for m in _METRICS}
+            asc, desc = asc_by["hhea"], desc_by["hhea"]
+            nsp = sum(1 for c in seg_chars if c[0] == " ")
+            lines.append(_Line(segs=segs, width=sum(c[1] for c in seg_chars), nchars=len(seg_chars), size=size, ascent=asc, descent=desc, asc_by=asc_by, desc_by=desc_by, nspaces=nsp, paragraph=sp.id))
         # 水平位置
         for i, ln in enumerate(lines):
             ind = indent if i == 0 else 0.0
@@ -461,17 +478,35 @@ class _Layout:
                 ln.x = ind + avail - ln.width
             else:
                 ln.x = ind
-                if sp.align == Align.JUSTIFY and i < len(lines) - 1 and ln.nchars > 1 and ln.width < avail:
-                    ln.char_space = (avail - ln.width) / (ln.nchars - 1)
+                javail = avail - slack
+                if sp.align == Align.JUSTIFY and i < len(lines) - 1 and ln.nchars > 1 and ln.width < javail:
+                    if ln.nspaces and self.p["justify_word_space"]:
+                        ln.word_space = (javail - ln.width) / ln.nspaces  # 只撐開空白（同文書軟體對拉丁文字的做法）
+                    else:
+                        ln.char_space = (javail - ln.width) / (ln.nchars - 1)
         return lines
 
-    def block(self, paragraphs: list[StyledParagraph], width: float, wrap: bool, element_id: str) -> list[_Line]:
-        """一個文字區（文字框或儲存格）中所有段落的行，含基線位置。"""
+    def _fit(self, lines: list[_Line], height: Optional[float]) -> str:
+        """選首行上緣的量度：固定值直接用；auto 時找預測高度（首行上緣到末行下緣）最接近框高的量度。"""
+        want = self.p["ascent_metric"]
+        if want != "auto":
+            return want if want in _METRICS else "hhea"
+        if height is None or not lines:
+            return max(self.votes, key=lambda m: (self.votes[m], m == "hhea")) if any(self.votes.values()) else "hhea"
+        first, last = lines[0], lines[-1]
+        span = last.baseline - first.baseline
+        best = min(_METRICS, key=lambda m: (round(abs(first.asc_by[m] + span - last.desc_by[m] - height), 2), m != "hhea"))
+        self.votes[best] += 1
+        return best
+
+    def block(self, paragraphs: list[StyledParagraph], width: float, wrap: bool, element_id: str, slack: float = 0.0, height: Optional[float] = None) -> list[_Line]:
+        """一個文字區（文字框或儲存格）中所有段落的行，含基線位置。
+        height 是文字框的高度（用來選首行上緣的量度）；儲存格傳 None，沿用多數文字框的選擇。"""
         out: list[_Line] = []
         prev_sp: Optional[StyledParagraph] = None
         y: Optional[float] = None
         for sp in paragraphs:
-            lines = self.paragraph_lines(sp, width, wrap, element_id)
+            lines = self.paragraph_lines(sp, width, wrap, element_id, slack)
             for k, ln in enumerate(lines):
                 if y is None:
                     y = sp.space_before_pt + ln.ascent
@@ -482,6 +517,13 @@ class _Layout:
                 ln.baseline = y
                 out.append(ln)
             prev_sp = sp
+        metric = self._fit(out, height)
+        if out and metric != "hhea":
+            shift = out[0].asc_by[metric] - out[0].asc_by["hhea"]
+            for ln in out:
+                ln.baseline += shift
+        for ln in out:
+            ln.ascent, ln.descent = ln.asc_by[metric], ln.desc_by[metric]
         return out
 
 
@@ -559,9 +601,12 @@ class _Painter:
             if not ln.segs:
                 continue
             t = self.c.beginText()
+            t._code[:] = [op for op in t._code if not op.rstrip().endswith("Tm")]  # beginText 會先寫一個原點 Tm；去掉，讓每個文字物件只有一個 Tm（保留 BT）
             t.setTextTransform(*frame.upright(ox + ln.x, oy + ln.baseline))
             if ln.char_space:
                 t.setCharSpace(ln.char_space)
+            if ln.word_space:
+                t.setWordSpace(ln.word_space)
             mode = 0
             for sg in ln.segs:
                 t.setFont(sg.face.key, sg.size)
@@ -580,11 +625,13 @@ class _Painter:
                 t.setTextRenderMode(0)
             if ln.char_space:
                 t.setCharSpace(0)
+            if ln.word_space:
+                t.setWordSpace(0)
             self.c.drawText(t)
 
     def text_box(self, tb: StyledTextBox) -> None:
         frame = _Frame(tb.box, self.H)
-        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id)
+        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h)
         if len(lines) > 1:
             self.deg.append(Degradation(element_id=tb.id, concept="段落與文字框", action=f"PDF 沒有段落與文字框，寫成 {sum(1 for ln in lines if ln.segs)} 個逐行的文字物件", lossy=True))
         if lines and lines[-1].baseline - lines[-1].descent > tb.box.h + 0.5 * lines[-1].size:
@@ -830,7 +877,8 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     params = params_from(cfg, DEFAULT_PARAMS, "ai_pdf")
     degradations: list[Degradation] = []
     fonts = _Fonts(params, degradations)
-    layout = _Layout(fonts, params, degradations)
+    slack = float(cfg.section("settings").get("box_width_slack_pt", 0.0)) if (cfg is not None and params["wrap_slack_from_settings"]) else 0.0
+    layout = _Layout(fonts, params, degradations, slack)
     # 先解析一個字型當 ReportLab 的初始字型，避免每頁的前置碼引用未內嵌的 Helvetica
     first_run = next((r for p in doc.pages for tb in p.text_boxes for sp in tb.paragraphs for r in sp.runs), None)
     init_face = fonts.primary(first_run.font, first_run.bold, first_run.italic, "doc")[0] if first_run else None

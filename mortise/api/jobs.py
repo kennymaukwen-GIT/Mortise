@@ -4,6 +4,7 @@
 - 執行：固定大小的執行緒池（PDFium 本身有全域鎖，同時跑多份不會互相破壞）。
 - 進度：流水線每個階段開始、完成、沿用快取時發出事件，存在記憶體中供前端輪詢或串流。
 - 保留期限：預設 30 天後自動刪除（隱私：使用者檔案不長期保存，見架構文件風險 R7）。
+- 回饋資料庫：上傳時同意用於改善辨識的工作，其檔案、修正與評分另存到回饋根目錄，供評測、校準與調參使用。
 """
 
 from __future__ import annotations
@@ -52,9 +53,10 @@ class Progress:
 
 
 class JobManager:
-    def __init__(self, root: Path, workers: int = 2, retention_days: float = 30.0, cfg: Optional[Config] = None):
+    def __init__(self, root: Path, workers: int = 2, retention_days: float = 30.0, cfg: Optional[Config] = None, feedback_root: Optional[Path] = None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.feedback_root = Path(feedback_root) if feedback_root else None
         self.retention_s = retention_days * 86400
         self.cfg = cfg
         self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mortise-job")
@@ -116,6 +118,7 @@ class JobManager:
 
     def add_corrections(self, job_id: str, corrections: list[Correction]) -> None:
         pipe = self.pipeline(job_id)
+        self.record_corrections(job_id, corrections)  # 先記下系統當時的值，再重跑
         pipe.add_corrections(corrections)
         self.submit(job_id)
 
@@ -163,14 +166,74 @@ class JobManager:
 
     # ---------- 回饋 ----------
     def save_feedback(self, job_id: str, feedback: dict[str, Any]) -> Path:
-        """存一份回饋（評分、意見、修正）。只有使用者同意時，才會被收進訓練與評測資料。"""
+        """存一份回饋（評分、意見、某個元素對或錯）。
+        一律存在工作目錄（隨工作在保留期限後刪除）；使用者同意用於改善辨識時，另外收進回饋資料庫（見 _to_dataset）。"""
         pipe = self.pipeline(job_id)
         folder = pipe.dir / "feedback"
         folder.mkdir(exist_ok=True)
         path = folder / f"{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}.json"
         record = {"job_id": job_id, "filename": pipe.state.get("filename"), "allow_training": pipe.state.get("allow_training", False), "received_at": time.time(), **feedback}
         path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+        entry: dict[str, Any] = {"comments": [feedback["comment"]] if feedback.get("comment") else []}
+        if feedback.get("tags"):
+            entry["comments"].append("標籤：" + "、".join(feedback["tags"]))
+        if feedback.get("rating") is not None:
+            entry["page_ratings"] = [{"page_index": (feedback.get("page") or 1) - 1, "score": feedback["rating"], "max_score": 5, "comment": feedback.get("comment") or ""}]
+        if feedback.get("element_id") and feedback.get("correct") is not None:
+            item = {"page_index": (feedback.get("page") or 1) - 1, "element_id": feedback["element_id"], "field": "element", "target_stage": 4}
+            if feedback["correct"]:
+                entry["confirmations"] = [item]
+            else:
+                entry["comments"].append(f"使用者標示元素 {feedback['element_id']} 有錯")
+        self._to_dataset(job_id, entry)
         return path
+
+    def record_corrections(self, job_id: str, corrections: list[Correction]) -> None:
+        """使用者的修正也是回饋：連同系統當時的值與信心值一起收進回饋資料庫（需同意）。"""
+        pipe = self.pipeline(job_id)
+        items = []
+        try:
+            from ..eval.feedback import resolve_value
+            from ..eval.runner import load_artifacts
+
+            arts = load_artifacts(pipe)
+        except Exception:
+            arts, resolve_value = None, None
+        for c in corrections:
+            item = c.model_dump(mode="json")
+            if arts is not None:
+                try:
+                    snap = resolve_value(arts, c.target_stage, c.field, c.element_id, c.page_index)
+                    if snap.get("resolved"):
+                        item["system_value"] = snap.get("system_value")
+                        item["system_confidence"] = snap.get("system_confidence")
+                except Exception:
+                    pass
+            items.append(item)
+        self._to_dataset(job_id, {"corrections": items})
+
+    def _to_dataset(self, job_id: str, entry: dict[str, Any]) -> Optional[Path]:
+        """回饋資料庫：<回饋根目錄>/samples/ 下放樣本檔與同名的 .feedback.json（mortise.feedback/1 格式），
+        可以直接拿來跑 python -m mortise.eval run、annotations、calibrate、tune。只收使用者同意的工作。"""
+        pipe = self.pipeline(job_id)
+        if not pipe.state.get("allow_training") or self.feedback_root is None:
+            return None
+        samples = self.feedback_root / "samples"
+        samples.mkdir(parents=True, exist_ok=True)
+        name = f"{job_id}__{pipe.state.get('filename', 'upload')}"
+        sample = samples / name
+        if not sample.exists():
+            shutil.copyfile(pipe.dir / pipe.state["source"], sample)
+        fb_path = samples / (Path(name).stem + ".feedback.json")
+        data: dict[str, Any] = {"schema": "mortise.feedback/1", "sample": name, "author": "user", "comments": [], "page_ratings": [], "corrections": [], "confirmations": []}
+        if fb_path.exists():
+            data.update(json.loads(fb_path.read_text(encoding="utf-8")))
+        for key in ("comments", "page_ratings", "corrections", "confirmations"):
+            data.setdefault(key, [])
+            data[key] += entry.get(key, [])
+        data["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        fb_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        return fb_path
 
     # ---------- 刪除與保留期限 ----------
     def delete(self, job_id: str) -> None:
@@ -182,6 +245,8 @@ class JobManager:
         now = now or time.time()
         removed = []
         for d in self.root.iterdir():
+            if self.feedback_root is not None and d.resolve() == self.feedback_root.resolve():
+                continue  # 回饋資料庫是使用者同意保存的資料，不跟著工作過期
             state = d / "job.json"
             if not state.exists() or d.name in self.running:
                 continue
