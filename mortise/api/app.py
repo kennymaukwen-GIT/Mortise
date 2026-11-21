@@ -79,7 +79,7 @@ FORMAT_LABELS = {
 }
 
 # 修正欄位 → 送給哪個階段
-FIELD_STAGE = {"size": 2, "role": 4, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
+FIELD_STAGE = {"size": 2, "corners": 2, "role": 4, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
 
 
 def _job(job_id: str):
@@ -332,8 +332,8 @@ def page_elements(job_id: str, n: int) -> dict[str, Any]:
 
 
 class CorrectionIn(BaseModel):
-    field: Literal["size", "text", "role", "align", "font_family", "font_size_pt", "color"]
-    value: Any = Field(..., description="size 為 {width, height, unit}；color 為 #RRGGBB；其他為字串或數字")
+    field: Literal["size", "corners", "text", "role", "align", "font_family", "font_size_pt", "color"]
+    value: Any = Field(..., description="size 為 {width, height, unit}；corners 為原圖像素座標的四個點 [[x,y]×4]（左上、右上、右下、左下）；color 為 #RRGGBB；其他為字串或數字")
     element_id: Optional[str] = Field(None, description="文字框、段落或文字行的編號；size 不需要")
     page: Optional[int] = Field(None, description="頁碼（從 1 起算）；size 可省略表示整份文件")
 

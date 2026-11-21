@@ -1,0 +1,337 @@
+"""③ 辨識的影像產線（掃描、截圖、照片）：把 mortise/recognition 的各模組串起來，交出元素清單。
+
+順序是「剝洋蔥」：先處理最可靠的文字，再處理剩下的區域，最後補回底圖。
+  s3.ocr          文字偵測與文字辨識（PP-OCRv6，保留每個字的候選字與機率）
+  s3.text_attr    文字屬性：筆畫遮罩、顏色、字級與字型一起解（檢索加重繪比對）、粗斜體、基線
+  s3.regions      扣掉文字後的區域：照片、插畫、形狀（擬合成基本幾何）、表格格線；遮罩可以重疊
+  s3.crop         裁出照片與插畫（被文字蓋住的部分先修補再裁）
+  s3.background   擦掉所有元素後補回底圖；純色與漸層用擬合，紋理用修補（修補屬於生成，會記錄位置）
+這裡只負責轉換座標與產物格式；量測與感知的細節在各模組。所有數值都是原始量測值，不吸附、不定案。
+"""
+
+from __future__ import annotations
+
+import io
+import threading
+from typing import Optional
+
+import numpy as np
+from PIL import Image
+
+from ..artifacts import (
+    Background, Color, ElementList, FontCandidate, ImageElement, ImageKind, PageSpec, Point, ProductionLine, Provenance, Quad,
+    ShapeElement, ShapeGeometry, TableRegion, TextLine, TextRun, make_element_id, measured,
+)
+from ..config import Config
+from ..pipeline.store import Store
+
+NAME = "s3"
+STEP = "s3.image@1"
+
+_ENGINE = None
+_FONTS = None
+_LOCK = threading.Lock()
+
+
+def _engine(params: Optional[dict]):
+    global _ENGINE
+    with _LOCK:
+        if _ENGINE is None:
+            from ..recognition.ocr import OcrEngine
+
+            _ENGINE = OcrEngine(params)
+        return _ENGINE
+
+
+def _fonts():
+    global _FONTS
+    with _LOCK:
+        if _FONTS is None:
+            from ..recognition.fontlib import FontLibrary
+
+            _FONTS = FontLibrary.default()
+        return _FONTS
+
+
+def _png(arr: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(arr)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _quad(pts, W: float) -> Quad:
+    p = [Point(x=float(x) / W, y=float(y) / W) for x, y in np.asarray(pts, dtype=np.float64)[:4]]
+    return Quad(tl=p[0], tr=p[1], br=p[2], bl=p[3])
+
+
+def _rgb(c) -> Color:
+    return Color(r=int(c[0]), g=int(c[1]), b=int(c[2]))
+
+
+def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
+    import cv2
+
+    from ..recognition import background as bgmod
+    from ..recognition import regions as regmod
+    from ..recognition import text_attributes as ta
+
+    c = cfg.section("recognize")
+    work = np.asarray(Image.open(store.blob_path(spec.working_image)).convert("RGB"))
+    color = np.asarray(Image.open(store.blob_path(spec.color_image or spec.working_image)).convert("RGB"))
+    if color.shape != work.shape:
+        color = work
+    H, W = work.shape[:2]
+    notes: list[str] = []
+    page = spec.page_index
+
+    # ---------- s3.ocr ----------
+    ocr_lines = _engine(c.get("ocr_params")).read(work)
+    ai_chars: dict[int, list[int]] = {}
+    if ai is not None and ai.feature("ocr_arbitration"):
+        ai_chars = _arbitrate(ai, Image.fromarray(work), ocr_lines, spec, c)
+        if ai_chars:
+            notes.append(f"有 {sum(len(v) for v in ai_chars.values())} 個不確定的字由大型 AI 在候選字中挑選。")
+    fonts = _fonts()
+
+    # ---------- s3.text_attr ----------
+    texts: list[TextLine] = []
+    text_mask = np.zeros((H, W), dtype=bool)
+    dilate = int(c.get("text_mask_dilate_px", 2))
+    low_text = 0
+    for i, ol in enumerate(ocr_lines):
+        if not ol.text.strip():
+            continue
+        attrs = None
+        try:
+            attrs = ta.measure_line(color, ol, fonts)
+        except Exception as e:  # 單行量測失敗不中斷整頁
+            notes.append(f"有一行文字的屬性量不出來（{type(e).__name__}），改用粗估值。")
+        line = _text_line(page, i, ol, attrs, W)
+        if i in ai_chars:
+            line = line.model_copy(update={"ai_chars": ai_chars[i]})
+        texts.append(line)
+        if (ol.score or 0) < c.get("ocr_low_score", 0.8):
+            low_text += 1
+        # 筆畫遮罩貼回整張圖（擦字、找區域都要用）
+        if attrs is not None and attrs.mask is not None and attrs.mask.size:
+            warped = cv2.warpPerspective(attrs.mask.astype(np.uint8) * 255, np.asarray(attrs.mask_to_image, dtype=np.float64), (W, H), flags=cv2.INTER_NEAREST)
+            text_mask |= warped > 127
+        else:
+            poly = np.round(np.asarray(ol.quad, dtype=np.float64)).astype(np.int32)
+            m = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillPoly(m, [poly], 255)
+            text_mask |= m > 0
+    if dilate > 0 and text_mask.any():
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
+        text_mask = cv2.dilate(text_mask.astype(np.uint8), k) > 0
+    if low_text:
+        notes.append(f"有 {low_text} 行文字的辨識信心值偏低，請確認內容。")
+
+    # ---------- s3.regions ----------
+    regions = regmod.find_regions(work, text_mask, text_quads=[np.asarray(ol.quad) for ol in ocr_lines])
+    region_mask = np.zeros((H, W), dtype=bool)
+    for rg in regions:
+        x0, y0, x1, y1 = rg.bbox
+        region_mask[y0:y1, x0:x1] |= rg.mask.astype(bool)
+
+    # ---------- s3.crop：被文字蓋住的照片先擦字再裁 ----------
+    photos = [rg for rg in regions if rg.kind in ("photo", "illustration")]
+    text_free = None
+    if photos and any(text_mask[rg.bbox[1]:rg.bbox[3], rg.bbox[0]:rg.bbox[2]].any() for rg in photos):
+        text_free = bgmod.reconstruct_background(color, text_mask).image
+
+    images: list[ImageElement] = []
+    shapes: list[ShapeElement] = []
+    tables: list[TableRegion] = []
+    for rg in regions:
+        x0, y0, x1, y1 = rg.bbox
+        q = Quad.from_rect(x0 / W, y0 / W, x1 / W, y1 / W)
+        if rg.kind in ("photo", "illustration"):
+            rgba = regmod.crop_region(color, rg, inpainted=text_free)
+            blob = store.put_blob(_png(rgba), "image/png", "png")
+            kind = ImageKind.PHOTO if rg.kind == "photo" else ImageKind.ILLUSTRATION
+            images.append(ImageElement(
+                id=make_element_id(page, "img", q, blob.sha256[:12]), quad=q, z=10 + rg.z, image=blob,
+                pixel_size=(rgba.shape[1], rgba.shape[0]), kind=measured(kind, rg.confidence, Provenance.MEASURED, STEP),
+            ))
+        elif rg.kind == "shape" and rg.shape is not None:
+            shapes.append(_shape(page, rg, W))
+        elif rg.kind == "table" and rg.table is not None:
+            tables.append(_table(page, rg, W))
+
+    # ---------- s3.background ----------
+    remove = text_mask | region_mask
+    bg = bgmod.reconstruct_background(color, remove)
+    gen = [Quad.from_rect(a / W, b / W, cc / W, d / W) for a, b, cc, d in bg.generated_boxes]
+    flat = _rgb(bg.flat_color) if bg.flat_color is not None else _rgb(np.median(bg.image.reshape(-1, 3), axis=0))
+    if bg.is_blank:
+        background = Background(color=flat, method=bg.model)
+    else:
+        background = Background(image=store.put_blob(_png(bg.image), "image/png", "png"), color=flat, generated_regions=gen, method=bg.model)
+    if gen:
+        notes.append(f"底圖有 {len(gen)} 個區域是修補（生成）出來的，原本被文字或圖片蓋住。")
+    notes += list(bg.notes)
+
+    if not texts and not images and not shapes:
+        notes.append("這一頁沒有找到文字或可分離的元素，整頁以底圖輸出。")
+    return ElementList(page_index=page, production_line=ProductionLine.IMAGE, texts=texts, images=images, shapes=shapes, table_regions=tables, background=background, notes=notes)
+
+
+def _text_line(page: int, i: int, ol, attrs, W: float) -> TextLine:
+    text = ol.text
+    if attrs is None:
+        q = _quad(ol.quad, W)
+        size = q.height * 0.8
+        run = TextRun(
+            text=text, quad=q, font_size=measured(size, 0.2, Provenance.MEASURED, STEP, error=size * 0.25),
+            font_candidates=[], bold=measured(False, 0.3, Provenance.MEASURED, STEP), italic=measured(False, 0.3, Provenance.MEASURED, STEP),
+            color=measured(Color(r=0, g=0, b=0), 0.2, Provenance.MEASURED, STEP),
+        )
+        return TextLine(
+            id=make_element_id(page, "t", q, text), quad=q, z=10000 + i, baseline=(q.bl, q.br), runs=[run],
+            text_confidence=ol.score, char_candidates=[[(cd.text, cd.prob) for cd in ch.candidates] for ch in ol.chars],
+            notes=["文字屬性量測失敗，字級與顏色為粗估值。"],
+        )
+    q = _quad(attrs.quad, W)
+    b0, b1 = np.asarray(attrs.baseline, dtype=np.float64)
+    # 非空白字的序號 → 在 text 中的位置，用來把每個字的起點分給各段
+    nonspace = [k for k, ch in enumerate(text) if ch.strip()]
+    xs = list(attrs.char_x)
+    runs: list[TextRun] = []
+    for r in attrs.runs:
+        seg = text[r.start:r.end]
+        if not seg:
+            continue
+        idx = [n for n, k in enumerate(nonspace) if r.start <= k < r.end]
+        char_x = [xs[n] / W for n in idx if n < len(xs)]
+        # 這一段的四角：沿基線取這段字的範圍
+        if idx and len(xs) > max(idx):
+            s0 = xs[idx[0]]
+            s1 = xs[idx[-1] + 1] if idx[-1] + 1 < len(xs) else None
+        else:
+            s0, s1 = None, None
+        rq = _sub_quad(attrs.quad, b0, b1, s0, s1, W) if s0 is not None else q
+        est = r.font_size_px
+        runs.append(TextRun(
+            text=seg, quad=rq,
+            font_size=measured(float(est.value) / W, float(est.confidence), Provenance.MEASURED, STEP, error=float(est.error) / W),
+            font_candidates=[FontCandidate(name=fm.family, raw_name=f"{fm.family} {fm.style}".strip(), score=float(fm.score)) for fm in r.fonts],
+            bold=measured(bool(r.bold[0]), float(r.bold[1]), Provenance.MEASURED, STEP),
+            italic=measured(bool(r.italic[0]), float(r.italic[1]), Provenance.MEASURED, STEP),
+            color=measured(_rgb(r.color), float(r.color_confidence), Provenance.MEASURED, STEP),
+            char_spacing=(float(r.char_spacing_px.value) / W) if r.char_spacing_px is not None else None,
+            char_x=char_x,
+        ))
+    if not runs:
+        return _text_line(page, i, ol, None, W)
+    return TextLine(
+        id=make_element_id(page, "t", q, text), quad=q, z=10000 + i,
+        baseline=(Point(x=float(b0[0]) / W, y=float(b0[1]) / W), Point(x=float(b1[0]) / W, y=float(b1[1]) / W)),
+        runs=runs, text_confidence=ol.score,
+        char_candidates=[[(cd.text, float(cd.prob)) for cd in ch.candidates] for ch in ol.chars],
+        notes=list(attrs.notes) + [n for r in attrs.runs for n in r.notes],
+    )
+
+
+def _sub_quad(quad, b0, b1, s0: float, s1: Optional[float], W: float) -> Quad:
+    """整行的四角中，沿基線從 s0 到 s1（像素，以基線起點為 0）的那一段。"""
+    pts = np.asarray(quad, dtype=np.float64)
+    u = b1 - b0
+    length = float(np.hypot(*u)) or 1.0
+    u = u / length
+    s1 = length if s1 is None else s1
+    tl, tr, br, bl = pts
+
+    def along(a, b, s):
+        return a + (b - a) * max(0.0, min(1.0, (s + float(np.dot(b0 - a, u))) / (float(np.dot(b - a, u)) or 1.0)))
+
+    p = [along(tl, tr, s0), along(tl, tr, s1), along(bl, br, s1), along(bl, br, s0)]
+    return _quad(p, W)
+
+
+_GEOM = {"rect": ShapeGeometry.RECT, "rounded_rect": ShapeGeometry.ROUNDED_RECT, "ellipse": ShapeGeometry.ELLIPSE, "line": ShapeGeometry.LINE, "polygon": ShapeGeometry.PATH}
+
+
+def _shape(page: int, rg, W: float) -> ShapeElement:
+    f = rg.shape
+    geom = _GEOM.get(f.geometry, ShapeGeometry.PATH)
+    pts = np.asarray(f.quad, dtype=np.float64)
+    if geom == ShapeGeometry.LINE:
+        a, b = pts[0], pts[1] if not np.allclose(pts[0], pts[1]) else pts[2]
+        q = Quad(tl=Point(x=a[0] / W, y=a[1] / W), tr=Point(x=b[0] / W, y=b[1] / W), br=Point(x=b[0] / W, y=b[1] / W), bl=Point(x=a[0] / W, y=a[1] / W))
+    else:
+        q = _quad(pts, W)
+    path: list[list[float]] = []
+    if geom == ShapeGeometry.PATH and f.polygon is not None and len(f.polygon) >= 3:
+        poly = np.asarray(f.polygon, dtype=np.float64) / W
+        path = [[0, float(poly[0][0]), float(poly[0][1])]] + [[1, float(x), float(y)] for x, y in poly[1:]] + [[3]]
+        xs, ys = poly[:, 0], poly[:, 1]
+        q = Quad.from_rect(float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+    elif geom == ShapeGeometry.PATH:
+        geom = ShapeGeometry.RECT
+    return ShapeElement(
+        id=make_element_id(page, "shp", q, f"{f.geometry}:{f.fill}:{f.stroke}"), quad=q, z=10 + rg.z, geometry=geom,
+        fill=_rgb(f.fill) if f.fill is not None else None, stroke=_rgb(f.stroke) if f.stroke is not None else None,
+        stroke_width=(f.stroke_width_px / W) if f.stroke_width_px else None,
+        corner_radius=(f.corner_radius_px / W) if f.corner_radius_px else None, path=path, fit_error=f.fit_error_px / W,
+    )
+
+
+def _table(page: int, rg, W: float) -> TableRegion:
+    g = rg.table
+    xs = sorted(float(x) / W for x in g.v_lines)
+    ys = sorted(float(y) / W for y in g.h_lines)
+    q = Quad.from_rect(xs[0], ys[0], xs[-1], ys[-1]) if xs and ys else Quad.from_rect(rg.bbox[0] / W, rg.bbox[1] / W, rg.bbox[2] / W, rg.bbox[3] / W)
+    segments = [(xs[0], y, xs[-1], y) for y in ys] + [(x, ys[0], x, ys[-1]) for x in xs] if g.has_ruling else []
+    return TableRegion(id=make_element_id(page, "tbl", q, f"{len(xs)}x{len(ys)}"), quad=q, h_lines=ys, v_lines=xs, ruled=g.has_ruling, segments=segments, confidence=rg.confidence, z=10 + rg.z)
+
+
+def _arbitrate(ai, page_image: Image.Image, ocr_lines, spec: PageSpec, c: dict) -> dict[int, list[int]]:
+    """信心值低、而且有其他候選的字：把這幾行的影像疊成一張圖，請 AI 在候選中挑。AI 不得改寫原文。
+    直接修改 ocr_lines 中的字，回傳（行序號 → 被 AI 挑過的字的位置）。"""
+    from ..ai.marks import stack_crops
+    from ..ai.tasks import choose_candidates_task
+
+    thr = float(c.get("ai_char_prob", 0.6))
+    margin = float(c.get("ai_char_margin", 0.25))
+    max_lines = int(c.get("ai_max_lines", 12))
+    picks = []
+    for i, ol in enumerate(ocr_lines):
+        slots = []
+        for idx, ch in enumerate(ol.chars):
+            cands = [cd for cd in ch.candidates if cd.text.strip()]
+            if len(cands) >= 2 and cands[0].prob < thr and cands[0].prob - cands[1].prob < margin:
+                slots.append({"index": idx, "candidates": [cd.text for cd in cands[:5]]})
+        if slots and len(ol.chars) == len(ol.text):
+            picks.append((min(ol.chars[sl["index"]].candidates[0].prob for sl in slots), i, slots))
+    if not picks:
+        return {}
+    picks.sort()
+    picks = picks[:max_lines]
+    W = page_image.size[0]
+    crops, lines, k = [], [], 1
+    for n, (_, i, slots) in enumerate(picks, start=1):
+        q = _quad(ocr_lines[i].quad, W)
+        l, t, r, b = q.bbox
+        pad = 0.004
+        crops.append((f"L{n}", page_image.crop((max(0, int((l - pad) * W)), max(0, int((t - pad) * W)), min(W, int((r + pad) * W) + 1), min(page_image.size[1], int((b + pad) * W) + 1)))))
+        for sl in slots:
+            sl["k"] = k
+            k += 1
+        lines.append({"label": f"L{n}", "text": ocr_lines[i].text, "slots": slots, "line": i})
+    ans = ai.ask(choose_candidates_task(stack_crops(crops), lines, spec.page_index))
+    if ans is None:
+        return {}
+    choice = {c_["k"]: int(c_["choice"]) for c_ in ans["choices"]}
+    out: dict[int, list[int]] = {}
+    for ln in lines:
+        ol = ocr_lines[ln["line"]]
+        text = list(ol.text)
+        for sl in ln["slots"]:
+            pick = sl["candidates"][choice[sl["k"]]]
+            if pick != text[sl["index"]]:
+                text[sl["index"]] = pick
+                ol.chars[sl["index"]].text = pick
+            out.setdefault(ln["line"], []).append(sl["index"])
+        ol.text = "".join(text)
+    return out

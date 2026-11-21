@@ -25,6 +25,10 @@ class PageSpec(Model):
     effective_resolution: float  # 工作影像中每 pt 有幾個像素
 
     notes: list[str] = []
+    color_image: Optional[BlobRef] = None  # 攤平後、未增強的影像（量顏色用）；沒有就用 working_image
+    size_candidates: list[dict] = []  # 尺寸候選（名稱、寬 pt、高 pt、信心值、依據），前兩名接近時請使用者選
+    quad_method: str = ""  # 頁面四角怎麼來的：pdf_box、edge_fit、contour、full_image、user
+    quad_confidence: float = 1.0
 
     @property
     def page_height_pt(self) -> float:

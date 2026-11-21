@@ -41,6 +41,10 @@ class TextLine(Model):
     runs: list[TextRun]
     direction: WritingDirection = WritingDirection.HORIZONTAL
     hidden: bool = False  # 不可見文字（多半是 OCR 文字層）
+    text_confidence: Optional[float] = None  # 文字內容的信心值（影像產線才有；擷取產線的文字是精確的）
+    char_candidates: list[list[tuple[str, float]]] = []  # 每個字的候選字與機率（含第一名），供大型 AI 或使用者在候選中挑選
+    ai_chars: list[int] = []  # 哪些字（在 text 中的位置）是大型 AI 在候選中挑的
+    notes: list[str] = []
 
     @property
     def text(self) -> str:

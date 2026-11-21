@@ -111,13 +111,19 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
     for tb in sp.text_boxes:
         src_runs = [r for pid in next(b for b in pl.text_boxes if b.id == tb.id).paragraph_ids for lid in pars[pid].line_ids for r in lines[lid].runs]
         runs = [r for p in tb.paragraphs for r in p.runs]
+        box_lines = [lines[lid] for pid in next(b for b in pl.text_boxes if b.id == tb.id).paragraph_ids for lid in pars[pid].line_ids]
+        text_status = FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED
+        if any(ln.ai_chars for ln in box_lines):
+            text_status = FieldStatus.AI
+        if any(p.text_locked for p in tb.paragraphs):
+            text_status = FieldStatus.USER
         fields = {
-            "text": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED,
+            "text": text_status,
             "position": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED,
             "font": _STATUS[min((r.font.family for r in runs), key=lambda m: m.confidence).source] if runs else FieldStatus.UNRECOVERABLE,
             "font_size": _STATUS[min((r.size_pt for r in runs), key=lambda m: m.confidence).source] if runs else FieldStatus.UNRECOVERABLE,
             "color": _STATUS[min((r.color for r in src_runs), key=lambda m: m.confidence).source] if src_runs else FieldStatus.UNRECOVERABLE,
-            "paragraphs": FieldStatus.MEASURED,  # 段落是④從行距與行寬推出來的，檔案裡沒有
+            "paragraphs": FieldStatus.AI if any(pars[p.id].role.source == Provenance.AI for p in tb.paragraphs if p.id in pars) else FieldStatus.MEASURED,  # 段落是④從行距與行寬推出來的，檔案裡沒有
             "line_spacing": FieldStatus.MEASURED,
         }
         substituted = any(r.font.is_substituted for r in runs)

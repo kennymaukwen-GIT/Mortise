@@ -7,8 +7,8 @@
     s3.pdf_shapes  讀向量路徑：認出矩形、圓角矩形、橢圓、直線；其他較簡單的保留成自訂路徑；太複雜的留在底圖
     s3.tables      由框線找表格區（區域與格線位置；列欄結構在④）
     s3.background  隱藏已擷取的物件後重繪，得到底圖（不是生成）
-  影像產線（掃描、截圖、照片）：
-    s3.image_stub  尚未實作文字與區域辨識：整頁當成一張圖片交出，並在備註中說明
+  影像產線（掃描、截圖、照片）：見 s3_image_line.py（文字辨識、文字屬性、區域、裁圖、底圖修補）。
+    失敗時退回 s3.image_stub：整頁當成一張圖片交出，並在備註中說明原因。
 """
 
 from __future__ import annotations
@@ -41,11 +41,19 @@ def _png(im: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def run(doc: SourceDoc, spec: PageSpec, cfg: Config, corrections: list[Correction], store: Store) -> ElementList:
+def run(doc: SourceDoc, spec: PageSpec, cfg: Config, corrections: list[Correction], store: Store, ai=None) -> ElementList:
     ref = doc.pages[spec.page_index]
     kind = ref.input_type.value
     if doc.media_type == "application/pdf" and kind in (InputType.NATIVE_PDF, InputType.MIXED_PDF):
         elements = _extract_line(doc, spec, cfg, store)
+    elif cfg.section("recognize").get("image_line", True):
+        try:
+            from . import s3_image_line
+
+            elements = s3_image_line.run(spec, cfg, store, ai=ai)
+        except Exception as e:  # 影像產線失敗：整頁以圖片輸出，並照實說明
+            elements = _image_line(spec)
+            elements = elements.model_copy(update={"notes": elements.notes + [f"影像辨識失敗（{type(e).__name__}: {e}），這一頁以整張圖片輸出。"]})
     else:
         elements = _image_line(spec)
     return _apply_corrections(elements, corrections)
@@ -63,7 +71,7 @@ def _image_line(spec: PageSpec) -> ElementList:
     )
     return ElementList(
         page_index=spec.page_index, production_line=ProductionLine.IMAGE, images=[image],
-        notes=["影像產線（文字偵測、文字辨識、區域分類、背景修補）尚未實作：這一頁整頁以圖片輸出，文字不可編輯。"],
+        notes=["這一頁整頁以圖片輸出，文字不可編輯。"],
     )
 
 

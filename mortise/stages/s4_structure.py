@@ -71,7 +71,7 @@ def _joiner(a: str, b: str) -> str:
     return "" if a[-1].isspace() else " "
 
 
-def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: list[Correction]) -> PageLayout:
+def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: list[Correction], ai=None, page_image=None) -> PageLayout:
     c = cfg.section("structure")
     page = spec.page_index
     step = f"{NAME}.text_flow@{VERSION}"
@@ -193,6 +193,12 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
     z_order = [i[1] for i in sorted(items, key=lambda i: i[2])]
     guides_x = _guides([i[0].bbox[0] for i in items] + [i[0].bbox[2] for i in items], c["left_align_tolerance"])
     guides_y = _guides([i[0].bbox[1] for i in items] + [i[0].bbox[3] for i in items], c["left_align_tolerance"])
+    # ---------- s4.ai_roles：規則判斷不確定時，請大型 AI 看編號標記圖決定角色與閱讀順序 ----------
+    if ai is not None and page_image is not None and ai.feature("structure"):
+        paragraphs, reading, ai_note = _ai_roles_order(ai, page_image, paragraphs, text_boxes, elements, tables, reading, spec, cfg)
+        if ai_note:
+            notes.append(ai_note)
+
     layout = PageLayout(
         page_index=page, paragraphs=paragraphs, text_boxes=text_boxes, reading_order=reading, z_order=z_order,
         links=links, guides_x=guides_x, guides_y=guides_y, notes=notes, tables=tables,
@@ -379,6 +385,59 @@ def _roles(paragraphs: list[Paragraph], by_line: dict[str, TextLine], spec: Page
         out.append(p.model_copy(update={"role": measured(role, conf, Provenance.INFERRED, step)}))
     order = {p.id: i for i, p in enumerate(paragraphs)}
     return sorted(out, key=lambda p: order[p.id])
+
+
+_AI_ROLE = {
+    "title": Role.TITLE, "subtitle": Role.SUBTITLE, "body": Role.BODY, "caption": Role.CAPTION, "header": Role.HEADER,
+    "footer": Role.FOOTER, "page_number": Role.PAGE_NUMBER, "footnote": Role.FOOTNOTE, "list_item": Role.BODY,
+    "table": Role.BODY, "figure": Role.CAPTION, "other": Role.UNKNOWN,
+}
+
+
+def _ai_roles_order(ai, page_image, paragraphs, text_boxes, elements, tables, reading, spec, cfg):
+    """把段落、圖片、表格依目前的閱讀順序編號畫在頁面上，請 AI 回答每段的角色與閱讀順序。
+    觸發條件：有角色信心值低於門檻的段落，或頁面上有並排的文字框（可能多欄）。AI 只回答編號與標籤。"""
+    from ..ai.marks import render_marks
+    from ..ai.tasks import roles_order_task
+
+    c = cfg.section("structure")
+    table_par_ids = {pid for t in tables for cell in t.cells for pid in cell.paragraph_ids}
+    flow = [p for p in paragraphs if p.id not in table_par_ids]
+    if len(flow) < int(c.get("ai_min_paragraphs", 2)):
+        return paragraphs, reading, None
+    low = [p for p in flow if p.role.confidence < c.get("ai_role_confidence", 0.7) and not p.role.locked]
+    boxes = [b.quad.bbox for b in text_boxes]
+    side_by_side = any(a[2] <= b[0] and min(a[3], b[3]) - max(a[1], b[1]) > 0.02 for a in boxes for b in boxes if a is not b)
+    if not low and not side_by_side:
+        return paragraphs, reading, None
+    box_of = {pid: b.id for b in text_boxes for pid in b.paragraph_ids}
+    by_line = {t.id: t for t in elements.texts}
+    pos = {eid: i for i, eid in enumerate(reading)}
+    ordered = sorted(flow, key=lambda p: (pos.get(box_of.get(p.id), 1e9), p.quad.bbox[1]))
+    items_q = [(p.id, p.quad) for p in ordered] + [(im.id, im.quad) for im in elements.images] + [(t.id, t.quad) for t in tables]
+    png, mapping = render_marks(page_image, items_q, max_long_edge=int(ai.cfg.get("max_image_long_edge", 2576)))
+    kinds = {p.id: "paragraph" for p in ordered} | {im.id: "image" for im in elements.images} | {t.id: "table" for t in tables}
+    items = []
+    for n, eid in mapping.items():
+        it = {"n": n, "kind": kinds[eid]}
+        if kinds[eid] == "paragraph":
+            par = next(p for p in ordered if p.id == eid)
+            it["text"] = "".join(by_line[lid].text for lid in par.line_ids)[:80]
+        items.append(it)
+    ans = ai.ask(roles_order_task(png, items, spec.page_index))
+    if ans is None:
+        return paragraphs, reading, None
+    step = f"{NAME}.ai_roles@{VERSION}"
+    role_of = {mapping[r["n"]]: _AI_ROLE[r["role"]] for r in ans["roles"]}
+    new_pars = [p.model_copy(update={"role": measured(role_of[p.id], 0.85, Provenance.AI, step)}) if p.id in role_of and not p.role.locked else p for p in paragraphs]
+    order: list[str] = []
+    for n in ans["reading_order"]:
+        eid = mapping[n]
+        eid = box_of.get(eid, eid)  # 段落 → 所屬的文字框
+        if eid not in order:
+            order.append(eid)
+    order += [eid for eid in reading if eid not in order]
+    return new_pars, order, "段落角色與閱讀順序由大型 AI 依編號標記圖判斷。"
 
 
 def _guides(values: list[float], tol: float) -> list[float]:

@@ -126,8 +126,17 @@ class Pipeline:
         self._save_state()
         return best
 
+    def _ai(self):
+        if getattr(self, "_ai_dispatcher", None) is None:
+            from ..ai import AiDispatcher
+
+            self._ai_dispatcher = AiDispatcher(self.cfg.section("ai"), cache_dir=self.dir / "ai")
+        return self._ai_dispatcher
+
     def _run_once(self, round_no: int, final: bool = False) -> FidelityReport:
         cfg, store = self.cfg, self.store
+        ai = self._ai()
+        ai_key = (cfg.key("ai"), ai.enabled, ai.provider.model)
         source = self.dir / self.state["source"]
         intent = Intent.model_validate(self.state.get("intent") or {})
 
@@ -148,12 +157,12 @@ class Pipeline:
             spec, h2 = self._cached(2, f"s2/{tag}", PageSpec, k2, lambda: s2_page.run(doc, i, cfg, c2, store), i)
             # ③ 辨識（只依賴頁面幾何，不依賴比例尺）
             c3 = self._for_stage(3, i)
-            k3 = _digest(s3_recognize.VERSION, cfg.key("recognize"), doc.doc_id, ref.input_type.value.value, s2_page.geometry_key(spec), [c.model_dump(mode="json") for c in c3])
-            el, h3 = self._cached(3, f"s3/{tag}", ElementList, k3, lambda: s3_recognize.run(doc, spec, cfg, c3, store), i)
+            k3 = _digest(s3_recognize.VERSION, cfg.key("recognize"), doc.doc_id, ref.input_type.value.value, s2_page.geometry_key(spec), [c.model_dump(mode="json") for c in c3], ai_key)
+            el, h3 = self._cached(3, f"s3/{tag}", ElementList, k3, lambda: s3_recognize.run(doc, spec, cfg, c3, store, ai=ai), i)
             # ④ 結構（逐頁）
             c4 = self._for_stage(4, i)
-            k4 = _digest(s4_structure.VERSION, cfg.key("structure"), h3, spec.aspect_ratio, [c.model_dump(mode="json") for c in c4])
-            pl, h4 = self._cached(4, f"s4/{tag}", PageLayout, k4, lambda: s4_structure.run_page(el, spec, cfg, c4), i)
+            k4 = _digest(s4_structure.VERSION, cfg.key("structure"), h3, spec.aspect_ratio, [c.model_dump(mode="json") for c in c4], ai_key)
+            pl, h4 = self._cached(4, f"s4/{tag}", PageLayout, k4, lambda: s4_structure.run_page(el, spec, cfg, c4, ai=ai, page_image=self._page_image(spec) if ai.enabled else None), i)
             specs.append(spec)
             elements.append(el)
             page_layouts.append(pl)
@@ -183,6 +192,11 @@ class Pipeline:
         if final:
             report = report.model_copy(update={"corrections_proposed": []})
         return report
+
+    def _page_image(self, spec: PageSpec):
+        from PIL import Image
+
+        return Image.open(self.store.blob_path(spec.working_image)).convert("RGB")
 
     # ---------- 取用結果 ----------
     def output_path(self, fmt: str) -> Path:
