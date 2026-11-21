@@ -9,11 +9,13 @@
   s5.paragraph    段落屬性：行距、段距、對齊
   s5.box          文字框、圖片、形狀的位置與大小
   s5.styles       歸納樣式表與主題色
-尚未實作：母片定案、表格設定、數字格式、Excel 公式推論、顏色吸附、比例尺一致性檢查。
+  s5.tables       表格：欄寬、列高、儲存格邊距與垂直對齊、底色、框線、數字格式推論（千分位、百分比、貨幣）
+尚未實作：母片定案、Excel 公式推論、顏色吸附、比例尺一致性檢查。
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 from ..artifacts import (
@@ -27,7 +29,7 @@ from ..config import Config
 from ..tools.fonts import has_cjk, verification_font
 
 NAME = "s5"
-VERSION = "1"
+VERSION = "2"
 
 _APPS = [
     ("powerpoint", "powerpoint"), ("impress", "libreoffice_impress"), ("keynote", "keynote"), ("google slides", "google_slides"),
@@ -131,13 +133,25 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
                 bx = _box(s.quad, w)
             if s.fill:
                 color_counter[s.fill.hex] += 50
-            shapes.append(StyledShape(id=s.id, box=bx, z=s.z, geometry=s.geometry.value, fill=s.fill, stroke=s.stroke, stroke_width_pt=(s.stroke_width * w) if s.stroke_width else None))
+            path_pt: list[list[float]] = []
+            if s.geometry == ShapeGeometry.PATH:
+                for sg in s.path:
+                    if sg[0] == 3:
+                        path_pt.append([3])
+                    else:
+                        path_pt.append([sg[0]] + [v * w - (bx.x if i % 2 == 0 else bx.y) for i, v in enumerate(sg[1:])])
+            shapes.append(StyledShape(
+                id=s.id, box=bx, z=s.z, geometry=s.geometry.value, fill=s.fill, stroke=s.stroke,
+                stroke_width_pt=(s.stroke_width * w) if s.stroke_width else None,
+                corner_radius_pt=(s.corner_radius * w) if s.corner_radius else None, path=path_pt,
+            ))
+        tables = [_table(t, el, pl, lines, w, c, subs, same, style_counter, style_role, color_counter) for t in pl.tables]
         bg = el.background
         pages.append(
             StyledPage(
                 page_index=spec.page_index, width_pt=w, height_pt=h,
                 background_color=bg.color if (bg.color and bg.color.hex != "FFFFFF") else None, background_image=bg.image,
-                text_boxes=text_boxes, images=images, shapes=shapes, reading_order=pl.reading_order,
+                text_boxes=text_boxes, images=images, shapes=shapes, reading_order=pl.reading_order, tables=tables,
             )
         )
         notes.extend(f"第 {spec.page_index + 1} 頁：{n}" for n in el.notes)
@@ -160,6 +174,115 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
 
     styled = StyledDoc(target_mode=target_mode, source_app=source_app, pages=pages, styles=styles, theme_colors=theme, notes=notes)
     return _apply_corrections(styled, corrections, subs)
+
+
+# ---------- s5.tables ----------
+
+_NUM = re.compile(r"^\s*([-+(]?)\s*([$€£¥＄NT]*)\s*([\d,，]*\d(?:[.．]\d+)?)\s*(%|％)?\s*\)?\s*$")
+
+
+def infer_number(text: str) -> tuple[float, str] | None:
+    """「1,250」→（1250, "#,##0"）；「61%」→（0.61, "0%"）；「$25」→（25, "$#,##0"）；「(3.5)」→（-3.5, "#,##0.0;(#,##0.0)"）。"""
+    m = _NUM.match(text)
+    if not m:
+        return None
+    sign, cur, digits, pct = m.groups()
+    raw = digits.replace("，", ",").replace("．", ".")
+    if "," in raw and not re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", raw):
+        return None  # 逗號位置不像千分位（可能是清單或日期）
+    value = float(raw.replace(",", ""))
+    decimals = len(raw.split(".")[1]) if "." in raw else 0
+    body = ("#,##0" if "," in raw else "0") + ("." + "0" * decimals if decimals else "")
+    neg = sign in ("-", "(")
+    if pct:
+        value /= 100.0
+        fmt = ("0" + ("." + "0" * decimals if decimals else "")) + "%"
+    else:
+        fmt = body
+    if cur:
+        sym = "$" if cur in ("$", "＄") else ("NT$" if "NT" in cur else cur)
+        fmt = f'"{sym}"{fmt}' if sym not in ("$",) else f"${fmt}"
+    if sign == "(":
+        fmt = f"{fmt};({fmt})"
+    return (-value if neg else value), fmt
+
+
+def _table(t, el: ElementList, pl, lines: dict, w: float, c: dict, subs: dict, same: bool, style_counter, style_role, color_counter):
+    """④的表格結構 → 成品表格：欄寬、列高、儲存格的段落、底色、框線、邊距、垂直對齊、數字格式。"""
+    from ..artifacts import Border, StyledCell, StyledTable
+
+    region = next((r for r in el.table_regions if r.id == t.region_id), None)
+    pars = {p.id: p for p in pl.paragraphs}
+    xs, ys = t.col_lines, t.row_lines
+    tol = 0.004
+    seg = region.segments if region else []
+    color = (region.line_color if region and region.line_color else None) or Color(r=0, g=0, b=0)
+    width_pt = (region.line_width * w) if region and region.line_width else 0.5
+    cells = []
+    for cl in t.cells:
+        l, top, r, b = cl.quad.bbox
+        sps: list[StyledParagraph] = []
+        cell_lines = []
+        for pid in cl.paragraph_ids:
+            p = pars[pid]
+            p_lines = [lines[i] for i in p.line_ids]
+            cell_lines += p_lines
+            runs = _runs(p_lines, p.joiners, w, c, subs)
+            for rn in runs:
+                sig = (rn.font.family.value, rn.size_pt.value, rn.bold, rn.italic, rn.color.hex)
+                style_counter[sig] += len(rn.text)
+                style_role.setdefault(sig, Role.BODY)
+                color_counter[rn.color.hex] += len(rn.text)
+            sps.append(StyledParagraph(id=p.id, runs=runs, align=p.alignment.value, line_spacing=_line_spacing(p_lines, p.line_pitch, runs, w, c, same), role=Role.BODY, source_line_count=len(p.line_ids)))
+        if cell_lines:
+            tl, tt = min(ln.quad.bbox[0] for ln in cell_lines), min(ln.quad.bbox[1] for ln in cell_lines)
+            tr, tb = max(ln.quad.bbox[2] for ln in cell_lines), max(ln.quad.bbox[3] for ln in cell_lines)
+            gap_t, gap_b, gap_l, gap_r = (tt - top) * w, (b - tb) * w, (tl - l) * w, (r - tr) * w
+            if gap_t > 0 and gap_b > 0 and abs(gap_t - gap_b) <= 0.3 * (gap_t + gap_b) and (b - top) > 1.6 * (tb - tt):
+                v_align = "middle"
+            elif gap_b < 0.5 * gap_t:
+                v_align = "bottom"
+            else:
+                v_align = "top"
+            side = max(0.0, min(gap_l, gap_r)) if sps and sps[0].align == Align.CENTER else max(0.0, gap_l)
+            margins = [max(0.0, gap_t) if v_align == "top" else 0.0, max(0.0, gap_r) if sps and sps[0].align == Align.RIGHT else side, max(0.0, gap_b) if v_align == "bottom" else 0.0, side]
+        else:
+            v_align, margins = "top", [0.0, 0.0, 0.0, 0.0]
+        fill = None
+        if region:
+            for fq, fc in region.cell_fills:
+                fl, ft, fr, fb = fq.bbox
+                if fl - tol <= cl.quad.center.x <= fr + tol and ft - tol <= cl.quad.center.y <= fb + tol:
+                    fill = fc
+        edges = [
+            _covered_edge(seg, False, top, l, r, tol), _covered_edge(seg, True, r, top, b, tol),
+            _covered_edge(seg, False, b, l, r, tol), _covered_edge(seg, True, l, top, b, tol),
+        ]
+        borders = [Border(color=color, width_pt=width_pt) if e else None for e in edges]
+        text = "".join(rn.text for sp in sps for rn in sp.runs).strip()
+        num = infer_number(text) if text and len(sps) == 1 else None
+        cells.append(StyledCell(
+            row=cl.row, col=cl.col, row_span=cl.row_span, col_span=cl.col_span, paragraphs=sps, fill=fill, borders=borders,
+            v_align=v_align, margins_pt=[round(v, 2) for v in margins], header=cl.header,
+            value=num[0] if num else None, number_format=num[1] if num else None,
+        ))
+    return StyledTable(
+        id=t.id, box=_box(t.quad, w), z=t.z, col_widths_pt=[(b - a) * w for a, b in zip(xs, xs[1:])],
+        row_heights_pt=[(b - a) * w for a, b in zip(ys, ys[1:])], cells=cells, header_rows=t.header_rows,
+    )
+
+
+def _covered_edge(segments, vertical: bool, at: float, lo: float, hi: float, tol: float) -> bool:
+    need, got = 0.6 * (hi - lo), 0.0
+    for x0, y0, x1, y1 in segments:
+        if vertical and abs(x0 - x1) <= tol and abs((x0 + x1) / 2 - at) <= tol:
+            a, b = min(y0, y1), max(y0, y1)
+        elif not vertical and abs(y0 - y1) <= tol and abs((y0 + y1) / 2 - at) <= tol:
+            a, b = min(x0, x1), max(x0, x1)
+        else:
+            continue
+        got += max(0.0, min(b, hi) - max(a, lo))
+    return got >= need
 
 
 # ---------- s5.font_size、s5.font ----------

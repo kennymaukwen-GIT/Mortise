@@ -47,6 +47,31 @@ class TextBox(Model):
     space_between: list[float] = []  # 相鄰段落之間多出來的距離（相對單位），長度為段落數減 1
 
 
+class TableCell(Model):
+    row: int
+    col: int
+    row_span: int = 1
+    col_span: int = 1
+    quad: Quad
+    paragraph_ids: list[str] = []  # 儲存格內的段落（依閱讀順序）
+    header: bool = False
+
+
+class TableStructure(Model):
+    """④理解出的表格：列、欄、合併儲存格、表頭、儲存格內文字的歸屬。"""
+
+    id: str
+    region_id: str  # 來自③的表格區編號
+    quad: Quad
+    z: int
+    row_lines: list[float]  # 列的邊界 y（列數 + 1 條）
+    col_lines: list[float]  # 欄的邊界 x（欄數 + 1 條）
+    cells: list[TableCell]
+    header_rows: int = 0
+    ruled: bool = True
+    confidence: float = 1.0
+
+
 class PageLayout(Model):
     page_index: int
     paragraphs: list[Paragraph] = []
@@ -57,6 +82,7 @@ class PageLayout(Model):
     guides_x: list[float] = []  # 對齊線
     guides_y: list[float] = []
     notes: list[str] = []
+    tables: list[TableStructure] = []
 
 
 class MasterCandidate(Model):

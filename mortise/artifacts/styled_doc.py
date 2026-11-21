@@ -83,10 +83,43 @@ class StyledShape(Model):
     id: str
     box: Box
     z: int
-    geometry: str  # rect、line、ellipse
+    geometry: str  # rect、rounded_rect、line、ellipse、path
     fill: Optional[Color] = None
     stroke: Optional[Color] = None
     stroke_width_pt: Optional[float] = None
+    corner_radius_pt: Optional[float] = None  # rounded_rect 才有
+    path: list[list[float]] = []  # path 才有：每段 [種類, x, y, ...]，座標相對於 box 左上角（pt）；種類 0 起筆、1 直線、2 三次貝茲（後接 3 個點）、3 閉合
+
+
+class Border(Model):
+    color: Color
+    width_pt: float
+
+
+class StyledCell(Model):
+    row: int
+    col: int
+    row_span: int = 1
+    col_span: int = 1
+    paragraphs: list[StyledParagraph] = []
+    fill: Optional[Color] = None
+    borders: list[Optional[Border]] = [None, None, None, None]  # 上、右、下、左
+    v_align: str = "top"  # top、middle、bottom
+    margins_pt: list[float] = [0.0, 0.0, 0.0, 0.0]  # 上、右、下、左：文字與儲存格邊緣的距離
+    header: bool = False
+    value: Optional[float] = None  # 數字儲存格的數值（⑤推論；給 Excel 用）
+    number_format: Optional[str] = None  # Excel 數字格式，例如 "#,##0"、"0%"
+    formula: Optional[str] = None  # 只有使用者確認過的公式才會填
+
+
+class StyledTable(Model):
+    id: str
+    box: Box
+    z: int
+    col_widths_pt: list[float]
+    row_heights_pt: list[float]
+    cells: list[StyledCell]
+    header_rows: int = 0
 
 
 class StyledPage(Model):
@@ -99,6 +132,7 @@ class StyledPage(Model):
     images: list[StyledImage] = []
     shapes: list[StyledShape] = []
     reading_order: list[str] = []
+    tables: list[StyledTable] = []
 
 
 class Style(Model):

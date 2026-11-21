@@ -165,6 +165,26 @@ class Quad(Model):
         return abs(self.angle_deg) <= tol_deg
 
 
+def oriented_union(quads: list[Quad]) -> Quad:
+    """多個同方向四角的外接矩形，保留方向（旋轉的文字框不能用軸對齊的外接矩形）。
+    方向不一致或接近水平時，退回軸對齊的外接矩形。"""
+    angles = [q.angle_deg for q in quads]
+    if not quads or max(angles) - min(angles) > 0.5 or abs(angles[0]) < 0.05:
+        return union_quad(quads)
+    a = math.radians(sum(angles) / len(angles))
+    ux, uy = math.cos(a), math.sin(a)  # 沿文字方向
+    nx, ny = -uy, ux  # 垂直文字方向（y 向下的座標系中，指向文字的下方）
+    pts = [p for q in quads for p in q.points]
+    us = [p.x * ux + p.y * uy for p in pts]
+    ns = [p.x * nx + p.y * ny for p in pts]
+    u0, u1, n0, n1 = min(us), max(us), min(ns), max(ns)
+
+    def pt(u: float, n: float) -> Point:
+        return Point(x=u * ux + n * nx, y=u * uy + n * ny)
+
+    return Quad(tl=pt(u0, n0), tr=pt(u1, n0), br=pt(u1, n1), bl=pt(u0, n1))
+
+
 def union_quad(quads: list[Quad]) -> Quad:
     """多個四角的外接矩形（軸對齊）。"""
     boxes = [q.bbox for q in quads]

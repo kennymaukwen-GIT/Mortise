@@ -74,6 +74,7 @@ class ImageElement(Model):
 
 class ShapeGeometry(str, Enum):
     RECT = "rect"
+    ROUNDED_RECT = "rounded_rect"
     LINE = "line"
     ELLIPSE = "ellipse"
     PATH = "path"
@@ -88,6 +89,9 @@ class ShapeElement(Model):
     stroke: Optional[Color] = None
     stroke_width: Optional[float] = None  # 相對單位
     is_page_background: bool = False  # 佔滿整頁的底色矩形
+    corner_radius: Optional[float] = None  # 圓角半徑（相對單位），rounded_rect 才有
+    path: list[list[float]] = []  # path 才有：每段 [種類, x, y, ...]（頁面相對座標）；種類 0 起筆、1 直線、2 三次貝茲（後接 3 個點）、3 閉合
+    fit_error: Optional[float] = None  # 認成基本幾何時的擬合誤差（相對單位）
 
 
 class TableRegion(Model):
@@ -97,6 +101,13 @@ class TableRegion(Model):
     quad: Quad
     h_lines: list[float] = []  # 水平格線的 y
     v_lines: list[float] = []  # 垂直格線的 x
+    ruled: bool = True  # 有畫出來的框線；False 表示由文字對齊推出的無框線表格
+    segments: list[tuple[float, float, float, float]] = []  # 實際的格線線段（x0, y0, x1, y1），④用來判斷合併儲存格
+    line_color: Optional[Color] = None
+    line_width: Optional[float] = None  # 相對單位
+    cell_fills: list[tuple[Quad, Color]] = []  # 儲存格底色（色塊與其顏色）
+    confidence: float = 1.0
+    z: int = 0  # 圖層順序（格線中最底層的那一條）
 
 
 class Background(Model):

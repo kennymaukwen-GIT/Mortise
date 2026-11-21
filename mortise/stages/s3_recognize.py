@@ -4,7 +4,8 @@
   擷取產線（原生 PDF）：直接讀檔案
     s3.pdf_text    讀逐字資料，合併成文字行與樣式段
     s3.pdf_images  讀內嵌圖片
-    s3.pdf_shapes  讀向量路徑，認出矩形與直線；其餘留在底圖
+    s3.pdf_shapes  讀向量路徑：認出矩形、圓角矩形、橢圓、直線；其他較簡單的保留成自訂路徑；太複雜的留在底圖
+    s3.tables      由框線找表格區（區域與格線位置；列欄結構在④）
     s3.background  隱藏已擷取的物件後重繪，得到底圖（不是生成）
   影像產線（掃描、截圖、照片）：
     s3.image_stub  尚未實作文字與區域辨識：整頁當成一張圖片交出，並在備註中說明
@@ -19,7 +20,7 @@ import numpy as np
 from PIL import Image
 
 from ..artifacts import (
-    Background, Color, Correction, ElementList, FontCandidate, ImageElement, ImageKind, InputType, PageSpec, Point,
+    Background, Color, Correction, ElementList, FontCandidate, ImageElement, ImageKind, InputType, PageSpec, Point, TableRegion,
     ProductionLine, Provenance, Quad, ShapeElement, ShapeGeometry, SourceDoc, TextLine, TextRun, exact, make_element_id, measured,
 )
 from ..config import Config
@@ -29,7 +30,7 @@ from ..tools.fonts import clean_font_name, is_cjk, split_style
 from ..tools.geometry import to_point
 
 NAME = "s3"
-VERSION = "1"
+VERSION = "2"
 
 SEG_LINETO, SEG_BEZIERTO, SEG_MOVETO = 0, 1, 2
 
@@ -79,9 +80,12 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
     try:
         texts = read_text_lines(reader, spec.page_index, m, src_w, c)
         images, image_z = _images(reader, spec, m, c, store, notes)
-        shapes, shape_z, page_color = _shapes(reader, spec, m, src_w, c, notes)
+        shapes, shape_z, page_color, _ = _shapes(reader, spec, m, src_w, c, notes)
         _mark_shadows(images, shapes)
+        # 底色物件不隱藏：底圖要帶著底色，否則隱藏後會變成白底（深色投影片就會整頁變白）
         background = _background(reader, spec, c, store, image_z | shape_z, page_color)
+        tables, absorbed = _tables(shapes, [t for t in texts if not t.hidden], spec, c)
+        shapes = [sh for sh in shapes if sh.id not in absorbed]
     finally:
         reader.close()
         pdoc.close()
@@ -89,7 +93,7 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
         notes.append("這一頁有不可見文字（多半是 OCR 文字層），已標記為隱藏，不會輸出。")
     return ElementList(
         page_index=spec.page_index, production_line=ProductionLine.EXTRACT,
-        texts=texts, images=images, shapes=shapes, background=background, notes=notes,
+        texts=texts, images=images, shapes=shapes, table_regions=tables, background=background, notes=notes,
     )
 
 
@@ -147,6 +151,7 @@ def read_text_lines(reader: pdf.PageReader, page_index: int, m: list[float], src
                 flush()
         cur.append(ch)
     flush()
+    lines = _rejoin(lines, reader, c)
 
     out: list[TextLine] = []
     for line in lines:
@@ -232,6 +237,75 @@ def read_text_lines(reader: pdf.PageReader, page_index: int, m: list[float], src
     return out
 
 
+def _rejoin(lines: list[list[pdf.RawChar]], reader: pdf.PageReader, c: dict) -> list[list[pdf.RawChar]]:
+    """把同一條基線上被切開的片段接回去。任何方向的文字都適用（在各自的文字座標系中判斷）。
+
+    兩種情況：
+    1. 間距很小（不到 line_gap_factor 個字寬）：片段是被 PDF 的物件邊界或 PDFium 補的換行切開的，直接接。
+    2. 間距較大（左右對齊的段落會把詞間距拉寬）：只有在「不是欄間空白」時才接。欄間空白（或無框線表格的欄距）
+       會在上下相鄰的行出現在同一個位置；對齊造成的寬間距每行位置都不同，上下行在這裡有字。
+    都不跨越垂直的框線（表格的格子）。
+    """
+    rules = []  # 垂直框線（PDF 座標）：x、y0、y1
+    for p in reader.paths():
+        l, b, r, t = p.bounds
+        if (r - l) <= 2.0 and (t - b) >= 4.0 and (p.stroke or p.fill):
+            rules.append(((l + r) / 2, b, t))
+    info = []
+    for chs in lines:
+        vis = [ch for ch in chs if ch.text.strip()]
+        ang = sorted(ch.angle for ch in vis)[len(vis) // 2]
+        ux, uy = math.cos(ang), math.sin(ang)
+        spans = []
+        for ch in vis:
+            l, b, r, t = ch.loose_box
+            proj = [x * ux + y * uy for x, y in ((l, b), (r, b), (r, t), (l, t))]
+            s0 = ch.origin[0] * ux + ch.origin[1] * uy
+            spans.append((min(s0, max(proj)), max(proj)))
+        size = sorted(ch.size for ch in vis)[len(vis) // 2]
+        cross = -vis[0].origin[0] * uy + vis[0].origin[1] * ux
+        info.append({"chs": chs, "ang": ang, "cross": cross, "size": size, "x0": min(a for a, _ in spans), "x1": max(b for _, b in spans), "spans": spans,
+                     "horizontal": abs(uy) < 0.02, "y": vis[0].origin[1]})
+    small_gap = c["line_gap_factor"]
+    max_gap = c.get("join_max_gap_factor", 4.0)
+    merged = True
+    while merged:
+        merged = False
+        order = sorted(range(len(info)), key=lambda i: (round(math.degrees(info[i]["ang"])), round(info[i]["cross"], 1), info[i]["x0"]))
+        for ai, bi in zip(order, order[1:]):
+            A, B = info[ai], info[bi]
+            if abs(A["ang"] - B["ang"]) > math.radians(1.0):
+                continue
+            size = max(A["size"], B["size"])
+            if abs(A["cross"] - B["cross"]) > c["baseline_tolerance"] * size or abs(A["size"] - B["size"]) > 0.05 * size:
+                continue
+            gap = B["x0"] - A["x1"]
+            if gap < -0.3 * size or gap > max_gap * size:
+                continue
+            if A["horizontal"] and any(A["x1"] - 0.5 <= x <= B["x0"] + 0.5 and y0 - size <= A["y"] <= y1 + size for x, y0, y1 in rules):
+                continue
+            if gap > small_gap * size:
+                lo, hi = A["x1"] + 0.25 * gap, B["x0"] - 0.25 * gap
+                neighbours = [n for k, n in enumerate(info) if k not in (ai, bi) and abs(n["ang"] - A["ang"]) <= math.radians(1.0)
+                              and 0.3 * size < abs(n["cross"] - A["cross"]) <= 2.6 * size and n["x0"] < B["x1"] and n["x1"] > A["x0"]]
+                if not neighbours:
+                    continue
+                if not any(any(a < hi and b2 > lo for a, b2 in n["spans"]) for n in neighbours):
+                    continue  # 上下行在這裡也都是空白：是欄間空白，不接
+            last = next(ch for ch in reversed(A["chs"]) if ch.text.strip())
+            first = next(ch for ch in B["chs"] if ch.text.strip())
+            joiner = []
+            if gap > 0.15 * size and not (is_cjk(last.text) or is_cjk(first.text)):
+                joiner = [pdf.RawChar(**{**last.__dict__, "text": " ", "generated": True})]
+            A["chs"] = A["chs"] + joiner + B["chs"]
+            A["x1"] = max(A["x1"], B["x1"])
+            A["spans"] = A["spans"] + B["spans"]
+            info.pop(bi)
+            merged = True
+            break
+    return [n["chs"] for n in info]
+
+
 # ---------- s3.pdf_images ----------
 
 
@@ -304,49 +378,255 @@ def _color(rgba) -> Color | None:
     return Color(r=rgba[0], g=rgba[1], b=rgba[2], a=rgba[3] / 255) if rgba and rgba[3] > 0 else None
 
 
-def _shapes(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: float, c: dict, notes: list[str]) -> tuple[list[ShapeElement], set[int], Color | None]:
+def _segments(path: pdf.RawPath) -> list[list]:
+    """PDFium 的路徑點 → 線段清單：[種類, x, y, ...]（PDF 座標）。種類 0 起筆、1 直線、2 三次貝茲、3 閉合。"""
+    out: list[list] = []
+    pts = path.points
+    i = 0
+    while i < len(pts):
+        kind, x, y, close = pts[i]
+        if kind == SEG_MOVETO:
+            out.append([0, x, y])
+            i += 1
+        elif kind == SEG_LINETO:
+            out.append([1, x, y])
+            i += 1
+        else:  # 三次貝茲：連續三個點
+            trio = pts[i:i + 3]
+            if len(trio) < 3:
+                break
+            out.append([2, trio[0][1], trio[0][2], trio[1][1], trio[1][2], trio[2][1], trio[2][2]])
+            close = trio[-1][3]
+            i += 3
+        if close:
+            out.append([3])
+    return out
+
+
+def _ellipse_of(segs: list[list], tol: float) -> tuple[float, float, float, float] | None:
+    """由貝茲曲線組成（可夾雜極短的直線）、所有端點與曲線中點都落在外接矩形內切橢圓上：是橢圓。
+    不同軟體切的段數不同（PowerPoint 4 段、LibreOffice 12 段加短直線），所以不限段數。回傳（左、下、右、上）。"""
+    curves = [sg for sg in segs if sg[0] == 2]
+    if len(curves) < 4 or sum(1 for sg in segs if sg[0] == 0) != 1:
+        return None
+    xs = [v for sg in segs if sg[0] in (0, 1, 2) for v in sg[1::2]]
+    ys = [v for sg in segs if sg[0] in (0, 1, 2) for v in sg[2::2]]
+    l, r, b, t = min(xs), max(xs), min(ys), max(ys)
+    rx, ry = (r - l) / 2, (t - b) / 2
+    if rx < tol or ry < tol:
+        return None
+    cx, cy = (l + r) / 2, (t + b) / 2
+
+    def off(x: float, y: float) -> float:
+        return abs(((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 - 1)
+
+    prev = None
+    for sg in segs:
+        if sg[0] == 3:
+            continue
+        end = (sg[-2], sg[-1])
+        if off(*end) > 0.03:
+            return None
+        if sg[0] == 1 and prev is not None and abs(end[0] - prev[0]) + abs(end[1] - prev[1]) > 0.08 * min(rx, ry):
+            return None  # 長直線：不是橢圓
+        if sg[0] == 2 and prev is not None:
+            mx = 0.125 * prev[0] + 0.375 * sg[1] + 0.375 * sg[3] + 0.125 * sg[5]
+            my = 0.125 * prev[1] + 0.375 * sg[2] + 0.375 * sg[4] + 0.125 * sg[6]
+            if off(mx, my) > 0.03:
+                return None
+        prev = end
+    return l, b, r, t
+
+
+def _rounded_rect_of(segs: list[list], tol: float) -> tuple[tuple[float, float, float, float], float] | None:
+    """四條邊加四個圓角（貝茲）的軸對齊圓角矩形。回傳（（左、下、右、上）、圓角半徑）。"""
+    body = [sg for sg in segs if sg[0] in (1, 2)]
+    curves = [sg for sg in body if sg[0] == 2]
+    if len(curves) != 4 or not (4 <= len(body) <= 9) or sum(1 for sg in segs if sg[0] == 0) != 1:
+        return None
+    xs = [v for sg in segs if sg[0] in (0, 1, 2) for v in sg[1::2]]
+    ys = [v for sg in segs if sg[0] in (0, 1, 2) for v in sg[2::2]]
+    l, r, b, t = min(xs), max(xs), min(ys), max(ys)
+    radii = []
+    prev = (segs[0][1], segs[0][2])
+    for sg in body:
+        end = (sg[-2], sg[-1])
+        if sg[0] == 1:
+            if abs(prev[0] - end[0]) > tol and abs(prev[1] - end[1]) > tol:
+                return None  # 斜線：不是圓角矩形
+        else:
+            radii.append((abs(end[0] - prev[0]) + abs(end[1] - prev[1])) / 2)
+        prev = end
+    rad = sum(radii) / 4
+    if rad <= tol or max(radii) - min(radii) > max(0.15 * rad, tol) or rad > min(r - l, t - b) / 2 + tol:
+        return None
+    return (l, b, r, t), rad
+
+
+def _shapes(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: float, c: dict, notes: list[str]) -> tuple[list[ShapeElement], set[int], Color | None, set[int]]:
+    """向量路徑 → 形狀。矩形、圓角矩形、橢圓、直線認成基本幾何；其他較簡單的路徑保留成自訂路徑；
+    太複雜的（例如上千條路徑組成的插畫）留在底圖。回傳（形狀、已取出的物件、頁面底色、底色物件）。"""
     out: list[ShapeElement] = []
     taken: set[int] = set()
     page_color: Color | None = None
+    page_color_z: set[int] = set()
     page_area = spec.aspect_ratio
     paths = reader.paths()
+    tol = 0.02
+    max_paths = c.get("max_vector_paths", 300)
+    max_segs = c.get("max_path_segments", 400)
+    complex_paths = [p for p in paths if (p.fill or p.stroke) and _rect_of(p, tol) is None and len(p.points) > 2]
+    allow_free = len(complex_paths) <= max_paths
     leftover = 0
+
+    def rel_quad(l: float, b: float, r: float, t: float) -> Quad:
+        a, bq = to_point(m, l, t), to_point(m, r, b)
+        return Quad.from_rect(min(a.x, bq.x), min(a.y, bq.y), max(a.x, bq.x), max(a.y, bq.y))
+
     for p in paths:
         fill, stroke = _color(p.fill), _color(p.stroke)
         if fill is None and stroke is None:
             continue
-        rect = _rect_of(p, tol=0.02)
+        sw = (p.stroke_width / src_w) if stroke else None
+        rect = _rect_of(p, tol=tol)
+        segs = _segments(p)
+        key_col = f"{fill.hex if fill else ''}:{stroke.hex if stroke else ''}"
         if rect is not None:
-            l, b, r, t = rect
-            a, bq = to_point(m, l, t), to_point(m, r, b)
-            q = Quad.from_rect(min(a.x, bq.x), min(a.y, bq.y), max(a.x, bq.x), max(a.y, bq.y))
+            q = rel_quad(*rect)
             full = (q.width * q.height) / page_area >= c["full_page_coverage"]
             if full and fill is not None and fill.a >= 0.999 and not out and stroke is None:
                 page_color = fill  # 最底層的整頁色塊：當成頁面底色，不輸出成形狀
-                taken.add(p.z)
+                page_color_z.add(p.z)
                 continue
-            out.append(
-                ShapeElement(
-                    id=make_element_id(spec.page_index, "shp", q, f"rect:{fill.hex if fill else ''}:{stroke.hex if stroke else ''}"), quad=q, z=p.z,
-                    geometry=ShapeGeometry.RECT, fill=fill, stroke=stroke, stroke_width=(p.stroke_width / src_w) if stroke else None,
-                )
-            )
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"rect:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.RECT, fill=fill, stroke=stroke, stroke_width=sw))
             taken.add(p.z)
-        elif len(p.points) == 2 and stroke is not None and all(pt[0] != SEG_BEZIERTO for pt in p.points):
+            continue
+        if len(p.points) == 2 and stroke is not None and all(pt[0] != SEG_BEZIERTO for pt in p.points):
             a, bq = to_point(m, p.points[0][1], p.points[0][2]), to_point(m, p.points[1][1], p.points[1][2])
             q = Quad(tl=a, tr=bq, br=bq, bl=a)
-            out.append(
-                ShapeElement(
-                    id=make_element_id(spec.page_index, "shp", q, f"line:{stroke.hex}"), quad=q, z=p.z,
-                    geometry=ShapeGeometry.LINE, stroke=stroke, stroke_width=p.stroke_width / src_w,
-                )
-            )
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"line:{stroke.hex}"), quad=q, z=p.z, geometry=ShapeGeometry.LINE, stroke=stroke, stroke_width=sw))
             taken.add(p.z)
-        else:
-            leftover += 1
+            continue
+        ell = _ellipse_of(segs, tol)
+        if ell is not None:
+            q = rel_quad(*ell)
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"ellipse:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.ELLIPSE, fill=fill, stroke=stroke, stroke_width=sw))
+            taken.add(p.z)
+            continue
+        rr = _rounded_rect_of(segs, tol)
+        if rr is not None:
+            q = rel_quad(*rr[0])
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"rrect:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.ROUNDED_RECT, fill=fill, stroke=stroke, stroke_width=sw, corner_radius=rr[1] / src_w))
+            taken.add(p.z)
+            continue
+        if allow_free and len(segs) <= max_segs:
+            rel: list[list[float]] = []
+            for sg in segs:
+                if sg[0] == 3:
+                    rel.append([3])
+                    continue
+                coords = []
+                for x, y in zip(sg[1::2], sg[2::2]):
+                    pt = to_point(m, x, y)
+                    coords += [pt.x, pt.y]
+                rel.append([sg[0]] + coords)
+            xs = [v for sg in rel if sg[0] != 3 for v in sg[1::2]]
+            ys = [v for sg in rel if sg[0] != 3 for v in sg[2::2]]
+            if not xs or (max(xs) - min(xs)) + (max(ys) - min(ys)) <= 1e-6:
+                continue
+            q = Quad.from_rect(min(xs), min(ys), max(xs), max(ys))
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"path:{key_col}:{len(rel)}:{round(xs[0], 5)}"), quad=q, z=p.z, geometry=ShapeGeometry.PATH, fill=fill, stroke=stroke, stroke_width=sw, path=rel))
+            taken.add(p.z)
+            continue
+        leftover += 1
     if leftover:
-        notes.append(f"有 {leftover} 個較複雜的向量圖形尚未轉成可編輯形狀，已留在底圖中。")
-    return out, taken, page_color
+        notes.append(f"有 {leftover} 個向量圖形太複雜，沒有轉成可編輯形狀，已留在底圖中。")
+    return out, taken, page_color, page_color_z
+
+
+# ---------- s3.tables ----------
+
+
+def _tables(shapes: list[ShapeElement], texts: list[TextLine], spec: PageSpec, c: dict) -> tuple[list[TableRegion], set[str]]:
+    """由框線找表格區：水平與垂直線段（直線或很細的矩形）連成格線。③只交區域與格線位置，列欄結構在④。
+    回傳（表格區、被表格吸收的形狀編號：格線本身與儲存格底色）。"""
+    thin = c.get("table_rule_max_width", 0.004)
+    tol = c.get("table_join_tolerance", 0.004)
+    hs, vs = [], []  # (x0, y0, x1, y1, 形狀)
+    for sh in shapes:
+        l, t, r, b = sh.quad.bbox
+        if sh.geometry == ShapeGeometry.LINE:
+            if abs(b - t) <= tol and r - l > tol:
+                hs.append((l, (t + b) / 2, r, (t + b) / 2, sh))
+            elif abs(r - l) <= tol and b - t > tol:
+                vs.append(((l + r) / 2, t, (l + r) / 2, b, sh))
+        elif sh.geometry == ShapeGeometry.RECT:
+            if b - t <= thin and r - l > 4 * (b - t):
+                hs.append((l, (t + b) / 2, r, (t + b) / 2, sh))
+            elif r - l <= thin and b - t > 4 * (r - l):
+                vs.append(((l + r) / 2, t, (l + r) / 2, b, sh))
+            elif sh.stroke is not None and sh.fill is None:  # 每格一個描邊矩形的畫法
+                hs += [(l, t, r, t, sh), (l, b, r, b, sh)]
+                vs += [(l, t, l, b, sh), (r, t, r, b, sh)]
+    if len(hs) < 2 or len(vs) < 2:
+        return [], set()
+    segs = hs + vs
+    parent = list(range(len(segs)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, (hx0, hy, hx1, _, _) in enumerate(hs):
+        for j, (vx, vy0, _, vy1, _) in enumerate(vs, start=len(hs)):
+            if hx0 - tol <= vx <= hx1 + tol and vy0 - tol <= hy <= vy1 + tol:
+                parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(len(segs)):
+        groups.setdefault(find(i), []).append(i)
+
+    def cluster(values: list[float]) -> list[float]:
+        out: list[list[float]] = []
+        for v in sorted(values):
+            if out and v - out[-1][-1] <= tol:
+                out[-1].append(v)
+            else:
+                out.append([v])
+        return [sum(g) / len(g) for g in out]
+
+    regions: list[TableRegion] = []
+    used: set[str] = set()
+    for members in groups.values():
+        H = [segs[i] for i in members if i < len(hs)]
+        V = [segs[i] for i in members if i >= len(hs)]
+        ys = cluster([s_[1] for s_ in H])
+        xs = cluster([s_[0] for s_ in V])
+        if len(ys) < 2 or len(xs) < 2 or (len(ys) - 1) * (len(xs) - 1) < 2:
+            continue
+        l, r, t, b = min(xs), max(xs), min(ys), max(ys)
+        q = Quad.from_rect(l, t, r, b)
+        inside = [tl for tl in texts if l <= tl.quad.center.x <= r and t <= tl.quad.center.y <= b]
+        if not inside:
+            continue  # 沒有字的格子多半是裝飾，不當表格
+        first = (H + V)[0][4]
+        col = first.stroke or first.fill
+        width = first.stroke_width if first.stroke_width else min(sh.quad.bbox[3] - sh.quad.bbox[1] for *_, sh in H if sh.geometry == ShapeGeometry.RECT) if any(sh.geometry == ShapeGeometry.RECT for *_, sh in H) else None
+        fills = []
+        for sh in shapes:
+            sl, st, sr, sb = sh.quad.bbox
+            if sh.geometry == ShapeGeometry.RECT and sh.fill is not None and sh.stroke is None and sb - st > thin and sr - sl > thin and l - tol <= sl and sr <= r + tol and t - tol <= st and sb <= b + tol:
+                fills.append((sh.quad, sh.fill))
+                used.add(sh.id)
+        rid = make_element_id(spec.page_index, "tbl", q, f"{len(xs)}x{len(ys)}")
+        regions.append(TableRegion(
+            id=rid, quad=q, h_lines=ys, v_lines=xs, ruled=True,
+            segments=[(s_[0], s_[1], s_[2], s_[3]) for s_ in H + V], line_color=col, line_width=width, cell_fills=fills, confidence=0.9,
+            z=min(s_[4].z for s_ in H + V),
+        ))
+        used.update(s_[4].id for s_ in H + V)
+    return regions, used
 
 
 def _mark_shadows(images: list[ImageElement], shapes: list[ShapeElement]) -> None:

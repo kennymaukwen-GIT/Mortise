@@ -11,7 +11,8 @@
   s4.same_style  同樣式分群（發放 same_style 編號，供⑤歸納樣式表）
   s4.order       閱讀順序與圖層順序、對齊線
   s4.cross_page  跨頁重複元素 → 母片候選
-尚未實作：清單階層、分欄、表格結構、圖說配對、網格編號、大型 AI 仲裁。
+  s4.tables     表格：列、欄、合併儲存格（相鄰兩格之間沒有格線就是合併）、表頭、儲存格內的段落
+尚未實作：清單階層、分欄、無框線表格、圖說配對、網格編號、大型 AI 仲裁。
 """
 
 from __future__ import annotations
@@ -22,13 +23,13 @@ import statistics
 
 from ..artifacts import (
     Align, AssemblyLink, AssemblyType, Correction, ElementList, Layout, MasterCandidate, PageLayout, PageSpec, Paragraph,
-    Provenance, Role, TextBox, TextLine, make_element_id, measured, union_quad,
+    Provenance, Quad, Role, TableCell, TableStructure, TextBox, TextLine, make_element_id, measured, oriented_union, union_quad,
 )
 from ..config import Config
 from ..tools.fonts import is_cjk
 
 NAME = "s4"
-VERSION = "1"
+VERSION = "2"
 
 _BULLET = re.compile(r"^\s*([•‧·●○■□▪◆◇▶➤\-–—*]|\(?\d{1,2}[.)、]|[a-zA-Z][.)]|[一二三四五六七八九十]+[、.])\s*")
 _PAGE_NUMBER = re.compile(r"^[\-–— ]*(第\s*)?\d{1,4}(\s*頁)?(\s*[/／]\s*\d{1,4})?[\-–— ]*$")
@@ -77,6 +78,10 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
     notes: list[str] = []
     lines = [t for t in elements.texts if not t.hidden and t.text.strip()]
     lines.sort(key=lambda t: (round(t.baseline[0].y, 4), t.baseline[0].x))
+
+    # ---------- s4.tables：表格先處理，儲存格裡的字不參與一般的文字流 ----------
+    tables, table_pars, in_tables = _tables(elements, lines, spec, c)
+    lines = [t for t in lines if t.id not in in_tables]
 
     # ---------- s4.text_flow：行 → 區塊 ----------
     blocks: list[list[TextLine]] = []
@@ -139,7 +144,7 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
                 groups[-1].append(line)
         par_ids: list[str] = []
         for g in groups:
-            q = union_quad([t.quad for t in g])
+            q = oriented_union([t.quad for t in g])
             inner = [b2.baseline[0].y - b1.baseline[0].y for b1, b2 in zip(g, g[1:])]
             pitch_value = statistics.median(inner) if inner else base_pitch
             align = _alignment(g, block, spec, c)
@@ -157,12 +162,12 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
             par_ids.append(pid)
             if len(g) > 1:
                 links.append(AssemblyLink(type=AssemblyType.TEXT_FLOW, key=pid, members=[t.id for t in g], confidence=0.8, writer=step))
-        bq = union_quad([t.quad for t in block])
+        bq = oriented_union([t.quad for t in block])
         bid = make_element_id(page, "box", bq, par_ids[0])
         text_boxes.append(TextBox(id=bid, quad=bq, z=min(t.z for t in block), paragraph_ids=par_ids, space_between=gaps_between))
 
     # ---------- s4.roles ----------
-    paragraphs = _roles(paragraphs, {t.id: t for t in lines}, spec, c)
+    paragraphs = _roles(paragraphs, {t.id: t for t in lines}, spec, c) + table_pars
 
     # ---------- s4.contain ----------
     for box in text_boxes:
@@ -173,7 +178,7 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
                 links.append(AssemblyLink(type=AssemblyType.CONTAIN, key=shape.id, members=[shape.id, box.id], confidence=0.7, writer=f"{NAME}.contain@{VERSION}"))
 
     # ---------- s4.same_style ----------
-    by_line = {t.id: t for t in lines}
+    by_line = {t.id: t for t in elements.texts}
     groups_by_style: dict[str, list[str]] = {}
     for p in paragraphs:
         sig = _style_sig(by_line[p.line_ids[0]])
@@ -183,19 +188,134 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
         links.append(AssemblyLink(type=AssemblyType.SAME_STYLE, key=key, members=members, confidence=1.0, writer=f"{NAME}.same_style@{VERSION}"))
 
     # ---------- s4.order ----------
-    items = [(b.quad, b.id, b.z) for b in text_boxes] + [(i.quad, i.id, i.z) for i in elements.images] + [(s.quad, s.id, s.z) for s in elements.shapes]
+    items = [(b.quad, b.id, b.z) for b in text_boxes] + [(i.quad, i.id, i.z) for i in elements.images] + [(s.quad, s.id, s.z) for s in elements.shapes] + [(t.quad, t.id, t.z) for t in tables]
     reading = [i[1] for i in sorted(items, key=lambda i: (round(i[0].bbox[1], 2), i[0].bbox[0]))]
     z_order = [i[1] for i in sorted(items, key=lambda i: i[2])]
     guides_x = _guides([i[0].bbox[0] for i in items] + [i[0].bbox[2] for i in items], c["left_align_tolerance"])
     guides_y = _guides([i[0].bbox[1] for i in items] + [i[0].bbox[3] for i in items], c["left_align_tolerance"])
-    if elements.table_regions:
-        notes.append("表格結構（列、欄、合併儲存格）尚未實作。")
-
     layout = PageLayout(
         page_index=page, paragraphs=paragraphs, text_boxes=text_boxes, reading_order=reading, z_order=z_order,
-        links=links, guides_x=guides_x, guides_y=guides_y, notes=notes,
+        links=links, guides_x=guides_x, guides_y=guides_y, notes=notes, tables=tables,
     )
     return _apply_corrections(layout, corrections)
+
+
+def _covered(segments: list[tuple[float, float, float, float]], vertical: bool, at: float, lo: float, hi: float, tol: float) -> bool:
+    """在位置 at、範圍 lo 到 hi 之間，是否有格線線段蓋住至少六成。"""
+    need = 0.6 * (hi - lo)
+    got = 0.0
+    for x0, y0, x1, y1 in segments:
+        if vertical and abs(x0 - x1) <= tol and abs((x0 + x1) / 2 - at) <= tol:
+            a, b = min(y0, y1), max(y0, y1)
+        elif not vertical and abs(y0 - y1) <= tol and abs((y0 + y1) / 2 - at) <= tol:
+            a, b = min(x0, x1), max(x0, x1)
+        else:
+            continue
+        got += max(0.0, min(b, hi) - max(a, lo))
+    return got >= need
+
+
+def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dict) -> tuple[list[TableStructure], list[Paragraph], set[str]]:
+    """s4.tables：③的表格區 → 列、欄、合併儲存格、表頭，並把文字行分給儲存格。
+
+    合併儲存格的判斷：相鄰兩格之間的格線若不存在（線段蓋不到六成），兩格就是同一格。
+    回傳（表格結構、儲存格內的段落、被表格吸收的文字行編號）。"""
+    step = f"{NAME}.tables@{VERSION}"
+    tol = c.get("table_line_tolerance", 0.004)
+    out: list[TableStructure] = []
+    pars: list[Paragraph] = []
+    used: set[str] = set()
+    for reg in elements.table_regions:
+        ys, xs = reg.h_lines, reg.v_lines
+        nr, nc = len(ys) - 1, len(xs) - 1
+        parent = {(r, k): (r, k) for r in range(nr) for k in range(nc)}
+
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+
+        if reg.ruled:
+            for r in range(nr):
+                for k in range(nc - 1):  # 左右相鄰：看中間的直線
+                    if not _covered(reg.segments, True, xs[k + 1], ys[r], ys[r + 1], tol):
+                        parent[find((r, k + 1))] = find((r, k))
+            for r in range(nr - 1):
+                for k in range(nc):  # 上下相鄰：看中間的橫線
+                    if not _covered(reg.segments, False, ys[r + 1], xs[k], xs[k + 1], tol):
+                        parent[find((r + 1, k))] = find((r, k))
+        groups: dict[tuple, list[tuple[int, int]]] = {}
+        for key in parent:
+            groups.setdefault(find(key), []).append(key)
+        spans = []
+        for members in groups.values():
+            r0, r1 = min(m[0] for m in members), max(m[0] for m in members)
+            k0, k1 = min(m[1] for m in members), max(m[1] for m in members)
+            if len(members) == (r1 - r0 + 1) * (k1 - k0 + 1):
+                spans.append((r0, k0, r1 - r0 + 1, k1 - k0 + 1))
+            else:  # 不是長方形的合併：拆回單格
+                spans += [(m[0], m[1], 1, 1) for m in members]
+        cells: list[TableCell] = []
+        for r, k, rs, cs in sorted(spans):
+            q = Quad.from_rect(xs[k], ys[r], xs[k + cs], ys[r + rs])
+            l, t, rr, b = q.bbox
+            mine = [ln for ln in lines if ln.id not in used and l <= ln.quad.center.x <= rr and t <= ln.quad.center.y <= b]
+            mine.sort(key=lambda ln: (round(ln.baseline[0].y, 4), ln.baseline[0].x))
+            used.update(ln.id for ln in mine)
+            pids = []
+            for g in _cell_groups(mine):
+                pq = union_quad([ln.quad for ln in g])
+                inner = [b2.baseline[0].y - b1.baseline[0].y for b1, b2 in zip(g, g[1:])]
+                pid = make_element_id(spec.page_index, "par", pq, g[0].id)
+                pars.append(Paragraph(
+                    id=pid, line_ids=[ln.id for ln in g], quad=pq, alignment=_cell_alignment(g, q, tol),
+                    role=measured(Role.BODY, 0.6, Provenance.INFERRED, step), line_pitch=statistics.median(inner) if inner else None,
+                    joiners=[_joiner(a.text, b2.text) for a, b2 in zip(g, g[1:])],
+                ))
+                pids.append(pid)
+            cells.append(TableCell(row=r, col=k, row_span=rs, col_span=cs, quad=q, paragraph_ids=pids))
+        # 表頭：第一列的字全是粗體，或第一列有自己的底色
+        by_id = {ln.id: ln for ln in lines}
+        par_by_id = {p.id: p for p in pars}
+        first = [cl for cl in cells if cl.row == 0]
+        first_lines = [by_id[lid] for cl in first for pid in cl.paragraph_ids for lid in par_by_id[pid].line_ids]
+        bold = bool(first_lines) and all(r.bold.value for ln in first_lines for r in ln.runs)
+        filled = any(abs(f[0].center.y - (ys[0] + ys[1]) / 2) < (ys[1] - ys[0]) / 2 for f in reg.cell_fills) and not any(abs(f[0].center.y - (ys[-2] + ys[-1]) / 2) < (ys[-1] - ys[-2]) / 2 for f in reg.cell_fills)
+        header_rows = 1 if (bold or filled) and nr > 1 else 0
+        if header_rows:
+            cells = [cl.model_copy(update={"header": cl.row < header_rows}) for cl in cells]
+        out.append(TableStructure(
+            id=reg.id.replace("-tbl-", "-table-"), region_id=reg.id, quad=reg.quad, z=reg.z, row_lines=ys, col_lines=xs,
+            cells=cells, header_rows=header_rows, ruled=reg.ruled, confidence=reg.confidence * (0.95 if all(cs == 1 and rs == 1 for _, _, rs, cs in spans) else 0.8),
+        ))
+    return out, pars, used
+
+
+def _cell_groups(lines: list[TextLine]) -> list[list[TextLine]]:
+    """儲存格內的行 → 段落：行距明顯變大、或字級改變就分段。"""
+    groups: list[list[TextLine]] = []
+    for ln in lines:
+        if groups:
+            prev = groups[-1][-1]
+            pitch = ln.baseline[0].y - prev.baseline[0].y
+            if 0 < pitch <= 1.6 * max(prev.font_size, ln.font_size) and abs(ln.font_size - prev.font_size) <= 0.05 * prev.font_size:
+                groups[-1].append(ln)
+                continue
+        groups.append([ln])
+    return groups
+
+
+def _cell_alignment(lines: list[TextLine], cell: Quad, tol: float):
+    step = f"{NAME}.align@{VERSION}"
+    l, _, r, _ = cell.bbox
+    lefts = [ln.quad.bbox[0] - l for ln in lines]
+    rights = [r - ln.quad.bbox[2] for ln in lines]
+    if all(abs(a - b) <= max(tol, 0.08 * (a + b)) for a, b in zip(lefts, rights)) and min(lefts) > 2 * tol:
+        return measured(Align.CENTER, 0.75, Provenance.MEASURED, step)
+    if all(b < a * 0.6 for a, b in zip(lefts, rights)):
+        return measured(Align.RIGHT, 0.75, Provenance.MEASURED, step)
+    return measured(Align.LEFT, 0.8, Provenance.MEASURED, step)
 
 
 def _alignment(group: list[TextLine], block: list[TextLine], spec: PageSpec, c: dict):

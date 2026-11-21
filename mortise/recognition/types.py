@@ -100,6 +100,10 @@ class ShapeFit:
     corner_radius_px: Optional[float] = None  # rounded_rect 才有
     polygon: Optional[np.ndarray] = None  # (N, 2)，polygon 才有
     fit_error_px: float = 0.0  # 擬合後輪廓與實際輪廓的平均距離
+    # ---- 以下為 regions.py 追加（皆有預設值，不影響既有呼叫） ----
+    confidence: float = 0.0  # 幾何類型判定的信心值（0 到 1）：依殘差與「最佳對次佳模型」的差距
+    candidates: list[tuple[str, float]] = field(default_factory=list)  # 各幾何模型的平均擬合誤差（像素），由小到大；供⑤改判
+    estimates: dict[str, Estimate] = field(default_factory=dict)  # 原始量測值與誤差：width_px、height_px、angle_deg、corner_radius_px、stroke_width_px、fill_mad 等
 
 
 @dataclass
@@ -121,6 +125,11 @@ class Region:
     shape: Optional[ShapeFit] = None  # kind == "shape" 才有
     table: Optional[TableGrid] = None  # kind == "table" 才有
     notes: list[str] = field(default_factory=list)
+    # ---- 以下為 regions.py 追加（皆有預設值，不影響既有呼叫） ----
+    kind_candidates: list[tuple[str, float]] = field(default_factory=list)  # 類型候選與分數，由高到低（不定案，交⑤）
+    features: dict[str, float] = field(default_factory=dict)  # 分類用的特徵原始值（色彩數、平坦比、高頻比…）
+    outline: Optional[ShapeFit] = None  # 照片與插畫的外形擬合（rect、rounded_rect、ellipse）；擬合不好則為 None
+    occluded_mask: Optional[np.ndarray] = None  # bool，形狀同 mask：被文字或其他區域蓋住、由補全推得的部分
 
 
 # ---------------------------------------------------------------- 背景（background.py）
@@ -134,6 +143,12 @@ class BackgroundResult:
     generated_boxes: list[tuple[int, int, int, int]]  # 哪些區域是生成（修補）出來的；純色與漸層擬合不算生成
     is_blank: bool  # 底圖是否只是單一顏色（是的話輸出時不需要底圖）
     notes: list[str] = field(default_factory=list)
+    confidence: float = 1.0  # 整體品質估計（0 到 1）：擬合殘差、修補面積、遮罩寬度、周圍複雜度
+    generated_mask: Optional[np.ndarray] = None  # bool，與工作影像同尺寸：逐像素標示「修補生成」的像素
+    generated_fraction: float = 0.0  # 生成像素佔全頁的比例（還原度報告用）
+    fit_residual: Optional[float] = None  # 未遮住的背景像素對所選模型的殘差（ΔE，第 90 百分位）
+    gradient: Optional[dict] = None  # 漸層參數：{"degree", "coeffs"（3×k，RGB 各一列）, "basis"}；model="gradient" 才有
+    regions: list[dict] = field(default_factory=list)  # 分區處理的逐區紀錄：{"bbox", "method", "residual", "confidence"}
 
 
 # ---------------------------------------------------------------- 頁面幾何（page_geometry.py、page_size.py）
@@ -146,6 +161,11 @@ class PageQuad:
     method: str  # "edge_fit"、"contour"、"full_image"（找不到邊，以整張圖為頁面）
     aspect_ratio: float  # 攤平後的高 ÷ 寬（已由透視關係估計）
     notes: list[str] = field(default_factory=list)
+    corner_error_px: Optional[np.ndarray] = None  # (4,)：每個角的位置誤差（像素，約一個標準差）
+    aspect: Optional[Estimate] = None  # 長寬比（高 ÷ 寬）的量測值、誤差範圍、信心值
+    aspect_method: str = ""  # "perspective"（由透視反推焦距）、"side_ratio"（退回邊長比）、"image"（整張圖）
+    focal_px: Optional[float] = None  # 由四角反推的焦距（像素）；解不穩定時留空
+    edge_support: Optional[list[float]] = None  # 上、右、下、左四邊有邊緣支持的長度比例（0 到 1）
 
 
 @dataclass
@@ -155,3 +175,6 @@ class SizeCandidate:
     height_pt: float
     confidence: float
     reason: str  # 白話說明依據
+    aspect_score: float = 1.0  # 只看長寬比的吻合度（0 到 1；以長寬比誤差範圍為尺度）
+    family: str = ""  # 規格家族，例如 "ISO A 直"（長寬比相同的尺寸歸同一家族）
+    scale_evidence: bool = False  # 是否有絕對尺度線索（dpi、字級）參與排序

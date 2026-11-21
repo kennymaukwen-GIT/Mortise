@@ -31,7 +31,7 @@ from ..tools import pdfium as pdf
 from . import s2_page, s3_recognize
 
 NAME = "s7"
-VERSION = "1"
+VERSION = "2"
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -81,7 +81,7 @@ def run(
     for p in pages:
         if p.target_similarity is None:
             continue
-        boxes = [e for e in p.elements if e.kind == "text_box"]
+        boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
         good = [e for e in boxes if e.text_match and e.linebreak_match and (e.position_error_pt or 0.0) <= c["position_tolerance_pt"]]
         text_score = len(good) / len(boxes) if boxes else 1.0
         scores.append(0.5 * p.target_similarity + 0.5 * text_score)
@@ -124,6 +124,15 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
         if substituted:
             names = sorted({f"{r.font.family.value} → {r.font.verification_family}" for r in runs if r.font.is_substituted})
             issues.append(Issue(severity=Severity.INFO, code="font_substituted", element_id=tb.id, message="驗證時用替代字型：" + "、".join(names) + "。輸出檔仍寫原字型名稱，你的電腦若沒有該字型，開啟時會被換掉。"))
+    for t in sp.tables:
+        lt = next(x for x in pl.tables if x.id == t.id)
+        tconf = lt.confidence
+        reports.append(ElementReport(element_id=t.id, kind="table", fields={
+            "text": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED,
+            "structure": FieldStatus.MEASURED,  # 列欄與合併儲存格是④從格線推出來的
+            "borders": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED,
+            "number_format": FieldStatus.MEASURED,
+        }, confidence=tconf))
     for im in sp.images:
         reports.append(ElementReport(element_id=im.id, kind="image", fields={"pixels": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED, "position": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED}))
     for s in sp.shapes:
@@ -171,6 +180,18 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                 new_elements = []
                 issues = list(report.issues)
                 for e in report.elements:
+                    if e.kind == "table":
+                        lt = next(x for x in pl.tables if x.id == e.element_id)
+                        wrong = []
+                        for cell in lt.cells:
+                            expect_c = "".join(src_lines[lid].text for pid in cell.paragraph_ids for lid in pars[pid].line_ids)
+                            got_c = "".join(t.text for t in sorted(assigned.get(f"{e.element_id}#{cell.row},{cell.col}", []), key=lambda t: (round(t.baseline[0].y, 4), t.baseline[0].x)))
+                            if _norm(expect_c) != _norm(got_c):
+                                wrong.append(f"第 {cell.row + 1} 列第 {cell.col + 1} 欄")
+                        new_elements.append(e.model_copy(update={"text_match": not wrong, "linebreak_match": not wrong}))
+                        if wrong:
+                            issues.append(Issue(severity=Severity.ERROR, code="table_cell_mismatch", element_id=e.element_id, message=f"表格有 {len(wrong)} 格的文字與原圖不一致：" + "、".join(wrong[:6]) + ("…" if len(wrong) > 6 else "")))
+                        continue
                     if e.kind != "text_box":
                         new_elements.append(e)
                         continue
@@ -218,18 +239,35 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
 
 
 def _assign(lines: list[TextLine], page, w: float) -> dict[str, list[TextLine]]:
-    """把渲染結果的每一行，分給最接近的文字框。"""
+    """把渲染結果的每一行，分給它所在的文字框或表格儲存格（旋轉的框先轉回框自己的座標再判斷）。
+    表格儲存格的鍵是「表格編號#列,欄」。"""
+    frames = []  # （鍵、中心 x、中心 y、寬、高、角度）
+    for tb in page.text_boxes:
+        b = tb.box
+        frames.append((tb.id, b.x + b.w / 2, b.y + b.h / 2, b.w, b.h, math.radians(b.rotation)))
+    for t in page.tables:
+        xs = [t.box.x]
+        for cw in t.col_widths_pt:
+            xs.append(xs[-1] + cw)
+        ys = [t.box.y]
+        for rh in t.row_heights_pt:
+            ys.append(ys[-1] + rh)
+        for cell in t.cells:
+            x0, x1 = xs[cell.col], xs[cell.col + cell.col_span]
+            y0, y1 = ys[cell.row], ys[cell.row + cell.row_span]
+            frames.append((f"{t.id}#{cell.row},{cell.col}", (x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0, 0.0))
     out: dict[str, list[TextLine]] = {}
     for line in lines:
-        cx, cy = line.quad.center.x * w, line.quad.center.y * w
+        px, py = line.quad.center.x * w, line.quad.center.y * w
+        size = line.font_size * w
         best, best_d = None, None
-        for tb in page.text_boxes:
-            b = tb.box
-            dx = max(b.x - cx, 0.0, cx - (b.x + b.w))
-            dy = max(b.y - cy, 0.0, cy - (b.y + b.h))
-            d = math.hypot(dx, dy)
+        for key, cx, cy, fw, fh, ang in frames:
+            dx, dy = px - cx, py - cy
+            lx = dx * math.cos(ang) + dy * math.sin(ang)  # 轉回框自己的座標
+            ly = -dx * math.sin(ang) + dy * math.cos(ang)
+            d = math.hypot(max(0.0, abs(lx) - fw / 2), max(0.0, abs(ly) - fh / 2))
             if best_d is None or d < best_d:
-                best, best_d = tb.id, d
-        if best is not None and best_d <= 0.05 * w:
+                best, best_d = key, d
+        if best is not None and best_d <= max(2.0 * size, 0.01 * w):
             out.setdefault(best, []).append(line)
     return out
