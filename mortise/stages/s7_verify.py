@@ -59,12 +59,14 @@ def run(
     notes: list[str] = ["7A 中性驗證尚未實作；目前的分數全部來自 7B 目標驗證。"]
     pages = [_field_report(spec, el, layout, styled) for spec, el in zip(specs, elements)]
     target_engine = None
+    target_render = None
     proposals: list[Correction] = []
 
     pptx = next((o for o in outputs if o.format == OutputFormat.PPTX), None)
     if pptx is not None and libreoffice.available():
         try:
             rendered = libreoffice.to_pdf(store.blob_path(pptx.file), c["libreoffice_timeout_s"])
+            target_render = store.put_blob(rendered, "application/pdf", "pdf")
             target_engine = f"{libreoffice.version()}（替身引擎，不是 PowerPoint；斷行與字距可能與 PowerPoint 不同）"
             pages, proposals = _target_verify(rendered, specs, elements, layout, styled, pages, cfg, store, round_no)
         except libreoffice.RenderError as e:
@@ -91,7 +93,7 @@ def run(
     notes.extend(styled.notes)
     return FidelityReport(
         target_engine=target_engine, pages=pages, overall_score=(sum(scores) / len(scores)) if scores else None,
-        field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes,
+        field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes, target_render=target_render,
     )
 
 
@@ -198,8 +200,15 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                     lbox = next(b for b in pl.text_boxes if b.id == e.element_id)
                     expect: list[TextLine] = [src_lines[lid] for pid in lbox.paragraph_ids for lid in pars[pid].line_ids]
                     got = sorted(assigned.get(e.element_id, []), key=lambda t: (round(t.baseline[0].y, 4), t.baseline[0].x))
-                    text_ok = _norm("".join(t.text for t in expect)) == _norm("".join(t.text for t in got))
-                    breaks_ok = text_ok and len(expect) == len(got) and all(_norm(a.text) == _norm(b.text) for a, b in zip(expect, got))
+                    stb = next(t for t in sp.text_boxes if t.id == e.element_id)
+                    if any(p.text_locked for p in stb.paragraphs):
+                        # 使用者改過文字：以成品文件的文字為準，斷行只比行數
+                        want = _norm("".join(r.text for p in stb.paragraphs for r in p.runs))
+                        text_ok = want == _norm("".join(t.text for t in got))
+                        breaks_ok = text_ok and len(got) == sum(p.source_line_count for p in stb.paragraphs)
+                    else:
+                        text_ok = _norm("".join(t.text for t in expect)) == _norm("".join(t.text for t in got))
+                        breaks_ok = text_ok and len(expect) == len(got) and all(_norm(a.text) == _norm(b.text) for a, b in zip(expect, got))
                     pos = None
                     dx = dy = 0.0
                     if got:

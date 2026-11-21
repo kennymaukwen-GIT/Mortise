@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from .common import SCHEMA_VERSION, Model
+from .common import SCHEMA_VERSION, BlobRef, Model
 from .correction import Correction
 
 
@@ -61,3 +61,4 @@ class FidelityReport(Model):
     corrections_proposed: list[Correction] = []
     round: int = 0
     notes: list[str] = []
+    target_render: Optional[BlobRef] = None  # 7B 目標驗證渲染出來的 PDF（前端疊圖預覽用）

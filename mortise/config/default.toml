@@ -53,6 +53,7 @@ position_tolerance_pt = 1.5          # 位置誤差合格線（pt，初始值）
 position_fix_threshold_pt = 0.3      # 位置誤差超過此值就開修正單把文字框移回去（pt，初始值）
 similarity_pass = 0.97               # 整頁相似度合格線（0 到 1，初始值）
 max_rounds = 2                       # 修正迴圈最多幾輪
+low_confidence = 0.7                 # 信心值低於此值的元素，在預覽中標出來請使用者確認（初始值）
 libreoffice_timeout_s = 120          # 目標渲染逾時（秒）
 
 # 字型對應表：推論的字型 → 伺服器上拿來驗證的開放授權字型。

@@ -362,7 +362,7 @@ def _tag_styles(page: StyledPage, sig_to_id: dict[tuple, str]) -> StyledPage:
 
 def _apply_corrections(doc: StyledDoc, corrections: list[Correction], subs: dict[str, str]) -> StyledDoc:
     """⑤接受的修正（指定文字框或段落的編號）：
-    font_family、font_size_pt、color（十六進位）、align；
+    font_family、font_size_pt、color（十六進位）、align、text（改一段的文字，指名段落編號）；
     以及⑦驗證開的 width_adjust_pt（修正斷行）、offset_pt（平移文字框）。
     """
     if not corrections:
@@ -389,6 +389,13 @@ def _apply_corrections(doc: StyledDoc, corrections: list[Correction], subs: dict
                         continue
                     if c.field == "align":
                         paragraphs[i] = p.model_copy(update={"align": Align(c.new_value)})
+                        continue
+                    if c.field == "text":
+                        if hits_box and len(paragraphs) > 1:
+                            continue  # 指名文字框但框裡有多段：不知道要改哪一段
+                        head = p.runs[0] if p.runs else None
+                        if head is not None:
+                            paragraphs[i] = p.model_copy(update={"runs": [head.model_copy(update={"text": str(c.new_value)})], "text_locked": True})
                         continue
                     runs = []
                     for r in p.runs:

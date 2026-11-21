@@ -18,7 +18,7 @@ from ..artifacts import Correction, CorrectionSource, ElementList, FidelityRepor
 from ..artifacts.layout import PageLayout
 from ..config import Config
 from ..stages import s1_input, s2_page, s3_recognize, s4_structure, s5_settings, s6_export, s7_verify
-from .store import Store
+from .store import Store, atomic_write_text
 
 M = TypeVar("M", bound=BaseModel)
 Event = Callable[[dict[str, Any]], None]
@@ -48,7 +48,7 @@ class Pipeline:
 
     # ---------- 工作狀態 ----------
     def _save_state(self) -> None:
-        self._state_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=1), encoding="utf-8")
+        atomic_write_text(self._state_path, json.dumps(self.state, ensure_ascii=False, indent=1))
 
     def start(self, source: Path, filename: str, intent: Optional[Intent] = None) -> None:
         """登記要處理的檔案（複製一份到工作目錄）。"""

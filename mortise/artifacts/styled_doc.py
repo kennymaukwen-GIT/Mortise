@@ -52,6 +52,7 @@ class StyledParagraph(Model):
     role: Role = Role.UNKNOWN
     style_id: Optional[str] = None
     source_line_count: int = 1  # 原圖中這段佔幾行（⑦比對斷行用）
+    text_locked: bool = False  # 使用者改過這段的文字（⑦改以使用者的文字為準）
 
 
 class Box(Model):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 from pathlib import Path
 from typing import Type, TypeVar
 
@@ -16,6 +18,14 @@ M = TypeVar("M", bound=BaseModel)
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """先寫到暫存檔再改名：其他執行緒（例如 API 查詢狀態）永遠不會讀到寫到一半的檔案。"""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 class Store:
@@ -33,7 +43,9 @@ class Store:
         digest = sha256_bytes(data)
         path = self.root / "blobs" / f"{digest}.{ext}"
         if not path.exists():
-            path.write_bytes(data)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
         return BlobRef(sha256=digest, media_type=media_type, size=len(data), ext=ext)
 
     def blob_path(self, ref: BlobRef) -> Path:
@@ -50,10 +62,10 @@ class Store:
 
     def save(self, name: str, artifact: BaseModel, cache_key: str = "") -> str:
         text = artifact.model_dump_json(indent=1)
-        self._artifact_path(name).write_text(text, encoding="utf-8")
+        atomic_write_text(self._artifact_path(name), text)
         digest = sha256_bytes(text.encode("utf-8"))[:16]
         self.manifest[name] = {"key": cache_key, "hash": digest}
-        self._manifest_path.write_text(json.dumps(self.manifest, indent=1), encoding="utf-8")
+        atomic_write_text(self._manifest_path, json.dumps(self.manifest, indent=1))
         return digest
 
     def load(self, name: str, cls: Type[M]) -> M:
