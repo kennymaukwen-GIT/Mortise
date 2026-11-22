@@ -54,7 +54,10 @@ def paint(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def outlined(tmp_path_factory):
-    store, pages = _recognize(tmp_path_factory.mktemp("outlined"), FIX / "vector_outlined.pdf")
+    """關掉「外框字轉回文字」時的結果：檢查分群本身（預設會轉成文字，見 test_outlined_text_becomes_text_by_default）。"""
+    cfg = Config.load()
+    cfg.data["recognize"]["pdf_outlined_to_text"] = False
+    store, pages = _recognize(tmp_path_factory.mktemp("outlined"), FIX / "vector_outlined.pdf", cfg)
     return store, [el for _, el in pages]
 
 
@@ -369,6 +372,17 @@ def test_outlined_text_is_its_own_group(outlined):
     assert second.shapes == [] and second.background.image is None and not any("留在底圖" in n for n in second.notes)
     assert max(len(p.path) for p in second.vectors[1].paths) > 500
     assert [v.z for v in second.vectors] == sorted(v.z for v in second.vectors)
+
+
+def test_outlined_text_becomes_text_by_default(tmp_path):
+    """預設會把外框字轉回文字（細節見 tests/test_flattened.py）：那幾群外框與對應的圖片不再輸出，其他圖形照舊。"""
+    _, pages = _recognize(tmp_path, FIX / "vector_outlined.pdf")
+    (_, first), (_, second) = pages
+    assert [t.text for t in first.texts] == ["Outlined text fixture: the lines below are paths, not text.", "Summer sale starts today", "Riverside Park, 10:00", "Whole paragraph drawn", "as one single path"]
+    assert first.vectors == [] and first.images == [] and Counter(s.geometry.value for s in first.shapes) == {"ellipse": 1, "path": 12}
+    assert [t.text for t in second.texts] == ["SALE"]
+    assert [(v.kind, len(v.paths)) for v in second.vectors] == [("unknown", 321)] and len(second.images) == 1
+    assert all(any("原為外框字" in n for n in t.notes) for t in first.texts[1:] + second.texts)
 
 
 def test_glyph_rows_work_on_vector_paths(outlined):

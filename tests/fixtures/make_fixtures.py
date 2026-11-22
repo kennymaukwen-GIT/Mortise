@@ -2,6 +2,7 @@
 
     python tests/fixtures/make_fixtures.py            全部重新產生
     python tests/fixtures/make_fixtures.py vectors    只產生向量圖的三個（vector_*.pdf；不需要 LibreOffice，輸出的位元組固定）
+    python tests/fixtures/make_fixtures.py flattened  只產生被扁平化內容的兩個（flattened_*.pdf；不需要 LibreOffice，輸出的位元組固定）
 """
 
 from __future__ import annotations
@@ -525,12 +526,12 @@ q 0.866 0.5 -0.5 0.866 530 70 cm -8 -12 56 50 re W n /Kept Do Q
     pdf.save(HERE / "vector_paint.pdf", static_id=True)
 
 
-def _outline_text(c, font_path: str, text: str, x: float, y: float, size: float, single_path: bool = False, lines: list[str] | None = None, leading: float = 1.25) -> float:
-    """把文字畫成外框（每個字一條填色路徑；single_path 時整段只用一條路徑）。回傳最後一行結尾的 x。"""
+def _outline_text(c, font_path: str, text: str, x: float, y: float, size: float, single_path: bool = False, lines: list[str] | None = None, leading: float = 1.25, font_number: int = 0) -> float:
+    """把文字畫成外框（每個字一條填色路徑；single_path 時整段只用一條路徑）。回傳最後一行結尾的 x。font_number 是字型集合檔（.ttc）裡的第幾個。"""
     from fontTools.pens.basePen import BasePen
     from fontTools.ttLib import TTFont
 
-    font = TTFont(font_path)
+    font = TTFont(font_path, fontNumber=font_number) if font_path.endswith(".ttc") else TTFont(font_path)
     glyphs, cmap, scale = font.getGlyphSet(), font.getBestCmap(), size / font["head"].unitsPerEm
 
     class Pen(BasePen):  # TrueType 的二次曲線由 BasePen 升成三次曲線（數學上相等）
@@ -632,9 +633,148 @@ def vector_outlined() -> None:
     c.save()
 
 
+# ====================================================================== 被扁平化的內容（tests/test_flattened.py）
+#
+#   flattened_outlined.pdf  整頁的字都轉成外框（沒有任何真的文字）：標題、內文（一行裡有一個紅字）、中文、圖說，加一個裝飾圖形
+#   flattened_embedded.pdf  第 1 頁：原生標題與內文，加一張嵌入的圖表截圖（圖裡有字、長條、座標軸）
+#                           第 2 頁：原生標題，加一張照片（不可以被拆）
+#                           第 3 頁：整頁一張掃描的公文（JPEG），上面疊一行原生的紅字（①判成混合 PDF）
+# 圖片裡的字畫在已知位置（PIL 以基線左端為錨點），測試依 FLATTENED_TRUTH 換算成頁面座標對答案。
+
+_WQY = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
+
+FLATTENED_TRUTH = {
+    # 外框字：（文字、字型、字級 pt、基線左端的 PDF 座標 x、y、顏色）；同一行分段畫的寫成同一行
+    "outlined": [
+        ("Flattened brochure", "bold", 30.0, 60.0, 760.0, "1F3A5F"),
+        ("Every word on this page is a path.", "regular", 14.0, 60.0, 715.0, "222222"),
+        ("Prices start at $49 per month.", "regular", 14.0, 60.0, 695.0, "222222"),
+        ("文件反編譯器測試", "wqy", 20.0, 60.0, 650.0, "1F3A5F"),
+        ("Printed 2026-11-22 in Taipei", "regular", 10.0, 60.0, 620.0, "555555"),
+    ],
+    # 圖表截圖：1000 × 640 像素，放在 PDF 的 x=60、頁頂往下 120 pt，寬 475 pt
+    "chart": {"pixels": (1000, 640), "x": 60.0, "top": 120.0, "width": 475.0,
+              "texts": [("Quarterly Sales 2026", "bold", 44, 40, 70), ("Units sold per quarter", "regular", 28, 40, 112)],
+              "bars": [(160 + 200 * i, 560 - hgt, 280 + 200 * i, 560, col) for i, (hgt, col) in enumerate(
+                  [(220, (46, 134, 171)), (300, (242, 193, 78)), (260, (232, 106, 51)), (360, (142, 192, 124))])],
+              "labels": [(f"Q{i + 1}", 220 + 200 * i, 605) for i in range(4)]},
+    # 掃描的公文：1240 × 1754 像素（A4、150 dpi），佔滿整頁
+    "memo": {"pixels": (1240, 1754),
+             "texts": [("MEMORANDUM", "bold", 48, 120, 200), ("To: All staff", "regular", 32, 120, 290),
+                       ("Subject: Office move on December 1", "regular", 32, 120, 340),
+                       ("Please pack your desks by Friday afternoon.", "regular", 30, 120, 440),
+                       ("Movers arrive at nine in the morning.", "regular", 30, 120, 490),
+                       ("Thank you for your patience.", "regular", 30, 120, 540)]},
+}
+
+
+def flattened_outlined() -> None:
+    from reportlab.lib.colors import HexColor
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("flattened_outlined.pdf", (w, h))
+    fonts = {"bold": _SANS_BOLD, "regular": _SANS, "wqy": _WQY}
+    for text, font, size, x, y, color in FLATTENED_TRUTH["outlined"]:
+        c.setFillColor(HexColor("#" + color))
+        if text.startswith("Prices"):  # 一行分三段畫，中間的價格是紅字
+            x = _outline_text(c, fonts[font], "Prices start at ", x, y, size)
+            c.setFillColor(HexColor("#C8553D"))
+            x = _outline_text(c, fonts[font], "$49", x, y, size)
+            c.setFillColor(HexColor("#" + color))
+            _outline_text(c, fonts[font], " per month.", x, y, size)
+        else:
+            _outline_text(c, fonts[font], text, x, y, size)
+    c.setFillColor(HexColor("#2E86AB"))  # 裝飾：一片葉子形狀加一個圓，不是字
+    p = c.beginPath()
+    p.moveTo(450, 740)
+    p.curveTo(470, 790, 520, 790, 530, 760)
+    p.curveTo(510, 730, 470, 720, 450, 740)
+    p.close()
+    c.drawPath(p, stroke=0, fill=1)
+    c.circle(490, 700, 18, stroke=0, fill=1)
+    c.showPage()
+    c.save()
+
+
+def _flattened_images() -> tuple[Image.Image, Image.Image]:
+    from PIL import ImageFont
+
+    def font(kind: str, px: int):
+        return ImageFont.truetype(_SANS_BOLD if kind == "bold" else _SANS, px)
+
+    chart = FLATTENED_TRUTH["chart"]
+    img = Image.new("RGB", chart["pixels"], (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    for text, kind, px, x, y in chart["texts"]:
+        d.text((x, y), text, font=font(kind, px), fill=(31, 58, 95) if kind == "bold" else (90, 90, 90), anchor="ls")
+    d.line((100, 170, 100, 560), fill=(60, 60, 60), width=3)
+    d.line((100, 560, 940, 560), fill=(60, 60, 60), width=3)
+    for x0, y0, x1, y1, col in chart["bars"]:
+        d.rectangle((x0, y0, x1 - 1, y1 - 1), fill=col)
+        d.text(((x0 + x1) / 2, y0 - 14), str(560 - y0), font=font("bold", 26), fill=(40, 40, 40), anchor="ms")
+    for text, x, y in chart["labels"]:
+        d.text((x, y), text, font=font("regular", 28), fill=(40, 40, 40), anchor="ms")
+    memo = FLATTENED_TRUTH["memo"]
+    scan = Image.new("RGB", memo["pixels"], (252, 251, 248))
+    d = ImageDraw.Draw(scan)
+    for text, kind, px, x, y in memo["texts"]:
+        d.text((x, y), text, font=font(kind, px), fill=(25, 25, 30), anchor="ls")
+    d.line((120, 380, 1120, 380), fill=(25, 25, 30), width=2)
+    return img, scan
+
+
+def flattened_embedded() -> None:
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.utils import ImageReader
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("flattened_embedded.pdf", (w, h))
+    chart, scan = _flattened_images()
+    # 第 1 頁：原生文字 + 圖表截圖
+    c.setFillColor(HexColor("#1F3A5F"))
+    c.setFont("LSB", 24)
+    c.drawString(60, h - 80, "Annual Report Highlights")
+    c.setFillColor(HexColor("#333333"))
+    c.setFont("LS", 12)
+    c.drawString(60, h - 105, "The chart below was pasted as a picture.")
+    info = FLATTENED_TRUTH["chart"]
+    ih = info["width"] * info["pixels"][1] / info["pixels"][0]
+    buf = io.BytesIO()
+    chart.save(buf, "PNG")
+    buf.seek(0)
+    c.drawImage(ImageReader(buf), info["x"], h - info["top"] - ih, width=info["width"], height=ih)
+    c.setFont("LS", 12)
+    c.drawString(60, h - info["top"] - ih - 30, "Source: internal sales data.")
+    c.showPage()
+    # 第 2 頁：照片
+    c.setFillColor(HexColor("#1F3A5F"))
+    c.setFont("LSB", 24)
+    c.drawString(60, h - 80, "Field photo")
+    photo = io.BytesIO()
+    Image.open(_photo(900, 600, seed=5)).save(photo, "JPEG", quality=85)  # 照片多半是 JPEG
+    photo.seek(0)
+    c.drawImage(ImageReader(photo), 60, h - 120 - 316.7, width=475, height=316.7)
+    c.showPage()
+    # 第 3 頁：整頁掃描 + 原生紅字
+    buf = io.BytesIO()
+    scan.save(buf, "JPEG", quality=90)
+    buf.seek(0)
+    c.drawImage(ImageReader(buf), 0, 0, width=w, height=h)
+    c.setFillColor(HexColor("#C8553D"))
+    c.setFont("LSB", 18)
+    c.drawString(360, h - 50, "APPROVED 2026-11-22")
+    c.showPage()
+    c.save()
+
+
 if __name__ == "__main__":
     import sys
 
+    if sys.argv[1:] == ["flattened"]:
+        flattened_outlined()
+        flattened_embedded()
+        print(sorted(p.name for p in HERE.glob("flattened_*.pdf")))
+        sys.exit(0)
     if sys.argv[1:] != ["vectors"]:
         slide_dark()
         doc_a4()
@@ -643,4 +783,7 @@ if __name__ == "__main__":
     vector_logo()
     vector_paint()
     vector_outlined()
+    if sys.argv[1:] != ["vectors"]:
+        flattened_outlined()
+        flattened_embedded()
     print(sorted(p.name for p in HERE.glob("*.pdf")))

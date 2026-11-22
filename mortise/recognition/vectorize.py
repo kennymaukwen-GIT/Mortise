@@ -54,9 +54,15 @@ DEFAULTS: dict = {
     "explain_tol": 9.0,  # 邊緣像素離「兩色連線」多遠以內算混色（色階）
     "explain_slack": 0.1,  # 另外容許兩色距離的這個比例（混色不完全線性、JPEG 的邊緣振鈴）
     "explain_radii": [2, 4],  # 往八個方向找鄰近核心的距離（像素）
+    "chroma_weight": 0.4,  # 量得到雜訊時，混色判斷裡色度方向的權重（JPEG 的色度縮小取樣只抹寬色度，亮度仍準）
+    "chroma_weight_sigma": 1.0,  # 雜訊（每通道標準差，色階）至少這麼大才降低色度權重
+    "chroma_subsampled_below": 0.7,  # 色度邊緣的銳利程度不到亮度的這個比例，判定色度被縮小取樣過（JPEG 4:2:0）
+    "overshoot": 0.2,  # 量得到雜訊時，容許邊緣像素超出兩色連線兩端的比例（壓縮的過衝）
+    "overshoot_clean": 0.12,  # 沒量到雜訊時容許的過衝比例（雙三次放大的過衝約一成）
+    "ring_fraction": 0.22,  # 量得到雜訊時，貼著邊緣、與相鄰區域色差在「邊緣兩側色差 × 此值」以內的小塊當成振鈴
     "min_feature_px": 2,  # 細節至少幾個像素
     "feature_contrast": 24.0,  # 細節與底色的最小色差（色階）
-    "feature_colors": 3,  # 一塊細節最多拆成幾種顏色
+    "feature_colors": 6,  # 一塊細節最多拆成幾種顏色（圖表的軸、格線、資料線常常連成一塊）
     "max_features": 600,
     "max_features_per_mpx": 1500,
     "merge_de": 2.5,  # 相鄰純色區域的色差小於此值（ΔE）就合併
@@ -181,7 +187,10 @@ def vectorize(image: np.ndarray, mask: Optional[np.ndarray] = None, params: Opti
     """
     t_start = time.perf_counter()
     P = _params(params)
-    img = np.ascontiguousarray(np.asarray(image)[..., :3], dtype=np.uint8)
+    raw = np.asarray(image)[..., :3]
+    if raw.dtype != np.uint8:  # 浮點數輸入先四捨五入並限制在 0 到 255（直接轉型會繞回去：256 變成 0）
+        raw = np.clip(np.rint(raw), 0, 255)
+    img = np.ascontiguousarray(raw, dtype=np.uint8)
     H, W = img.shape[:2]
     msk = None if mask is None else np.asarray(mask).astype(bool)
     if H < 2 or W < 2:
@@ -839,6 +848,13 @@ _KIND_ZH = {"rect": "矩形", "rounded_rect": "圓角矩形", "ellipse": "橢圓
 # ---------------------------------------------------------------- 驗證
 
 
+def _edge_mag(img: np.ndarray) -> np.ndarray:
+    """每個像素的顏色梯度（三個通道取大，色階／像素）。"""
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    return np.sqrt(gx * gx + gy * gy).max(axis=2)
+
+
 def _verify(res: VectorResult, img: np.ndarray, mask: Optional[np.ndarray], fg_true: np.ndarray, seg: Segmentation, P: dict) -> None:
     H, W = img.shape[:2]
     rgba = vr.render_paths(res.paths, res.size, 1.0)
@@ -864,9 +880,24 @@ def _verify(res: VectorResult, img: np.ndarray, mask: Optional[np.ndarray], fg_t
     truth = fg_true * region
     inter = float(np.minimum(drawn, truth).sum())
     union = float(np.maximum(drawn, truth).sum())
-    res.iou = inter / union if union > 0 else 1.0
-    # 成塊的誤差：色差大的像素先做開運算去掉沿邊的細絲，剩下成塊的才是漏掉的東西
-    bad = ((de > max(float(P["blob_delta_e"]), 6.0 * seg.sigma)) & region).astype(np.uint8)
+    soft = inter / union if union > 0 else 1.0
+    # 模糊過的原圖邊緣是一道寬的漸變，向量的邊緣是銳利的：逐像素比覆蓋率，兩側的漸變尾巴都會算成不重疊
+    # （σ 1 像素的模糊在 8 像素寬的筆畫上就只剩八成多）。所以另外比「覆蓋率過半」的範圍（0.5 等值線不受對稱模糊影響），
+    # 兩者取較好的那個：細線靠前者、模糊的粗形狀靠後者。
+    dh, th = drawn >= 0.5, truth >= 0.5
+    un_h = int((dh | th).sum())
+    hard = float((dh & th).sum()) / un_h if un_h > 0 else 1.0
+    res.iou = max(soft, hard)
+    res.stats["iou_soft"] = round(soft, 4)
+    # 成塊的誤差：色差大的像素先做開運算去掉沿邊的細絲，剩下成塊的才是漏掉的東西。
+    # 原圖與重畫「兩邊都有邊緣」的地方不算（模糊或縮放過的原圖邊緣比向量寬，沿邊會有一兩像素寬的色差帶，那不是漏畫）
+    bad = ((de > max(float(P["blob_delta_e"]), 6.0 * seg.sigma)) & region)
+    if bad.any():
+        k3 = np.ones((3, 3), np.uint8)
+        e_in = cv2.dilate((_edge_mag(img.astype(np.float32)) > 12.0).astype(np.uint8), k3)
+        e_out = cv2.dilate((_edge_mag(comp) > 12.0).astype(np.uint8), k3)
+        bad &= ~((e_in > 0) & (e_out > 0))
+    bad = bad.astype(np.uint8)
     opened = cv2.morphologyEx(bad, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     blob_frac = float(opened.sum()) / float(max(1, region.sum()))
     res.stats["blob_fraction"] = round(blob_frac, 5)

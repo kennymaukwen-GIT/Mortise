@@ -916,6 +916,17 @@ def _ellipse_dist(pts: np.ndarray, cx, cy, a, b, th) -> np.ndarray:
     return f / np.maximum(g, 1e-12)
 
 
+def _robust_err(d: np.ndarray) -> float:
+    """擬合偏差的穩健上限：第 95 百分位，與最大值的 1/2.5 取大者。
+
+    壓縮過或有雜訊的邊緣偶爾有一兩個點偏得特別遠（8×8 區塊交界、三色交會處）；只看最大值會因為一個點就認不出圓或矩形，
+    只看百分位又可能放過真的不是基本幾何的形狀，所以兩個都看：大部分點在容許內，而且沒有任何點超過容許的 2.5 倍。"""
+    a = np.abs(np.asarray(d, dtype=np.float64))
+    if a.size == 0:
+        return 0.0
+    return max(float(np.percentile(a, 95)), float(a.max()) / 2.5)
+
+
 def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full: bool = True) -> Optional[PrimFit]:
     """用輪廓點（次像素）試基本幾何，由簡到繁：圓、矩形與圓角矩形、橢圓。
 
@@ -941,8 +952,8 @@ def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full
     # ---- 圓
     cx, cy, r = fit_circle_points(P)
     res = np.hypot(P[:, 0] - cx, P[:, 1] - cy) - r
-    if r >= 2.0 and float(np.max(np.abs(res))) <= tol and _arc_support(P, cx, cy) >= (0.999 if full else 0.5):
-        best = PrimFit(TracedPrimitive("circle", cx, cy, 2 * r, 2 * r), ellipse_path(cx, cy, r, r), float(np.max(np.abs(res))), float(np.sqrt(np.mean(res ** 2))))
+    if r >= 2.0 and _robust_err(res) <= tol and _arc_support(P, cx, cy) >= (0.999 if full else 0.5):
+        best = PrimFit(TracedPrimitive("circle", cx, cy, 2 * r, 2 * r), ellipse_path(cx, cy, r, r), _robust_err(res), float(np.sqrt(np.mean(res ** 2))))
         return best
     # ---- 矩形、圓角矩形（有號距離的最小平方）
     consider(_fit_rrect(P, tol, o, full))
@@ -957,7 +968,7 @@ def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full
         if d1 > 4.0 and d2 > 4.0 and max(d1, d2) < 20 * max(ext):
             a, b, th = d1 / 2.0, d2 / 2.0, math.radians(ang)
             dist = _ellipse_dist(P, ex, ey, a, b, th)
-            if float(np.max(np.abs(dist))) <= tol and _arc_support(P, ex, ey) >= (0.999 if full else 0.6):
+            if _robust_err(dist) <= tol and _arc_support(P, ex, ey) >= (0.999 if full else 0.6):
                 if a < b:
                     a, b, th = b, a, th + math.pi / 2
                 deg = math.degrees(th) % 180.0
@@ -966,7 +977,7 @@ def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full
                 notes = []
                 if abs(a - b) <= o["snap_tol"]:
                     rr = (a + b) / 2.0
-                    pf = PrimFit(TracedPrimitive("circle", ex, ey, 2 * rr, 2 * rr), ellipse_path(ex, ey, rr, rr), float(np.max(np.abs(dist))), float(np.sqrt(np.mean(dist ** 2))))
+                    pf = PrimFit(TracedPrimitive("circle", ex, ey, 2 * rr, 2 * rr), ellipse_path(ex, ey, rr, rr), _robust_err(dist), float(np.sqrt(np.mean(dist ** 2))))
                 else:
                     # 長軸方向接近水平或垂直，而且扶正造成的偏差在量測誤差內才扶正
                     for snap in (0.0, 90.0, -90.0):
@@ -974,7 +985,7 @@ def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full
                             deg = snap
                             notes.append("橢圓的方向已扶正")
                             break
-                    pf = PrimFit(TracedPrimitive("ellipse", ex, ey, 2 * a, 2 * b, deg), ellipse_path(ex, ey, a, b, deg), float(np.max(np.abs(dist))), float(np.sqrt(np.mean(dist ** 2))), notes)
+                    pf = PrimFit(TracedPrimitive("ellipse", ex, ey, 2 * a, 2 * b, deg), ellipse_path(ex, ey, a, b, deg), _robust_err(dist), float(np.sqrt(np.mean(dist ** 2))), notes)
                 consider(pf)
     return best
 
@@ -1001,11 +1012,12 @@ def _fit_rrect(P: np.ndarray, tol: float, o: dict, full: bool) -> Optional[PrimF
     best = None
     for r0 in (0.0 + 1e-3, 0.3 * min(hx0, hy0), 0.9 * min(hx0, hy0)):
         try:
-            sol = least_squares(lambda p: _rrect_sdf(p, sub), [mx, my, th0, hx0, hy0, r0], bounds=(lo, hi), method="trf", max_nfev=60)
+            sol = least_squares(lambda p: _rrect_sdf(p, sub), [mx, my, th0, hx0, hy0, r0], bounds=(lo, hi), method="trf", max_nfev=60,
+                                loss="soft_l1", f_scale=max(tol, 0.1))
         except Exception:
             continue
         d = _rrect_sdf(sol.x, P)
-        m = float(np.max(np.abs(d)))
+        m = _robust_err(d)
         if best is None or m < best[1]:
             best = (sol.x, m, d)
         if m <= tol * 0.5:
@@ -1031,11 +1043,11 @@ def _fit_rrect(P: np.ndarray, tol: float, o: dict, full: bool) -> Optional[PrimF
             try:
                 sol = least_squares(lambda q: _rrect_sdf(np.array([q[0], q[1], q[2], q[3], q[4], 0.0]), sub2), [cx, cy, th, hx, hy], method="lm", max_nfev=40)
                 d0 = _rrect_sdf(np.array([*sol.x, 0.0]), sub2)
-                if float(np.max(np.abs(d0))) <= tol:
+                if _robust_err(d0) <= tol:
                     cx, cy, th, hx, hy = sol.x
                     r, kind = 0.0, "rect"
                     d = d0
-                    m = float(np.max(np.abs(d0)))
+                    m = _robust_err(d0)
             except Exception:
                 pass
     if m > tol:

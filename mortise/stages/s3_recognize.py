@@ -35,6 +35,7 @@ from ..pipeline.store import Store
 from ..tools import pdfium as pdf
 from ..tools.fonts import clean_font_name, is_cjk, split_style
 from ..tools.geometry import to_point
+from . import s3_flattened
 
 NAME = "s3"
 VERSION = "3"
@@ -102,11 +103,14 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
         page_color, _ = _page_color(paths, spec, c)
         _mark_covered(paths)
         groups = _group_paths(paths, reader, m, c, bool(flags and flags.outlined_text_suspected))
+        # 文字轉成的外框：辨識過關的變回文字行（那些路徑不再畫成向量圖，但仍從底圖隱藏），其餘照舊是向量圖
+        outlined_texts, groups, outlined_z = s3_flattened.outlined_to_text(groups, reader, spec, src_w, c, store, notes)
+        texts = texts + outlined_texts
         vectors, vector_images, vector_z = _vector_graphics(groups, reader, spec, src_w, c, store, notes)
         shapes, shape_z = _shapes(paths, spec, m, src_w, notes)
         _mark_shadows(images, shapes)
         # 底色物件不隱藏：底圖要帶著底色，否則隱藏後會變成白底（深色投影片就會整頁變白）
-        background = _background(reader, spec, c, store, image_z | shape_z | vector_z, page_color)
+        background = _background(reader, spec, c, store, image_z | shape_z | vector_z | outlined_z, page_color)
         tables, absorbed = _tables(shapes, [t for t in texts if not t.hidden], spec, c)
         shapes = [sh for sh in shapes if sh.id not in absorbed]
     finally:

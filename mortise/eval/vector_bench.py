@@ -479,6 +479,20 @@ def _visible_boundary(paths: list[TracedPath], W: int, H: int, covs: Optional[li
     return np.vstack(out) if out else np.zeros((0, 2))
 
 
+def _fg_alpha(paths: list[TracedPath], covs: list[np.ndarray], background) -> np.ndarray:
+    """由下到上疊出「看得出來的前景」的覆蓋率：顏色與底色相同的純色形狀當成橡皮擦。"""
+    bg = tuple(int(v) for v in background) if background is not None else None
+    H, W = covs[0].shape if covs else (0, 0)
+    a = np.zeros((H, W), dtype=np.float32)
+    for p, c in zip(paths, covs):
+        col = p.stroke if (p.stroke is not None and p.fill is None and p.gradient is None) else p.fill
+        if bg is not None and p.gradient is None and col is not None and _delta_e_color(col, bg) < 1.0:
+            a = a * (1.0 - c)
+        else:
+            a = a + c * (1.0 - a)
+    return a
+
+
 def _chamfer(a: np.ndarray, b: np.ndarray) -> tuple[Optional[float], Optional[float]]:
     from scipy.spatial import cKDTree
 
@@ -518,10 +532,9 @@ def evaluate(sample: Sample, paths: list[TracedPath], k: float, background, inpu
     out: dict = {"de_truth": float(de.mean()), "de_truth_p95": float(np.percentile(de, 95))}
     t_cov = [_shape_cov(p, W, H) for p in truth]
     r_cov = [_shape_cov(p, W, H) for p in paths]
-    t_alpha = np.zeros((H, W), dtype=np.float32)
-    for c in t_cov:
-        t_alpha = np.maximum(t_alpha, c)
-    r_alpha = rgba[..., 3].astype(np.float32) / 255.0
+    # 覆蓋範圍只算「看得出來的前景」：與底色同色的形狀疊在上面等於挖洞（例如黃底上的白字），兩邊都照這個規則算
+    t_alpha = _fg_alpha(truth, t_cov, sample.background)
+    r_alpha = _fg_alpha(paths, r_cov, background if background is not None else sample.background)
     union = float(np.maximum(t_alpha, r_alpha).sum())
     out["iou"] = float(np.minimum(t_alpha, r_alpha).sum()) / union if union > 0 else 1.0
     ch, ch95 = _chamfer(_visible_boundary(truth, W, H, t_cov), _visible_boundary(paths, W, H, r_cov))

@@ -206,14 +206,59 @@ def _fit_gradient(xs: np.ndarray, ys: np.ndarray, col: np.ndarray, tol: float, s
     return cand[0][1]
 
 
-def _seg_dist(I: np.ndarray, C1: np.ndarray, C2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """像素色 I 到「C1 到 C2 的連線」的距離、投影位置 t（0 在 C1、1 在 C2）、兩色的距離。"""
+def _seg_dist(I: np.ndarray, C1: np.ndarray, C2: np.ndarray, over: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """像素色 I 到「C1 到 C2 的連線」的距離、投影位置 t（0 在 C1、1 在 C2）、兩色的距離。
+
+    over > 0 時連線兩端各延長兩色距離的 over 倍再量距離（壓縮過的圖在邊緣有過衝：比兩側都更亮或更暗），
+    回傳的 t 仍限制在 0 到 1（過衝的像素當成完全屬於靠近的那一側）。"""
     v = C2 - C1
     w = I - C1
     vv = np.einsum("ij,ij->i", v, v)
-    t = np.clip(np.einsum("ij,ij->i", w, v) / np.maximum(vv, 1e-6), 0.0, 1.0)
+    t = np.clip(np.einsum("ij,ij->i", w, v) / np.maximum(vv, 1e-6), -over, 1.0 + over)
     d = w - t[:, None] * v
-    return np.sqrt(np.einsum("ij,ij->i", d, d)), t, np.sqrt(vv)
+    return np.sqrt(np.einsum("ij,ij->i", d, d)), np.clip(t, 0.0, 1.0), np.sqrt(vv)
+
+
+def _metric(wc: float) -> np.ndarray:
+    """混色判斷用的色彩距離：沿亮度方向不變，垂直於亮度的色度方向乘上 wc。
+
+    第一個軸是 JPEG 的亮度方向（0.299, 0.587, 0.114），另兩軸與它正交；wc = 1 時就是一般的 RGB 距離。
+    JPEG 的色度縮小取樣（4:2:0）只改變色度、不改變亮度，所以它在邊緣造成的色差全部落在後兩軸上，
+    縮小 wc 就能讓那些像素仍被解釋成兩色混合（覆蓋率由亮度決定，亮度是全解析度的）。
+    """
+    y = np.array([0.299, 0.587, 0.114], dtype=np.float64)
+    y /= np.linalg.norm(y)
+    a = np.cross(y, [0.0, 0.0, 1.0])
+    a /= np.linalg.norm(a)
+    b = np.cross(y, a)
+    return (np.diag([1.0, wc, wc]) @ np.stack([y, a, b])).astype(np.float32)
+
+
+def _chroma_sharpness(I: np.ndarray) -> Optional[float]:
+    """色度邊緣相對於亮度邊緣的銳利程度（約 1 表示一樣銳利）。
+
+    JPEG 的 4:2:0 色度縮小取樣把色度的解析度減半，色度邊緣比亮度邊緣寬一倍：在「亮度與色度都在變」的邊緣上，
+    二階差分÷一階差分（越銳利越大）色度只有亮度的四到五成；乾淨、縮放、模糊、加雜訊的圖都在 1 附近（兩者一起變）。
+    這種邊緣太少（例如只有黑白灰）時回傳 None。"""
+    Y = I @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    C = np.stack([I @ np.array([-0.1687, -0.3313, 0.5], dtype=np.float32), I @ np.array([0.5, -0.4187, -0.0813], dtype=np.float32)], axis=-1)
+    k = np.array([[-0.5, 0.0, 0.5]], dtype=np.float32)
+
+    def grad_lap(F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        gx = cv2.filter2D(F, cv2.CV_32F, k, borderType=cv2.BORDER_REPLICATE)
+        gy = cv2.filter2D(F, cv2.CV_32F, k.T, borderType=cv2.BORDER_REPLICATE)
+        lp = cv2.Laplacian(F, cv2.CV_32F, ksize=1, borderType=cv2.BORDER_REPLICATE)
+        if F.ndim == 2:
+            return np.sqrt(gx * gx + gy * gy), np.abs(lp)
+        return np.sqrt((gx * gx + gy * gy).sum(axis=-1)), np.sqrt((lp * lp).sum(axis=-1))
+
+    gY, lY = grad_lap(np.ascontiguousarray(Y))
+    gC, lC = grad_lap(np.ascontiguousarray(C))
+    m = (gY > 8.0) & (gC > 8.0)
+    if int(m.sum()) < 50:
+        return None
+    rY = float(np.median(lY[m] / gY[m]))
+    return float(np.median(lC[m] / gC[m])) / max(rY, 1e-6)
 
 
 def segment(image: np.ndarray, P: dict) -> Segmentation:
@@ -276,6 +321,10 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
         step = max(1, len(xs) // 20000)
         model = _fit_gradient(xs[::step] + x0, ys[::step] + y0, col[::step], t_gradfit, stop_tol) if P["gradients"] else None
         if model is not None:
+            # 色標之間的差距還不到純色的容許偏差：不是漸層，是有雜訊或壓縮痕跡的純色（例如 JPEG 的白底）
+            sc = np.array([c for _, c in model.stops], dtype=np.float64)
+            if float(np.abs(sc - sc.mean(axis=0)).max()) <= 2.0 * t_flat:
+                model = RegionModel("flat", np.median(col, axis=0).astype(np.float64), residual=float(np.percentile(dev, 95)))
             rid = len(regions)
             regions.append(model)
             core[y0 : y0 + h, x0 : x0 + w][sub] = rid
@@ -317,10 +366,22 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
     second = np.full((H, W), -1, dtype=np.int32)
     alpha = np.ones((H, W), dtype=np.float32)
     nys, nxs = np.nonzero(~is_core)
+    # 色度被縮小取樣過（JPEG）或量得到明顯的雜訊時，混色判斷降低色度的權重（見 _metric）；乾淨的圖照一般的 RGB 距離
+    csharp = _chroma_sharpness(I)
+    subsampled = csharp is not None and csharp < float(P["chroma_subsampled_below"])
+    stats["chroma_sharpness"] = None if csharp is None else round(csharp, 3)
+    wc = float(P["chroma_weight"]) if (subsampled or sigma >= float(P["chroma_weight_sigma"])) else 1.0
+    stats["chroma_weight"] = wc
+    # 過衝：壓縮、雙三次放大、銳化都會讓邊緣旁邊比兩側更亮或更暗。沒量到雜訊時只容許小幅過衝（放大造成的約一成）
+    over = float(P["overshoot"]) if wc < 1.0 else float(P["overshoot_clean"])
+    M = _metric(wc)
+    Iw = (I.reshape(-1, 3) @ M.T).reshape(H, W, 3)
+    predw = (pred.reshape(-1, 3) @ M.T).reshape(H, W, 3)
+    flat_w = flat_tab @ M.T
     tau0 = max(float(P["explain_tol"]), 4.0 * sigma)
     if len(nys):
-        Ip = I[nys, nxs]
-        C1 = pred[nys, nxs]
+        Ip = Iw[nys, nxs]
+        C1 = predw[nys, nxs]
         d0 = np.sqrt(((Ip - C1) ** 2).sum(axis=1))
         best_d = np.full(len(nys), np.inf, dtype=np.float32)
         best_t = np.zeros(len(nys), dtype=np.float32)
@@ -336,8 +397,8 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                 diff = j != l1
                 if not diff.any():
                     continue
-                Cj = pred[yy, xx]
-                d, t, vv = _seg_dist(Ip, C1, Cj)
+                Cj = predw[yy, xx]
+                d, t, vv = _seg_dist(Ip, C1, Cj, over)
                 d = np.where(diff & (vv > 2.0 * tau0), d - float(P["explain_slack"]) * vv * np.minimum(t, 1 - t) * 2.0, np.inf)
                 better = d < best_d
                 best_d = np.where(better, d, best_d)
@@ -368,8 +429,8 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                     diff = (j >= 0) & (j != lu)
                     if not diff.any():
                         continue
-                    Cj = flat_tab[np.maximum(j, 0)]
-                    d, t, vv = _seg_dist(Iu, Cu, Cj)
+                    Cj = flat_w[np.maximum(j, 0)]
+                    d, t, vv = _seg_dist(Iu, Cu, Cj, over)
                     d = np.where(diff & (vv > 2.0 * tau0), d - float(P["explain_slack"]) * vv * np.minimum(t, 1 - t) * 2.0, np.inf)
                     better = d < bd
                     bd = np.where(better, d, bd)
@@ -398,13 +459,35 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
             return _rejected(H, W, sigma, stats, f"零碎的細節太多（{len(cand)} 處，上限 {max_feat}），像照片或材質，不適合向量化。")
         contrast_min = max(float(P["feature_contrast"]), 8.0 * sigma)
         leftover = 0
+        absorbed = 0
         er = 1
         ker_e = np.ones((2 * er + 1, 2 * er + 1), np.uint8)
+        n_base = len(regions)
         for k in cand:
             x0, y0, w, h = (int(ustats[k, i]) for i in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
             # 連同外圍一圈像素一起看：那一圈常是細線蓋住不到一半的像素（已被解釋成底色，但其實帶一點細線的顏色）
             X0, Y0, X1, Y1 = max(0, x0 - 1), max(0, y0 - 1), min(W, x0 + w + 1), min(H, y0 + h + 1)
             m = ucc[Y0:Y1, X0:X1] == k
+            # 緊貼著某個相鄰區域、顏色又與它相近（對比不到細節門檻）的一小塊：是壓縮的振鈴或過衝，不是細節，
+            # 直接歸給最像的那個相鄰區域（最近的核心可能是另一側的顏色，所以要看實際相鄰的區域）
+            if wc < 1.0:
+                around = cv2.dilate(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & ~m
+                ids = np.unique(labels[Y0:Y1, X0:X1][around])
+                ids = ids[(ids >= 0) & (ids < n_base)]
+                if len(ids):
+                    ys_m, xs_m = np.nonzero(m)
+                    px = Iw[ys_m + Y0, xs_m + X0]
+                    dist = np.sqrt(((px[:, None, :] - flat_w[ids][None, :, :]) ** 2).sum(axis=2))
+                    # 振鈴的大小與邊緣兩側的色差成正比：門檻取細節門檻與「相鄰區域之間最大色差 × ring_fraction」的較大者
+                    cw = flat_w[ids]
+                    local = float(np.sqrt(((cw[:, None, :] - cw[None, :, :]) ** 2).sum(axis=2)).max()) if len(ids) > 1 else 0.0
+                    if float(dist.min(axis=1).max()) < max(contrast_min, float(P["ring_fraction"]) * local):
+                        jj = ids[np.argmin(dist, axis=1)]
+                        labels[ys_m + Y0, xs_m + X0] = jj
+                        second[ys_m + Y0, xs_m + X0] = -1
+                        alpha[ys_m + Y0, xs_m + X0] = 1.0
+                        absorbed += len(ys_m)
+                        continue
             ring = cv2.dilate(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool) & ~m & ~is_core[Y0:Y1, X0:X1] & (second[Y0:Y1, X0:X1] < 0)
             ys_m, xs_m = np.nonzero(m)
             ys_r, xs_r = np.nonzero(ring)
@@ -412,8 +495,10 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
             xs_a = np.concatenate([xs_m, xs_r]) + X0
             n_m = len(ys_m)
             Ia = I[ys_a, xs_a]
-            Ca = pred[ys_a, xs_a]
-            mag = np.sqrt(((Ia - Ca) ** 2).sum(axis=1))
+            # 細節的顏色歸屬用一般的 RGB 距離（不降色度權重）：降了以後，彩色細線的邊緣會被當成「深灰色細線蓋住一部分」
+            Iaw = Ia
+            Caw = pred[ys_a, xs_a]
+            mag = np.sqrt(((Iaw - Caw) ** 2).sum(axis=1))
             remaining = np.ones(len(ys_a), dtype=bool)
             remaining[n_m:] = False  # 外圈像素不當種子
             is_ring = np.arange(len(ys_a)) >= n_m
@@ -421,6 +506,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
             # 每個像素目前歸給哪個細節（-1 表示還沒有）與它在那個細節裡的覆蓋率
             own = np.full(len(ys_a), -1, dtype=np.int64)
             own_t = np.zeros(len(ys_a), dtype=np.float32)
+            made: list[tuple[int, np.ndarray]] = []  # 這一塊已找到的細節（區域編號、在混色度量下的顏色）
             for _round in range(int(P["feature_colors"])):
                 if not remaining.any():
                     break
@@ -428,9 +514,36 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                 seed = int(np.argmax(mm))
                 if mm[seed] < contrast_min:
                     break
-                near_seed = (np.sqrt(((Ia - Ia[seed]) ** 2).sum(axis=1)) <= max(0.25 * mm[seed], 2.0 * tau0)) & ~is_ring & remaining
+                near_seed = (np.sqrt(((Iaw - Iaw[seed]) ** 2).sum(axis=1)) <= max(0.25 * mm[seed], 2.0 * tau0)) & ~is_ring & remaining
                 Ct = Ia[near_seed].mean(axis=0)
-                d, t, vv = _seg_dist(Ia, Ca, np.broadcast_to(Ct, Ia.shape))
+                Ctw = Iaw[near_seed].mean(axis=0)
+                if wc < 1.0 and made:
+                    # 壓縮過的圖：這個顏色若只是「底色與前面已找到的細節」混色後色度被抹開的結果（彩色細線旁的淡色光暈），
+                    # 就不另立細節，這些像素改算成那條細節蓋住一部分
+                    hw = Iw[ys_a, xs_a]
+                    bw = predw[ys_a, xs_a]
+                    hit = False
+                    for prid, pcol_w in made:
+                        # 光暈一定緊貼著那條細節（兩像素內）；離得遠的同色系像素是另一條線（例如淡灰格線與深灰軸線）
+                        loc = np.zeros((Y1 - Y0 + 4, X1 - X0 + 4), dtype=np.uint8)
+                        sel_p = (own == prid) & (own_t >= 0.5)
+                        loc[ys_a[sel_p] - Y0 + 2, xs_a[sel_p] - X0 + 2] = 1
+                        close = cv2.dilate(loc, np.ones((5, 5), np.uint8))[ys_a - Y0 + 2, xs_a - X0 + 2].astype(bool)
+                        if not close[seed]:
+                            continue
+                        dd, tt_, vv_ = _seg_dist((Ct.astype(np.float32)[None, :] @ M.T), bw[seed : seed + 1], pcol_w[None, :], over)
+                        if float(dd[0]) <= tau0 + float(P["explain_slack"]) * float(vv_[0]):
+                            d2, t2_, _ = _seg_dist(hw, bw, np.broadcast_to(pcol_w, hw.shape), over)
+                            take = near_seed & close & (own < 0) & (d2 <= tau0 + float(P["explain_slack"]) * vv_[0])
+                            take[seed] = True
+                            own[take] = prid
+                            own_t[take] = t2_[take]
+                            remaining &= ~take
+                            hit = True
+                            break
+                    if hit:
+                        continue
+                d, t, vv = _seg_dist(Iaw, Caw, np.broadcast_to(Ctw, Iaw.shape))
                 ok = (d <= tau0 + float(P["explain_slack"]) * vv) & (vv > contrast_min * 0.5) & (t > 0.04)
                 # 已經歸給別的細節的像素：只有在那邊只是淡淡的邊緣、在這邊蓋過一半時才改歸這邊
                 # （淡色細線接在深色線旁邊時，接點的像素是「整格淡色」而不是「一點點深色」）
@@ -444,9 +557,22 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                 loc = np.zeros((Y1 - Y0 + 2 * er, X1 - X0 + 2 * er), dtype=np.uint8)
                 loc[ys_a[strong] - Y0 + er, xs_a[strong] - X0 + er] = 1
                 near_strong = cv2.dilate(loc, ker_e)[ys_a - Y0 + er, xs_a - X0 + er].astype(bool)
-                ok &= near_strong
+                acc = ok & near_strong
+                # 模糊或放大過的圖，邊緣的漸變不只一個像素寬：再往外長兩圈，但覆蓋率必須一路遞減
+                # （中間隔著一格底色、再變深的是另一條線，不會被接過來）
+                tl = np.full((Y1 - Y0 + 2, X1 - X0 + 2), -1.0, dtype=np.float32)
+                for _grow in range(2):
+                    tl[:] = -1.0
+                    tl[ys_a[acc] - Y0 + 1, xs_a[acc] - X0 + 1] = t[acc]
+                    nb_max = cv2.dilate(tl, np.ones((3, 3), np.uint8))[ys_a - Y0 + 1, xs_a - X0 + 1]
+                    more = ok & ~acc & (t < 0.5) & (nb_max >= t)
+                    if not more.any():
+                        break
+                    acc |= more
+                ok = acc
                 rid = len(regions)
                 regions.append(RegionModel("flat", Ct.astype(np.float64), thin=True))
+                made.append((rid, (Ct.astype(np.float32)[None, :] @ M.T)[0]))
                 own[ok] = rid
                 own_t[ok] = t[ok]
                 remaining &= ~ok
@@ -465,6 +591,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                 alpha[yy[lo_], xx[lo_]] = 1.0 - tt[lo_]
             leftover += int(remaining[:n_m].sum()) if got else n_m
         stats["leftover_px"] = leftover
+        stats["absorbed_px"] = absorbed
         stats["features"] = int(sum(1 for r in regions if r.thin))
     # ---------- 5. 相鄰同色合併
     labels, second, regions = _merge_same(labels, second, regions, max(float(P["merge_de"]), 2.5 * sigma * 0.6), P)

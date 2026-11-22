@@ -58,6 +58,16 @@ pdf_outlined_aligned_share = 0.6     # 一行裡至少這個比例的字形要�
 pdf_outlined_max_gap = 1.2           # 同一行相鄰字形的間距上限（字高的倍數）
 pdf_outlined_max_height = 0.08       # 字形高度上限（頁寬比例）；更高的當成圖形
 pdf_outlined_line_pitch = 3.2        # 上下兩行的基線距離不超過字高的幾倍，算同一塊文字
+pdf_outlined_to_text = true          # 文字轉成的外框：辨識過關就變回可編輯的文字（stages/s3_flattened.py）
+pdf_outlined_text_min_confidence = 0.9  # 一行的辨識信心值至少這麼高才轉成文字；不足的保留成外框向量圖（初始值）
+pdf_outlined_align_max_cost = 0.6    # 字形與辨識出的字對齊時，字形中心離字的範圍最遠幾個行高（初始值）
+pdf_outlined_fit_max_error = 0.12    # 外框與字型墨跡外框的幾何殘差上限（em）；超過表示字形對應錯了，不轉（初始值）
+pdf_outlined_max_angle_deg = 1.5     # 只轉接近水平的行（度）；斜的與直排的保留成外框
+pdf_outlined_ocr_glyph_px = 48       # 畫外框給文字辨識時，讓主要字形高約這麼多像素
+pdf_outlined_ocr_min_dpi = 72        # 那張影像的解析度範圍（dpi）
+pdf_outlined_ocr_max_dpi = 600
+pdf_outlined_ocr_max_pixels = 16000000  # 那張影像的像素上限
+pdf_outlined_font_probe_lines = 3    # 每群取最長的幾行做字型重繪比對（其餘的行只用幾何在這些候選中挑）
 # ---- 描圖向量化（recognition/vectorize.py）：設定加在這一行下面，名稱以 vector_ 開頭 ----
 vector_enabled = true                # 影像產線：插畫（標誌、圖示、圖表）描成向量路徑；照片不描
 vector_min_size_px = 12              # 寬或高小於此像素的插畫不描
