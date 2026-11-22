@@ -3,12 +3,13 @@ import { useCallback, useEffect, useRef, type Dispatch } from "react";
 import * as api from "../api/client";
 import { ApiError } from "../api/client";
 import type { CorrectionIn, FormatInfo, PageSizePreset } from "../api/types";
+import { fromException, fromServerFailure } from "../lib/errors";
 import { checkFile, sniff } from "../lib/files";
-import { openLocal } from "../lib/localDoc";
+import { openLocal, OpenError } from "../lib/localDoc";
 import { deleteSoon, resumePendingDeletes } from "../lib/pendingDelete";
 import type { RecentJob } from "../lib/storage";
-import { resolveOrigin, resolveTarget, sourceOrientation } from "./derive";
-import type { Action, State } from "./store";
+import { blocks, resolveOrigin, resolveTarget, settingsFromIntent, sourceOrientation } from "./derive";
+import { isWorking, type Action, type FrameMessage, type State } from "./store";
 
 export interface ControllerDeps {
   maxMb: number;
@@ -32,12 +33,17 @@ export interface Controller {
   openJob(job: RecentJob): Promise<void>;
   deleteJob(job: RecentJob): Promise<void>;
   convertAgain(): void;
+  /** A picture, element list or download of the current job failed: find out whether the job is still on the server. */
+  checkJob(): Promise<void>;
 }
 
-function messageOf(e: unknown): string {
-  if (e instanceof ApiError) return e.message;
-  if (e instanceof Error) return e.message;
-  return String(e);
+/** Message for a file the browser could not open. */
+function openFailure(e: unknown, name: string): FrameMessage {
+  if (e instanceof OpenError) {
+    if (e.reason === "encrypted") return { key: "err.encrypted" };
+    if (e.reason === "empty") return { key: "err.noPages" };
+  }
+  return { key: "err.readGeneric", vars: { name } };
 }
 
 export function useController(state: State, dispatch: Dispatch<Action>, deps: ControllerDeps): Controller {
@@ -48,6 +54,9 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
   const watcher = useRef<api.JobWatcher | null>(null);
   const uploadAbort = useRef<AbortController | null>(null);
   const openSeq = useRef(0);
+  // Set synchronously when a conversion starts, so two clicks in the same task cannot create two jobs
+  // (stateRef only changes after React re-renders).
+  const busyRef = useRef(false);
 
   // Free the previous preview when the document changes, and the last one on unmount.
   const docRef = useRef(state.doc);
@@ -71,20 +80,38 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     watcher.current = null;
   };
 
+  const recent = (jobId: string, patch: Partial<RecentJob>) => {
+    const s = stateRef.current;
+    depsRef.current.onRecent({ jobId, filename: s.jobFilename ?? s.file?.name ?? jobId, format: s.jobFormat ?? "", createdAt: Date.now(), ...patch });
+  };
+
+  const gone = (jobId: string) => {
+    depsRef.current.onRecentRemoved(jobId);
+    if (stateRef.current.jobId === jobId) {
+      stopWatching();
+      dispatch({ type: "JOB_GONE" });
+    }
+  };
+
   const finishJob = useCallback(
     async (jobId: string) => {
+      const stop = () => stateRef.current.jobId !== jobId;
       try {
-        const [pages, report] = await Promise.all([api.getPages(jobId), api.getReport(jobId).catch(() => null)]);
-        if (stateRef.current.jobId !== jobId) return;
+        // A short network failure right after the run must not turn a finished job into a failed one.
+        const [pages, report] = await Promise.all([api.withRetry(() => api.getPages(jobId), stop), api.withRetry(() => api.getReport(jobId), stop).catch(() => null)]);
+        if (stop()) return;
         const score = report?.overall_score ?? null;
-        dispatch({ type: "JOB_DONE", pages, score });
-        const s = stateRef.current;
-        depsRef.current.onRecent({ jobId, filename: s.jobFilename ?? s.file?.name ?? jobId, format: s.jobFormat ?? "", createdAt: Date.now(), score, status: "done" });
+        const fmt = stateRef.current.jobFormat;
+        const noGraphics = !!report?.outputs?.some((o) => o.format === fmt && o.vector_count === 0);
+        dispatch({ type: "JOB_DONE", pages, score, notes: report?.notes ?? [], noGraphics });
+        recent(jobId, { score, status: "done" });
       } catch (e) {
-        if (stateRef.current.jobId === jobId) dispatch({ type: "JOB_FAILED", message: messageOf(e) });
+        if (stop()) return;
+        if (e instanceof ApiError && e.status === 404) return gone(jobId);
+        dispatch({ type: "JOB_FAILED", error: fromException(e, "follow") });
       }
     },
-    [dispatch],
+    [dispatch], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const follow = useCallback(
@@ -99,23 +126,31 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
           if (stateRef.current.jobId !== jobId) return;
           if (st.status === "done") void finishJob(jobId);
           else {
-            dispatch({ type: "JOB_FAILED", message: st.error || "failed" });
-            const s = stateRef.current;
-            depsRef.current.onRecent({ jobId, filename: s.jobFilename ?? jobId, format: s.jobFormat ?? "", createdAt: Date.now(), status: "failed" });
+            const err = fromServerFailure(st.error);
+            if (err.key === "err.jobDeleted") return gone(jobId);
+            dispatch({ type: "JOB_FAILED", error: err });
+            recent(jobId, { status: "failed" });
           }
         },
         onError: (e) => {
           watcher.current = null;
-          if (stateRef.current.jobId === jobId) dispatch({ type: "JOB_FAILED", message: messageOf(e) });
+          if (stateRef.current.jobId !== jobId) return;
+          if (e instanceof ApiError && e.status === 404) return gone(jobId);
+          dispatch({ type: "JOB_FAILED", error: fromException(e, "follow") });
         },
       });
     },
-    [dispatch, finishJob],
+    [dispatch, finishJob], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const openFile = useCallback(
     async (file: File) => {
       const d = depsRef.current;
+      // While a file is uploading or converting, a new file would silently drop that job: finish or cancel first.
+      if (isWorking(stateRef.current) || busyRef.current) {
+        dispatch({ type: "FRAME_ERROR", error: { key: "err.busy" } });
+        return;
+      }
       const check = checkFile(file, d.accepted, d.maxMb);
       if (!check.ok) {
         dispatch({
@@ -128,8 +163,6 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
         return;
       }
       const seq = ++openSeq.current;
-      stopWatching();
-      uploadAbort.current?.abort();
       dispatch({ type: "OPEN_START", file });
       try {
         const magic = await sniff(file);
@@ -142,22 +175,25 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
           doc.destroy();
           return;
         }
+        // Only now that the new file is known to be good: stop following a job that ran in the background.
+        stopWatching();
         dispatch({ type: "OPEN_OK", file, doc });
       } catch (e) {
-        if (seq === openSeq.current) dispatch({ type: "OPEN_FAIL", error: { key: "err.read", vars: { msg: messageOf(e) } } });
+        if (seq === openSeq.current) dispatch({ type: "OPEN_FAIL", error: openFailure(e, file.name) });
       }
     },
-    [dispatch],
+    [dispatch], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const convert = useCallback(async () => {
     const s = stateRef.current;
     const d = depsRef.current;
-    if (!s.file) return;
+    if (!s.file || busyRef.current) return;
     if (s.phase === "uploading" || s.phase === "converting" || s.phase === "opening") return;
     const origin = resolveOrigin(s.settings);
     const target = resolveTarget(s.settings, d.presets, sourceOrientation(s.doc, s.pages));
-    if (origin.kind === "incomplete" || origin.kind === "invalid" || target.kind === "incomplete" || target.kind === "invalid") return;
+    if (blocks(origin) || blocks(target)) return;
+    busyRef.current = true;
     const format = s.settings.format;
     dispatch({ type: "UPLOAD_START", format, hadOriginSize: origin.kind === "ok" });
     const ctrl = new AbortController();
@@ -173,7 +209,11 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
         },
         { onUpload: (f) => dispatch({ type: "UPLOAD_PROGRESS", fraction: f }), signal: ctrl.signal },
       );
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted) {
+        // Cancelled after the whole file was sent: the server created the job anyway. Delete it.
+        void deleteSoon(st.job_id);
+        return;
+      }
       uploadAbort.current = null;
       dispatch({ type: "JOB_CREATED", status: st });
       d.onRecent({ jobId: st.job_id, filename: st.filename ?? s.file.name, format, createdAt: Date.now(), status: st.status });
@@ -182,12 +222,20 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     } catch (e) {
       if (ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
       uploadAbort.current = null;
-      dispatch({ type: "JOB_FAILED", message: e instanceof ApiError && e.status === 0 ? "network" : messageOf(e) });
+      dispatch({ type: "JOB_FAILED", error: fromException(e, "upload") });
+    } finally {
+      busyRef.current = false;
     }
   }, [dispatch, finishJob, follow]);
 
   const cancel = useCallback(async () => {
     const s = stateRef.current;
+    if (s.progress.rerun && s.pages) {
+      // Re-running after a correction: never delete the job (that would throw away the result and the corrections).
+      // Go back to the previous result; the re-run keeps going and the view refreshes when it ends.
+      dispatch({ type: "RERUN_HIDE" });
+      return;
+    }
     stopWatching();
     uploadAbort.current?.abort();
     uploadAbort.current = null;
@@ -199,35 +247,68 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     }
   }, [dispatch]);
 
+  /** Ask the server where a job stands and continue from there (show it, follow it, or show its failure). */
+  const resume = async (jobId: string) => {
+    const st = await api.withRetry(() => api.getJob(jobId), () => stateRef.current.jobId !== jobId);
+    if (stateRef.current.jobId !== jobId) return st;
+    if (st.status === "done") await finishJob(jobId);
+    else if (st.status === "failed") {
+      const err = fromServerFailure(st.error);
+      dispatch({ type: "JOB_FAILED", error: err });
+      recent(jobId, { status: "failed" });
+    } else follow(jobId);
+    return st;
+  };
+
   const openJobImpl = async (job: RecentJob) => {
     stopWatching();
     uploadAbort.current?.abort();
     openSeq.current++;
     dispatch({ type: "OPEN_JOB_START", jobId: job.jobId, filename: job.filename, format: job.format });
     try {
-      const st = await api.getJob(job.jobId);
+      const st = await api.withRetry(() => api.getJob(job.jobId), () => stateRef.current.jobId !== job.jobId);
       if (stateRef.current.jobId !== job.jobId) return;
-      dispatch({ type: "JOB_META", hadOriginSize: !!st.intent?.known_size });
-      if (st.status === "done") await finishJob(job.jobId);
-      else if (st.status === "failed") dispatch({ type: "JOB_FAILED", message: st.error || "failed" });
-      else follow(job.jobId);
+      const settings = settingsFromIntent(st.intent, depsRef.current.presets);
+      dispatch({ type: "JOB_META", hadOriginSize: !!st.intent?.known_size, settings, filename: st.filename ?? job.filename, format: st.intent?.outputs?.[0] });
+      await resume(job.jobId);
     } catch (e) {
+      if (stateRef.current.jobId !== job.jobId) return;
       if (e instanceof ApiError && e.status === 404) {
         depsRef.current.onRecentRemoved(job.jobId);
         dispatch({ type: "RESET" });
         dispatch({ type: "FRAME_ERROR", error: { key: "err.expired" } });
-      } else dispatch({ type: "JOB_FAILED", message: messageOf(e) });
+      } else dispatch({ type: "JOB_FAILED", error: fromException(e, "follow") });
     }
   };
+
   const retry = useCallback(async () => {
     const s = stateRef.current;
-    if (s.file) return convert();
-    if (s.jobId) {
-      // No local copy (job reopened from the list): just ask the server again.
-      const job = { jobId: s.jobId, filename: s.jobFilename ?? s.jobId, format: s.jobFormat ?? "", createdAt: Date.now() };
-      return openJobImpl(job);
+    const mode = s.jobError?.retry ?? (s.file ? "reupload" : "reopen");
+    if (mode === "none") return;
+    if (mode === "reopen" && s.jobId) {
+      // The job itself may be fine (only the connection failed): ask the server about the same job again.
+      const id = s.jobId;
+      dispatch({ type: "JOB_RECHECK" });
+      try {
+        await resume(id);
+      } catch (e) {
+        if (stateRef.current.jobId !== id) return;
+        if (e instanceof ApiError && e.status === 404) return gone(id);
+        dispatch({ type: "JOB_FAILED", error: fromException(e, "follow") });
+      }
+      return;
     }
-  }, [convert]); // openJobImpl only reads refs
+    if (!s.file) {
+      if (s.jobId) return openJobImpl({ jobId: s.jobId, filename: s.jobFilename ?? s.jobId, format: s.jobFormat ?? "", createdAt: Date.now() });
+      return;
+    }
+    // Uploading again creates a new job: remove the failed one so the list and the server do not fill with copies.
+    if (s.jobId) {
+      depsRef.current.onRecentRemoved(s.jobId);
+      void deleteSoon(s.jobId);
+    }
+    return convert();
+  }, [convert]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const correct = useCallback(
     async (items: CorrectionIn[]) => {
@@ -242,6 +323,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
   );
 
   const startOver = useCallback(() => {
+    if (isWorking(stateRef.current)) return; // the menu item is disabled then; Cancel is the way out
     stopWatching();
     uploadAbort.current?.abort();
     openSeq.current++;
@@ -259,7 +341,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     dispatch({ type: "CANCELLED" });
   }, [dispatch]);
 
-  const openJob = useCallback((job: RecentJob) => openJobImpl(job), [dispatch, finishJob, follow]); // openJobImpl only reads refs
+  const openJob = useCallback((job: RecentJob) => openJobImpl(job), [dispatch, finishJob, follow]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const deleteJob = useCallback(
     async (job: RecentJob) => {
@@ -277,5 +359,15 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     dispatch({ type: "CONVERT_AGAIN" });
   }, [dispatch]);
 
-  return { openFile, convert, cancel, retry, correct, startOver, deleteFromServer, openJob, deleteJob, convertAgain };
+  const checkJob = useCallback(async () => {
+    const id = stateRef.current.jobId;
+    if (!id) return;
+    try {
+      await api.getJob(id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404 && stateRef.current.jobId === id) gone(id);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return { openFile, convert, cancel, retry, correct, startOver, deleteFromServer, openJob, deleteJob, convertAgain, checkJob };
 }

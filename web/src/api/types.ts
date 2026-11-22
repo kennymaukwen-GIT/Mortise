@@ -204,8 +204,19 @@ export interface PageElements {
   styles: StyleInfo[];
 }
 
+/** Summary of one output file (GET /api/jobs/{id}/report, field "outputs"). */
+export interface OutputSummary {
+  format: OutputFormatId;
+  filename: string;
+  selfcheck_ok: boolean;
+  notes: string[];
+  /** svg_assets only: number of vector graphics in the zip (0 = only a README). */
+  vector_count?: number | null;
+}
+
 export interface FidelityReportJson {
   overall_score: number | null;
+  outputs?: OutputSummary[];
   pages: { page_index: number; neutral_similarity?: number | null; target_similarity?: number | null }[];
   notes?: string[];
   round?: number;
@@ -243,6 +254,6 @@ export interface CreateJobInput {
   /** Output page size. */
   target_width?: number;
   target_height?: number;
-  target_unit?: "mm" | "cm" | "in" | "pt" | "px";
+  target_unit?: "mm" | "cm" | "in" | "pt";
   allow_training?: boolean;
 }

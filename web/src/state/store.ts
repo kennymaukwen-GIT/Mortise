@@ -56,6 +56,10 @@ export interface State {
   progress: Progress;
   pages: PageInfo[] | null;
   score: number | null;
+  /** The fidelity report's notes (server text, Traditional Chinese): why a check did not run, what was simplified, … */
+  reportNotes: string[];
+  /** The download has no graphics at all (svg_assets found no vector graphics on these pages). */
+  noGraphics: boolean;
   pageIndex: number;
   view: View;
   editMode: boolean;
@@ -90,6 +94,8 @@ export const initialState: State = {
   progress: noProgress,
   pages: null,
   score: null,
+  reportNotes: [],
+  noGraphics: false,
   pageIndex: 0,
   view: "original",
   editMode: false,
@@ -111,7 +117,7 @@ export type Action =
   | { type: "UPLOAD_PROGRESS"; fraction: number }
   | { type: "JOB_CREATED"; status: JobStatus }
   | { type: "JOB_EVENT"; event: JobEvent }
-  | { type: "JOB_DONE"; pages: PageInfo[]; score: number | null }
+  | { type: "JOB_DONE"; pages: PageInfo[]; score: number | null; notes?: string[]; noGraphics?: boolean }
   | { type: "JOB_FAILED"; error: JobError }
   | { type: "CANCELLED" }
   | { type: "RERUN_START" }
@@ -120,7 +126,7 @@ export type Action =
   | { type: "JOB_RECHECK" }
   | { type: "CONVERT_AGAIN" }
   | { type: "OPEN_JOB_START"; jobId: string; filename: string; format: string }
-  | { type: "JOB_META"; hadOriginSize: boolean; settings?: Partial<Settings> }
+  | { type: "JOB_META"; hadOriginSize: boolean; settings?: Partial<Settings>; filename?: string | null; format?: string | null }
   | { type: "RESET" };
 
 function clampPage(index: number, count: number): number {
@@ -224,6 +230,8 @@ export function reducer(s: State, a: Action): State {
         phase: "done",
         pages: a.pages,
         score: a.score,
+        reportNotes: a.notes ?? [],
+        noGraphics: !!a.noGraphics,
         progress: { ...s.progress, fraction: 1, upload: null, finishing: false, background: false },
         pageIndex: clampPage(s.pageIndex, a.pages.length),
         view: s.progress.rerun ? s.view : "result",
@@ -271,7 +279,13 @@ export function reducer(s: State, a: Action): State {
         jobHadOriginSize: true,
       };
     case "JOB_META":
-      return { ...s, jobHadOriginSize: a.hadOriginSize, settings: a.settings ? { ...s.settings, ...a.settings } : s.settings };
+      return {
+        ...s,
+        jobHadOriginSize: a.hadOriginSize,
+        jobFilename: a.filename || s.jobFilename,
+        jobFormat: a.format || s.jobFormat,
+        settings: a.settings ? { ...s.settings, ...a.settings } : s.settings,
+      };
     case "RESET":
       return { ...initialState, settings: { ...s.settings, originW: "", originH: "", orientation: null } };
     default:

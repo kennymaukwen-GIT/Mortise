@@ -1,8 +1,8 @@
 // Pure helpers that turn settings + documents into what the API needs or the UI shows.
-import type { PageInfo, PageSizePreset } from "../api/types";
+import type { IntentJson, PageInfo, PageSizePreset } from "../api/types";
 import type { LocalDoc } from "../lib/localDoc";
-import { checkPair, orient, orientationOf, ptToMm, type Orientation, type PairCheck } from "../lib/units";
-import type { Settings, State } from "./store";
+import { checkPair, fmtMm, orient, orientationOf, ptToMm, toMm, type Orientation, type PairCheck } from "../lib/units";
+import type { Settings } from "./store";
 
 export function isSlidePreset(p: PageSizePreset): boolean {
   return p.width_mm > p.height_mm || /slide/i.test(p.id) || /slide/i.test(p.label);
@@ -27,7 +27,12 @@ export function effectiveOrientation(settings: Settings, preset: PageSizePreset 
   return src ?? "portrait";
 }
 
-export type TargetResult = { kind: "none" } | { kind: "ok"; width: number; height: number } | { kind: "incomplete" } | { kind: "invalid" };
+export type TargetResult = { kind: "none" } | { kind: "ok"; width: number; height: number } | { kind: "incomplete" } | { kind: "invalid" } | { kind: "range" };
+
+/** A W/H check that stops CONVERT (the message is shown on the card instead of uploading). */
+export function blocks(r: { kind: string }): boolean {
+  return r.kind === "incomplete" || r.kind === "invalid" || r.kind === "range";
+}
 
 export function resolveTarget(settings: Settings, presets: PageSizePreset[], src: Orientation | null): TargetResult {
   if (settings.sizeMode === "original") return { kind: "none" };
@@ -72,6 +77,25 @@ export function pageGeometry(page: PageInfo | undefined, doc: LocalDoc | null, i
   return { width: W, height: H, placement, resultAspect: W / H, origAspect };
 }
 
-export function canConvert(s: State, formatsReady: boolean): boolean {
-  return !!s.file && (s.phase === "loaded" || s.phase === "done" || s.phase === "failed") && formatsReady;
+/**
+ * Card settings that reproduce a job's intent (used when a job is reopened from the list or after a reload):
+ * format, original size and output size. An output size matching a preset (either way round) selects the preset.
+ */
+export function settingsFromIntent(intent: IntentJson | null | undefined, presets: PageSizePreset[]): Partial<Settings> {
+  if (!intent) return {};
+  const out: Partial<Settings> = {};
+  if (intent.outputs?.length) out.format = intent.outputs[0];
+  const ks = intent.known_size;
+  const kw = ks ? toMm(ks.width, ks.unit) : null;
+  const kh = ks ? toMm(ks.height, ks.unit) : null;
+  out.originW = kw != null ? fmtMm(kw) : "";
+  out.originH = kh != null ? fmtMm(kh) : "";
+  const ts = intent.target_size;
+  const tw = ts ? toMm(ts.width, ts.unit) : null;
+  const th = ts ? toMm(ts.height, ts.unit) : null;
+  if (tw == null || th == null) return { ...out, sizeMode: "original", presetId: null, targetW: "", targetH: "", orientation: null };
+  const near = (a: number, b: number) => Math.abs(a - b) < 0.6;
+  const p = presets.find((x) => (near(x.width_mm, tw) && near(x.height_mm, th)) || (near(x.width_mm, th) && near(x.height_mm, tw)));
+  if (p) return { ...out, sizeMode: "preset", presetId: p.id, targetW: "", targetH: "", orientation: orientationOf(tw, th) };
+  return { ...out, sizeMode: "custom", presetId: null, targetW: fmtMm(tw), targetH: fmtMm(th), orientation: null };
 }

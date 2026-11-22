@@ -42,16 +42,32 @@ export type PairCheck =
   | { kind: "empty" }
   | { kind: "ok"; width: number; height: number }
   | { kind: "incomplete" }
-  | { kind: "invalid" };
+  | { kind: "invalid" }
+  | { kind: "range" };
 
-/** Validate a W/H pair: both empty, or both positive numbers. */
-export function checkPair(w: string, h: string): PairCheck {
+/**
+ * Sizes the server accepts for both the original size and the output size: 0.5 in to 200 in
+ * (36 pt to 14400 pt, the same limits as POST /api/jobs). Outside them the server answers 422.
+ */
+export const SIZE_MIN_MM = 12.7;
+export const SIZE_MAX_MM = 5080;
+
+/** Validate a W/H pair in mm: both empty, or both numbers within SIZE_MIN_MM..SIZE_MAX_MM. */
+export function checkPair(w: string, h: string, min = SIZE_MIN_MM, max = SIZE_MAX_MM): PairCheck {
   const a = parsePositive(w);
   const b = parsePositive(h);
   if (a === null && b === null) return { kind: "empty" };
   if ((a !== null && Number.isNaN(a)) || (b !== null && Number.isNaN(b))) return { kind: "invalid" };
   if (a === null || b === null) return { kind: "incomplete" };
+  // A little tolerance so the limits themselves (typed as 12.7 or 5080) are accepted despite rounding.
+  if (a < min - 1e-6 || b < min - 1e-6 || a > max + 1e-6 || b > max + 1e-6) return { kind: "range" };
   return { kind: "ok", width: a, height: b };
+}
+
+/** Convert a physical length to mm (null for units without a physical size, e.g. px). */
+export function toMm(v: number, unit: string): number | null {
+  const k: Record<string, number> = { mm: 1, cm: 10, in: 25.4, pt: MM_PER_PT };
+  return unit in k ? v * k[unit] : null;
 }
 
 /** Pick an image width bucket (px) so we do not refetch on every zoom step. */

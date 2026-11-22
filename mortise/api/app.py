@@ -323,7 +323,29 @@ def job_report(job_id: str) -> dict[str, Any]:
     report = _load(pipe, "s7/fidelity_report", FidelityReport)
     data = report.model_dump(mode="json", exclude={"target_render"})
     data["rounds"] = pipe.state.get("rounds", [])
+    data["outputs"] = _outputs_summary(pipe)
     return data
+
+
+def _outputs_summary(pipe) -> list[dict[str, Any]]:
+    """各輸出檔的摘要（給前端在下載前提醒）：檔名、自檢結果與說明；svg_assets 另附 zip 裡的向量圖數量
+    （0 表示 zip 裡只有說明檔，前端會建議改選整頁的 SVG）。"""
+    out = []
+    for f in _intent(pipe).outputs:
+        if not pipe.store.has(f"s6/{f.value}"):
+            continue
+        of = pipe.store.load(f"s6/{f.value}", OutputFile)
+        item: dict[str, Any] = {"format": f.value, "filename": of.filename, "selfcheck_ok": of.selfcheck_ok, "notes": list(of.selfcheck_notes)}
+        if f == OutputFormat.SVG_ASSETS:
+            try:
+                import zipfile
+
+                with zipfile.ZipFile(pipe.store.blob_path(of.file)) as z:
+                    item["vector_count"] = int(json.loads(z.read("manifest.json")).get("count", 0))
+            except Exception:  # 讀不到 manifest：不提供數量（前端不提醒）
+                item["vector_count"] = None
+        out.append(item)
+    return out
 
 
 @app.get("/api/jobs/{job_id}/pages")

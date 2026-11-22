@@ -154,7 +154,9 @@ def text_lines(pdf: bytes) -> list[list[dict]]:
     for i in range(len(doc)):
         r = PageReader(doc, i)
         H = doc[i].get_size()[1]
-        chars = sorted(((c.text, c.origin[0], H - c.origin[1], c.size, c.loose_box) for c in r.chars() if c.text.strip() and not c.generated),
+        # PDFium 把行尾的連字號回報成 \x02（它判斷那是斷字用的連字號）：換回連字號
+        chars = sorted(((c.text.replace("\x02", "-"), c.origin[0], H - c.origin[1], c.size, c.loose_box) for c in r.chars()
+                        if c.text.strip() and not c.generated),
                        key=lambda c: (round(c[2], 1), c[1]))
         r.close()
         lines: list[dict] = []

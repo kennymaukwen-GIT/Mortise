@@ -55,6 +55,7 @@ export const en = {
   "err.readGeneric": "“{name}” could not be opened. It may be damaged.",
   "err.detail": "Server message",
   "err.goneHint": "Open the file again to convert it.",
+  "err.busy": "A file is being converted. Wait for it to finish, or press Cancel first.",
 
   "nav.prev": "Previous page",
   "nav.next": "Next page",
@@ -243,6 +244,7 @@ export const zhHant: Record<MessageKey, string> = {
   "err.readGeneric": "「{name}」打不開，檔案可能已損壞。",
   "err.detail": "伺服器的訊息",
   "err.goneHint": "重新開啟檔案即可再轉換。",
+  "err.busy": "目前正在轉換檔案。請等它完成，或先按「取消」。",
 
   "nav.prev": "上一頁",
   "nav.next": "下一頁",
