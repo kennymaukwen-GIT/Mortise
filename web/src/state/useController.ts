@@ -56,7 +56,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
   const openSeq = useRef(0);
   // Set synchronously when a conversion starts, so two clicks in the same task cannot create two jobs
   // (stateRef only changes after React re-renders).
-  const busyRef = useRef(false);
+  const busyRef = useRef<AbortController | null>(null);
 
   // Free the previous preview when the document changes, and the last one on unmount.
   const docRef = useRef(state.doc);
@@ -193,10 +193,10 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     const origin = resolveOrigin(s.settings);
     const target = resolveTarget(s.settings, d.presets, sourceOrientation(s.doc, s.pages));
     if (blocks(origin) || blocks(target)) return;
-    busyRef.current = true;
+    const ctrl = new AbortController();
+    busyRef.current = ctrl;
     const format = s.settings.format;
     dispatch({ type: "UPLOAD_START", format, hadOriginSize: origin.kind === "ok" });
-    const ctrl = new AbortController();
     uploadAbort.current = ctrl;
     try {
       const st = await api.createJob(
@@ -224,7 +224,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
       uploadAbort.current = null;
       dispatch({ type: "JOB_FAILED", error: fromException(e, "upload") });
     } finally {
-      busyRef.current = false;
+      if (busyRef.current === ctrl) busyRef.current = null;
     }
   }, [dispatch, finishJob, follow]);
 
@@ -239,6 +239,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     stopWatching();
     uploadAbort.current?.abort();
     uploadAbort.current = null;
+    busyRef.current = null; // the aborted upload may still be waiting for its answer (then it deletes its job itself)
     const id = s.jobId;
     dispatch({ type: "CANCELLED" });
     if (id) {

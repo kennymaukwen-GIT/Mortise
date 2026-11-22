@@ -1462,8 +1462,9 @@ input.field__input {
   text-overflow: ellipsis;
   pointer-events: none;
 }
-.pill-select--short select {
-  color: transparent;
+.pill-select.pill-select--short select,
+.pill-select.pill-select--short select:disabled {
+  color: transparent; /* also when disabled (the general disabled rule would otherwise show the full name under the short one) */
 }
 .pill-select--short select:disabled + .pill-select__caret,
 .pill-select--short:has(select:disabled) .pill-select__value {
@@ -1741,8 +1742,8 @@ input.field__input {
     --frame-radius: 26px;
     --card-radius: 28px;
     --card-pad: 26px 18px 20px 18px;
-    --label-col: 84px;
-    --input-w: 58px;
+    --label-col: 98px; /* "Origin Size:" at 17 px is about 92 px wide */
+    --input-w: 52px;
     --convert-h: 64px;
     --convert-r: 26px;
     --gap: 16px;

@@ -127,6 +127,7 @@ export type Action =
   | { type: "CONVERT_AGAIN" }
   | { type: "OPEN_JOB_START"; jobId: string; filename: string; format: string }
   | { type: "JOB_META"; hadOriginSize: boolean; settings?: Partial<Settings>; filename?: string | null; format?: string | null }
+  | { type: "FORMATS_AVAILABLE"; formats: string[] }
   | { type: "RESET" };
 
 function clampPage(index: number, count: number): number {
@@ -286,6 +287,12 @@ export function reducer(s: State, a: Action): State {
         jobFormat: a.format || s.jobFormat,
         settings: a.settings ? { ...s.settings, ...a.settings } : s.settings,
       };
+    case "FORMATS_AVAILABLE": {
+      // Keep the chosen format (e.g. filled in from a reopened job) when the server offers it; else SVG, else the first one.
+      const f = s.settings.format;
+      const next = a.formats.includes(f) ? f : a.formats.includes("svg") ? "svg" : (a.formats[0] ?? f);
+      return next === f ? s : { ...s, settings: { ...s.settings, format: next } };
+    }
     case "RESET":
       return { ...initialState, settings: { ...s.settings, originW: "", originH: "", orientation: null } };
     default:

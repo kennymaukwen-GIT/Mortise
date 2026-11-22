@@ -47,8 +47,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
       .then((list) => {
         if (!alive) return;
         setFormats(list);
-        const avail = list.filter((f) => f.available).map((f) => f.format);
-        dispatch({ type: "SETTINGS", patch: { format: avail.includes("svg") ? "svg" : (avail[0] ?? "svg") } });
+        dispatch({ type: "FORMATS_AVAILABLE", formats: list.filter((f) => f.available).map((f) => f.format) });
       })
       .catch(() => {
         if (!alive) return;

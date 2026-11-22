@@ -136,6 +136,14 @@ describe("reducer", () => {
     expect(s.file).toBe(file);
   });
 
+  it("keeps a format filled in from a job when the format list arrives later", () => {
+    let s = reducer(initialState, { type: "JOB_META", hadOriginSize: false, settings: { format: "docx_fixed" } });
+    s = reducer(s, { type: "FORMATS_AVAILABLE", formats: ["svg", "docx_fixed"] });
+    expect(s.settings.format).toBe("docx_fixed");
+    s = reducer(s, { type: "FORMATS_AVAILABLE", formats: ["pdf", "svg"] });
+    expect(s.settings.format).toBe("svg");
+  });
+
   it("start over clears everything but keeps the chosen format", () => {
     let s = reducer(loaded(), { type: "SETTINGS", patch: { format: "pdf", originW: "10" } });
     s = reducer(s, { type: "RESET" });

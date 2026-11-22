@@ -261,7 +261,7 @@ test("wrong files are refused inside the frame", async () => {
   await page.context().close();
 });
 
-test("a broken PDF fails on the server and offers Retry", async () => {
+test("a broken PDF fails on the server: English message, no pointless Retry", async () => {
   const page = await newPage();
   // Valid enough for the browser preview? No: pdf.js refuses it too, so send it through a bigger valid file first.
   await chooseFile(page, "slide_basic.pdf");
@@ -280,13 +280,32 @@ test("a broken PDF fails on the server and offers Retry", async () => {
   await page.click("button.convert-btn");
   await page.waitForSelector('[data-testid="job-error"]', { timeout: 120000 });
   const msg = await page.textContent('[data-testid="job-error"]');
-  assert(msg && msg.trim().length > 0, "server error message shown");
+  assert(/could not open this file/i.test(msg) && !/[\u4e00-\u9fff]/.test(msg), "English message for a damaged file: " + msg);
+  assert(await page.getByText("Server message").count(), "the server's own text is behind a toggle");
+  assert(!(await page.getByRole("button", { name: "Retry" }).count()), "no Retry for a file that cannot be opened");
   await shot(page, "failed");
   await page.unroute("**/api/jobs");
+  const [fc] = await Promise.all([page.waitForEvent("filechooser"), page.getByRole("button", { name: "Choose another file" }).click()]);
+  assert(fc, "Choose another file opens the picker");
+  await page.context().close();
+});
+
+test("a network failure after a finished run does not fail the job; Retry asks again", async () => {
+  const page = await newPage();
+  await chooseFile(page, "slide_basic.pdf");
+  // Every request for the job's pages fails until we let it through (simulates the network dropping at the end).
+  let block = true;
+  await page.route("**/api/jobs/*/pages", (route) => (block ? route.abort("internetdisconnected") : route.continue()));
+  await page.click("button.convert-btn");
+  await page.waitForSelector('[data-testid="job-error"]', { timeout: CONVERT_TIMEOUT });
+  const msg = await page.textContent('[data-testid="job-error"]');
+  assert(/could not be reached/.test(msg) && !/Failed to fetch/.test(msg), "network message, translated: " + msg);
+  const posts = [];
+  page.on("request", (r) => r.method() === "POST" && r.url().endsWith("/api/jobs") && posts.push(r.url()));
+  block = false;
   await page.getByRole("button", { name: "Retry" }).click();
-  await page.waitForSelector('[data-testid="progress"]', { timeout: 10000 });
-  await page.getByRole("button", { name: "Cancel" }).click();
-  await page.waitForSelector('[data-testid="progress"]', { state: "detached", timeout: 10000 });
+  await page.waitForSelector('[data-testid="frame-score"]', { timeout: CONVERT_TIMEOUT });
+  assert(posts.length === 0, "Retry asked about the same job instead of uploading again");
   await page.context().close();
 });
 
@@ -476,12 +495,158 @@ test("mobile layout", async () => {
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
   await shot(page, "mobile-card");
   await page.context().close();
-  const tablet = await newPage({ width: 1024, height: 900 });
+  const tablet = await newPage({ width: 1024, height: 768 });
   const f2 = await tablet.locator(".stage").boundingBox();
   const c2 = await tablet.locator(".card").boundingBox();
-  assert(c2.y >= f2.y + f2.height, "card below the frame under 1100 px");
+  const b2 = await tablet.locator("button.convert-btn").boundingBox();
+  assert(c2.x >= f2.x + f2.width, "card beside the frame at 1024 px");
+  assert(b2.y + b2.height <= 768, "CONVERT on the first screen at 1024×768: bottom " + Math.round(b2.y + b2.height));
   await shot(tablet, "tablet-empty");
   await tablet.context().close();
+  const narrow = await newPage({ width: 768, height: 1024 });
+  const f3 = await narrow.locator(".stage").boundingBox();
+  const c3 = await narrow.locator(".card").boundingBox();
+  assert(c3.y >= f3.y + f3.height && c3.y < 1024, "card below the frame under 900 px, its top on the first screen");
+  await narrow.context().close();
+});
+
+test("dragging a file over the frame shows only the drop hint", async () => {
+  const page = await newPage();
+  const dt = await page.evaluateHandle(() => {
+    const d = new DataTransfer();
+    d.items.add(new File(["%PDF-1.4"], "x.pdf", { type: "application/pdf" }));
+    return d;
+  });
+  await page.dispatchEvent("section.stage", "dragenter", { dataTransfer: dt });
+  assert((await page.locator(".empty").evaluate((el) => getComputedStyle(el).visibility)) === "hidden", "empty-state text hidden under the hint");
+  const bg = await page.locator(".drop-hint").evaluate((el) => getComputedStyle(el).backgroundColor);
+  assert(bg === "rgb(11, 12, 13)", "opaque hint background: " + bg);
+  await page.context().close();
+});
+
+test("sizes outside 12.7–5080 mm are stopped on the card, nothing is uploaded", async () => {
+  const page = await newPage();
+  await chooseFile(page, "slide_basic.pdf");
+  const posts = [];
+  page.on("request", (r) => r.method() === "POST" && r.url().endsWith("/api/jobs") && posts.push(r.url()));
+  await page.getByRole("textbox", { name: "Original width in millimetres" }).fill("100000");
+  await page.getByRole("textbox", { name: "Original height in millimetres" }).fill("50000");
+  await expectText(page.locator(".card .card-error"), /between 12\.7 and 5080 mm/);
+  await page.click("button.convert-btn");
+  await page.waitForTimeout(500);
+  assert(posts.length === 0 && !(await page.getByTestId("progress").count()), "no upload for an impossible origin size");
+  await page.getByRole("textbox", { name: "Original width in millimetres" }).fill("");
+  await page.getByRole("textbox", { name: "Original height in millimetres" }).fill("");
+  await page.getByRole("textbox", { name: "Output width in millimetres" }).fill("5");
+  await page.getByRole("textbox", { name: "Output height in millimetres" }).fill("5");
+  await expectText(page.locator(".card .card-error"), /between 12\.7 and 5080 mm/);
+  await page.click("button.convert-btn");
+  await page.waitForTimeout(500);
+  assert(posts.length === 0, "no upload for a 5 × 5 mm output");
+  await page.context().close();
+});
+
+test("opening a second file shows the second file (no stale preview)", async () => {
+  const page = await newPage();
+  await chooseFile(page, "deck.pdf");
+  await waitImages(page);
+  const first = await page.locator(".viewer .layer-img").getAttribute("src");
+  await page.setInputFiles('[data-testid="file-input"]', resolve(fixtures, "slide_basic.pdf"));
+  await expectText(page.getByTestId("page-count"), /^1 \/ 1$/);
+  await page.waitForFunction((src) => { const im = document.querySelector(".viewer .layer-img"); return im && im.getAttribute("src") !== src && im.complete && im.naturalWidth > 0; }, first, { timeout: 30000 });
+  await page.context().close();
+});
+
+test("Word output: the preview says Mortise drew it; reload comes back to the job", async () => {
+  const page = await newPage();
+  await chooseFile(page, "slide_basic.pdf");
+  await page.getByRole("combobox", { name: "Output format" }).selectOption("docx_fixed");
+  assert((await page.locator(".pill-select__value").first().textContent()) === "Word, fixed layout", "closed menu shows the short name");
+  await convert(page);
+  await page.getByRole("tab", { name: "Result" }).click();
+  await waitImages(page);
+  const note = page.getByTestId("render-note");
+  await note.waitFor({ timeout: 30000 });
+  assert((await note.getAttribute("data-render")) === "neutral", "Word preview drawn by the neutral renderer");
+  assert(/drawn by Mortise itself, not by Word/.test(await note.textContent()), "plain-language note: " + (await note.textContent()));
+  assert(/Fidelity \d+%/.test(await page.textContent('[data-testid="frame-score"]')), "score shown for Word");
+  await shot(page, "done-docx-neutral");
+  const url = new URL(page.url());
+  const job = url.searchParams.get("job");
+  assert(job, "the job id is in the address");
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector('[data-testid="frame-score"]', { timeout: 30000 });
+  assert((await page.getByRole("combobox", { name: "Output format" }).inputValue()) === "docx_fixed", "card filled back in from the job");
+  await page.context().close();
+});
+
+test("Cancel during a correction re-run keeps the job and the result", async () => {
+  const page = await newPage();
+  await chooseFile(page, "slide_basic.pdf");
+  await convert(page);
+  const job = await currentJob(page);
+  await page.getByRole("tab", { name: "Result" }).click();
+  await page.getByRole("button", { name: "Edit" }).click();
+  await page.waitForSelector(".el-box--text", { timeout: 30000 });
+  await page.locator(".el-box--text").first().click();
+  const dialog = page.getByRole("dialog", { name: "Edit text" });
+  await dialog.waitFor();
+  assert(await dialog.locator("textarea").first().evaluate((el) => el === document.activeElement), "focus starts in the first text field");
+  await dialog.locator("textarea").first().fill("CHANGED TITLE");
+  await dialog.getByRole("button", { name: "Apply" }).click();
+  await page.waitForSelector('[data-testid="progress"]', { timeout: 10000 });
+  await page.getByRole("button", { name: "Show the current result" }).click();
+  await page.waitForSelector('[data-testid="progress"]', { state: "detached", timeout: 10000 });
+  assert(await page.getByTestId("frame-score").count(), "previous result still shown");
+  assert((await fetch(`${API}/api/jobs/${job.jobId}`)).status === 200, "job still on the server");
+  // The re-run finishes in the background; the job keeps the correction.
+  const end = Date.now() + CONVERT_TIMEOUT;
+  let st = null;
+  while (Date.now() < end) {
+    st = await (await fetch(`${API}/api/jobs/${job.jobId}`)).json();
+    if (st.status === "done" && st.corrections >= 1) break;
+    await sleep(1000);
+  }
+  assert(st && st.status === "done" && st.corrections >= 1, "re-run finished with the correction: " + JSON.stringify(st && { s: st.status, c: st.corrections }));
+  assert((await currentJob(page))?.jobId === job.jobId, "job still in the recent list");
+  await page.context().close();
+});
+
+test("report download works with a Chinese file name", async () => {
+  const page = await newPage();
+  const buf = readFileSync(resolve(fixtures, "slide_basic.pdf"));
+  await page.setInputFiles('[data-testid="file-input"]', { name: "季度報告 (final).pdf", mimeType: "application/pdf", buffer: buf });
+  await page.waitForSelector(".viewer .layer-img", { timeout: 30000 });
+  await convert(page);
+  const [rep] = await Promise.all([page.waitForEvent("download"), page.locator(".result-card a", { hasText: "Download report" }).click()]);
+  assert((await rep.failure()) === null, "report downloaded");
+  const report = JSON.parse(readFileSync(await rep.path(), "utf8"));
+  assert(typeof report.overall_score === "number", "the download is the report");
+  // Headless Chromium names every non-ASCII download "download" (also the main file, which Starlette names), so check the header.
+  const job = await currentJob(page);
+  const cd = (await fetch(`${API}/api/jobs/${job.jobId}/download/report`)).headers.get("content-disposition") || "";
+  assert(cd.includes("filename*=UTF-8''" + encodeURIComponent("季度報告 (final).report.json").replace(/[()]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())), "UTF-8 file name in the header: " + cd);
+  await page.context().close();
+});
+
+test("keyboard: Esc gives focus back; Tab out closes the menu; orientation arrows do not turn pages", async () => {
+  const page = await newPage();
+  await chooseFile(page, "deck.pdf");
+  const fileBtn = page.getByRole("button", { name: /File menu/ });
+  await fileBtn.click();
+  await page.keyboard.press("Escape");
+  assert(await fileBtn.evaluate((el) => el === document.activeElement), "Esc returns focus to the File button");
+  await fileBtn.click();
+  for (let i = 0; i < 6; i++) await page.keyboard.press("Tab");
+  assert(!(await page.getByRole("menu").count()), "menu closed when focus left it");
+  await page.getByRole("combobox", { name: "Output page size" }).selectOption("A4");
+  const land = page.getByRole("radio", { name: "Landscape" });
+  await land.focus();
+  await page.keyboard.press("ArrowLeft");
+  await expectText(page.getByTestId("page-count"), /^1 \/ 3$/);
+  assert((await page.getByRole("radio", { name: "Portrait" }).getAttribute("aria-checked")) === "true", "← chose portrait");
+  assert((await page.getByRole("radio", { name: "Portrait" }).getAttribute("tabindex")) === "0", "roving tabindex");
+  await page.context().close();
 });
 
 /* ---------------------------------------------------------------- main */
