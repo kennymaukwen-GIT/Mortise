@@ -165,6 +165,7 @@ class StyledPage(Model):
     reading_order: list[str] = []
     tables: list[StyledTable] = []
     vectors: list[StyledVector] = []  # 向量圖；每個都對應 images 裡 vector_id 相同的那張圖片
+    placement: Optional[Box] = None  # 有指定輸出尺寸時：原始頁面的內容縮放後放在輸出頁面的哪裡（pt）。⑦比對原圖時只比這個範圍；沒有縮放就留空
 
 
 class StyledMaster(Model):

@@ -13,6 +13,7 @@ class Intent(Model):
     outputs: list[OutputFormat] = [OutputFormat.PPTX]
     mode: UsageMode = UsageMode.RESCUE
     known_size: Optional[PhysicalSize] = None  # 使用者已知的實際尺寸（永遠優先）
+    target_size: Optional[PhysicalSize] = None  # 使用者指定的輸出尺寸（例如 A3）：⑤把整頁等比例縮放到這個尺寸並置中；不指定就維持原始尺寸
     languages: list[str] = ["zh-Hant", "en"]
 
 
