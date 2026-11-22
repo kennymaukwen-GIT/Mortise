@@ -193,8 +193,6 @@ export const en = {
   "edit.kind.text": "Text box",
   "edit.failed": "The correction could not be sent: {msg}",
   "edit.loadFailed": "The elements of this page could not be loaded.",
-  "edit.article.a": "a",
-  "edit.article.an": "an",
 
   "lang.en": "English",
   "lang.zh": "繁體中文",
@@ -389,7 +387,7 @@ export const zhHant: Record<MessageKey, string> = {
   "edit.noChanges": "還沒有修改。",
   "edit.issues": "需要注意",
   "edit.confidence": "信心值 {pct}%",
-  "edit.notText": "這是{kind}，這裡只能修正文字框。",
+  "edit.notText": "這是{article}{kind}，這裡只能修正文字框。",
   "edit.kind.table": "表格",
   "edit.kind.image": "圖片",
   "edit.kind.shape": "形狀",
@@ -397,8 +395,6 @@ export const zhHant: Record<MessageKey, string> = {
   "edit.kind.text": "文字框",
   "edit.failed": "修正沒有送出：{msg}",
   "edit.loadFailed": "這一頁的元素載入失敗。",
-  "edit.article.a": "",
-  "edit.article.an": "",
 
   "lang.en": "English",
   "lang.zh": "繁體中文",

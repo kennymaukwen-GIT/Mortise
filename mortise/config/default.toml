@@ -192,7 +192,9 @@ docx_portable_fonts = [              # 2. 已經是多數裝置都有的字型�
 ]
 # 3. 其他字型依類別（字型檔的等寬旗標、PANOSE、名稱）寫成該類的常見字型（有損，記錄）。等寬字型只在整個文字框都是等寬字時保留
 docx_fallback_fonts = { sans = "Arial", serif = "Times New Roman", mono = "Courier New", cjk_sans = "Microsoft JhengHei", cjk_serif = "PMingLiU", cjk_kai = "DFKai-SB" }
-docx_embed_fonts = false             # 是否把字型內嵌進 Word 檔（見 docx_common.py「內嵌字型」；預設關）
+docx_embed_fonts = false             # 是否把字型內嵌進 Word 檔（評估見 docx_common.py「內嵌字型」：LibreOffice 實測會讀，其他軟體需查證；檔案約大十倍，預設關）
+docx_embed_max_kb = 3072             # 內嵌字型檔的總大小上限（KB，未壓縮）；中日韓字型一律不內嵌
+docx_embed_deny_prefixes = ["Unifont"]  # 不內嵌的字型（字族名稱的開頭），同 pdf_font_deny_prefixes
 
 [verify]                             # ⑦ 驗證
 render_dpi = 100                     # 比對用的渲染解析度（dpi）

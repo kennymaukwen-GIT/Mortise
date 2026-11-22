@@ -2,8 +2,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { Box, CorrectionIn, PageElements, TextBoxInfo } from "../api/types";
 import { useI18n } from "../i18n/I18n";
+import { hasCjk, visibleIssues } from "../lib/errors";
 import { diffForm, initialForm, normalizeHex, type TextForm } from "../state/corrections";
-import { Close } from "./Icons";
+import { Caret, Close } from "./Icons";
 
 const LOW = 0.7;
 
@@ -11,10 +12,11 @@ type AnyEl = { id: string; box: Box; confidence: number | null; issues: string[]
 
 export function flatten(els: PageElements): AnyEl[] {
   const out: AnyEl[] = [];
-  for (const t of els.text_boxes) out.push({ id: t.id, box: t.box, confidence: t.confidence, issues: t.issues, kind: "text", tb: t, label: t.paragraphs.map((p) => p.text).join(" ").slice(0, 60) });
-  for (const t of els.tables) out.push({ id: t.id, box: t.box, confidence: t.confidence, issues: t.issues, kind: "table", label: `${t.rows}×${t.cols}` });
-  for (const i of els.images) out.push({ id: i.id, box: i.box, confidence: i.confidence, issues: i.issues, kind: "image", label: i.id });
-  for (const s of els.shapes) out.push({ id: s.id, box: s.box, confidence: s.confidence, issues: s.issues, kind: "shape", label: s.geometry });
+  // "信心值 0.50 偏低" is already shown in the UI's own words (Confidence 50%), so it is left out of the issues.
+  for (const t of els.text_boxes) out.push({ id: t.id, box: t.box, confidence: t.confidence, issues: visibleIssues(t.issues), kind: "text", tb: t, label: t.paragraphs.map((p) => p.text).join(" ").slice(0, 60) });
+  for (const t of els.tables) out.push({ id: t.id, box: t.box, confidence: t.confidence, issues: visibleIssues(t.issues), kind: "table", label: `${t.rows}×${t.cols}` });
+  for (const i of els.images) out.push({ id: i.id, box: i.box, confidence: i.confidence, issues: visibleIssues(i.issues), kind: "image", label: i.id });
+  for (const s of els.shapes) out.push({ id: s.id, box: s.box, confidence: s.confidence, issues: visibleIssues(s.issues), kind: "shape", label: s.geometry });
   // Big things first so small boxes stay on top and clickable.
   return out.sort((a, b) => b.box.w * b.box.h - a.box.w * a.box.h);
 }
@@ -24,7 +26,7 @@ export function isFlagged(e: { confidence: number | null; issues: string[] }): b
 }
 
 export function EditLayer({ elements, onSelect, selectedId }: { elements: PageElements; onSelect: (id: string) => void; selectedId: string | null }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const list = useMemo(() => flatten(elements), [elements]);
   const W = elements.width_pt || 1;
   const H = elements.height_pt || 1;
@@ -33,7 +35,10 @@ export function EditLayer({ elements, onSelect, selectedId }: { elements: PageEl
       {list.map((e) => {
         const flagged = isFlagged(e);
         const kindLabel = e.kind === "text" ? t("edit.kind.text") : t(`edit.kind.${e.kind}` as "edit.kind.table");
-        const reason = e.issues.join(" · ") || (e.confidence != null && e.confidence < LOW ? t("edit.confidence", { pct: Math.round(e.confidence * 100) }) : "");
+        // Server issue texts are Chinese; in the English UI they are left to the dialog (where they are marked as Chinese).
+        const issues = lang === "zh-Hant" ? e.issues : e.issues.filter((m) => !hasCjk(m));
+        const conf = e.confidence != null && e.confidence < LOW ? t("edit.confidence", { pct: Math.round(e.confidence * 100) }) : "";
+        const reason = [conf, ...issues].filter(Boolean).join(" · ") || (e.issues.length ? t("edit.issues") : "");
         return (
           <button
             key={e.id}
@@ -61,7 +66,7 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
   onClose: () => void;
   onApply: (items: CorrectionIn[]) => Promise<void>;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const uid = useId();
   const el = useMemo(() => flatten(elements).find((e) => e.id === elementId) ?? null, [elements, elementId]);
   const tb = el?.tb ?? null;
@@ -77,7 +82,8 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
   }, [before]);
 
   useEffect(() => {
-    const first = panel.current?.querySelector<HTMLElement>("textarea, input, select, button");
+    // Start in the first text field (the close button comes first in the markup).
+    const first = panel.current?.querySelector<HTMLElement>("textarea") ?? panel.current?.querySelector<HTMLElement>("input, select, button");
     first?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -154,14 +160,18 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
             <ul>
               {el.confidence != null && el.confidence < LOW && <li>{t("edit.confidence", { pct: Math.round(el.confidence * 100) })}</li>}
               {el.issues.map((m, i) => (
-                <li key={i}>{m}</li>
+                <li key={i} lang={hasCjk(m) ? "zh-Hant" : undefined}>
+                  {m}
+                </li>
               ))}
             </ul>
           </div>
         )}
 
         {!tb || !form ? (
-          <p className="dialog__note">{t("edit.notText", { kind: kindLabel.toLowerCase() })}</p>
+          <p className="dialog__note">
+            {t("edit.notText", { kind: kindLabel.toLowerCase(), article: lang === "en" ? (/^[aeiou]/i.test(kindLabel) ? "an" : "a") : "" })}
+          </p>
         ) : (
           <form
             className="dialog__form"
@@ -212,13 +222,16 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
               </label>
               <label className="field field--grow">
                 <span className="field__label">{t("edit.align")}</span>
-                <select className="field__input" value={form.align} onChange={(e) => setForm({ ...form, align: e.target.value })}>
-                  {(["left", "center", "right", "justify"] as const).map((a) => (
-                    <option key={a} value={a}>
-                      {t(`edit.align.${a}`)}
-                    </option>
-                  ))}
-                </select>
+                <span className="pill-select pill-select--field">
+                  <select value={form.align} onChange={(e) => setForm({ ...form, align: e.target.value })}>
+                    {(["left", "center", "right", "justify"] as const).map((a) => (
+                      <option key={a} value={a}>
+                        {t(`edit.align.${a}`)}
+                      </option>
+                    ))}
+                  </select>
+                  <Caret className="pill-select__caret" />
+                </span>
               </label>
             </div>
             {error && (

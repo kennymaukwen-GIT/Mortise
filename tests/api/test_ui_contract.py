@@ -189,11 +189,13 @@ def test_preview_cache_and_invalidation(client, sized_job):
     from mortise.pipeline import Pipeline
 
     base = f"/api/jobs/{sized_job}/pages/1/image"
-    params = {"kind": "result", "format": "svg", "width": 300}
+    params = {"kind": "result", "format": "svg", "width": 600}  # 前端使用的級距之一（只有這些寬度寫進磁碟快取）
     r1 = client.get(base, params=params)
     folder = Path(os.environ["MORTISE_JOBS"]) / sized_job / "previews"
-    cached = sorted(p.name for p in folder.glob("result-svg-p1-w300-*.png"))
+    cached = sorted(p.name for p in folder.glob("result-svg-p1-w600-*.png"))
     assert len(cached) == 1
+    odd = client.get(base, params={**params, "width": 333})  # 不常用的寬度照畫，但不存檔（免得任意寬度塞滿磁碟）
+    assert odd.status_code == 200 and not list(folder.glob("result-svg-p1-w333-*"))
     t0 = time.time()
     r2 = client.get(base, params=params)
     assert r2.content == r1.content and r2.headers["etag"] == r1.headers["etag"]
@@ -207,7 +209,7 @@ def test_preview_cache_and_invalidation(client, sized_job):
     assert _wait(client, sized_job)["status"] == "done"
     r3 = client.get(base, params=params)
     assert r3.status_code == 200 and r3.headers["etag"] != r1.headers["etag"]
-    now = sorted(p.name for p in folder.glob("result-svg-p1-w300-*.png"))
+    now = sorted(p.name for p in folder.glob("result-svg-p1-w600-*.png"))
     assert len(now) == 1 and now != cached
     pipe = Pipeline(Path(os.environ["MORTISE_JOBS"]) / sized_job)
     assert pipe.store.has("s7/fidelity_report")

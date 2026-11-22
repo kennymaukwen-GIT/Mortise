@@ -1,12 +1,12 @@
 import type { PageSizePreset } from "../api/types";
 import { FALLBACK_PAGE_SIZES } from "../lib/catalog";
 import type { LocalDoc } from "../lib/localDoc";
-import { detectedSizeMm, effectiveOrientation, pageGeometry, resolveOrigin, resolveTarget, sourceOrientation } from "./derive";
+import { detectedSizeMm, effectiveOrientation, pageGeometry, resolveOrigin, resolveTarget, settingsFromIntent, sourceOrientation } from "./derive";
 import { initialSettings, type Settings } from "./store";
 
 const presets: PageSizePreset[] = FALLBACK_PAGE_SIZES;
 const s = (patch: Partial<Settings>): Settings => ({ ...initialSettings, ...patch });
-const doc = (w: number, h: number): LocalDoc => ({ kind: "pdf", pageCount: 1, sizes: [{ width: w, height: h, unit: "pt" }], render: async () => "", destroy: () => {} });
+const doc = (w: number, h: number): LocalDoc => ({ id: 1, kind: "pdf", pageCount: 1, sizes: [{ width: w, height: h, unit: "pt" }], render: async () => "", destroy: () => {} });
 
 describe("output size", () => {
   it("is not sent for Original size", () => {
@@ -39,6 +39,25 @@ describe("output size", () => {
     expect(resolveOrigin(s({})).kind).toBe("empty");
     expect(resolveOrigin(s({ originW: "210" })).kind).toBe("incomplete");
     expect(resolveOrigin(s({ originW: "210", originH: "297" }))).toEqual({ kind: "ok", width: 210, height: 297 });
+  });
+
+  it("rejects sizes the server would refuse (12.7 to 5080 mm) before uploading", () => {
+    // 100000 × 50000 mm once made the server try to allocate 348 GB and crash.
+    expect(resolveOrigin(s({ originW: "100000", originH: "50000" })).kind).toBe("range");
+    expect(resolveOrigin(s({ originW: "1", originH: "1" })).kind).toBe("range");
+    expect(resolveOrigin(s({ originW: "12.7", originH: "5080" })).kind).toBe("ok");
+    expect(resolveTarget(s({ sizeMode: "custom", targetW: "5", targetH: "5" }), presets, null)).toEqual({ kind: "range" });
+    expect(resolveTarget(s({ sizeMode: "custom", targetW: "6000", targetH: "6000" }), presets, null)).toEqual({ kind: "range" });
+  });
+
+  it("fills the card back in from a job's intent", () => {
+    expect(settingsFromIntent({ outputs: ["pptx"], target_size: { width: 297, height: 210, unit: "mm" } }, presets)).toMatchObject({
+      format: "pptx", sizeMode: "preset", presetId: "A4", orientation: "landscape", originW: "",
+    });
+    expect(settingsFromIntent({ outputs: ["svg"], known_size: { width: 21, height: 29.7, unit: "cm" }, target_size: { width: 100, height: 50, unit: "mm" } }, presets)).toMatchObject({
+      originW: "210", originH: "297", sizeMode: "custom", targetW: "100", targetH: "50",
+    });
+    expect(settingsFromIntent({ outputs: ["svg"] }, presets)).toMatchObject({ sizeMode: "original", presetId: null });
   });
 });
 

@@ -11,7 +11,7 @@ import { I18nProvider, useI18n } from "./i18n/I18n";
 import { DEFAULT_ACCEPTED, DEFAULT_MAX_FILE_MB, FALLBACK_PAGE_SIZES, FORMAT_LABELS_EN } from "./lib/catalog";
 import * as storage from "./lib/storage";
 import type { RecentJob } from "./lib/storage";
-import { initialState, reducer } from "./state/store";
+import { initialState, isWorking, reducer } from "./state/store";
 import { useController } from "./state/useController";
 
 const FALLBACK_FORMATS: FormatInfo[] = Object.entries(FORMAT_LABELS_EN).map(([format, label_en]) => ({ format, label: label_en, label_en, available: false }));
@@ -27,6 +27,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   const [allowTraining, setAllowTraining] = useState(storage.loadAllowTraining);
   const [recent, setRecent] = useState<RecentJob[]>(storage.loadRecent);
   const [toast, setToast] = useState<string | null>(null);
+  const [hasLibreOffice, setHasLibreOffice] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   // Server facts: limits, formats, page sizes.
@@ -38,6 +39,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
         if (!alive) return;
         if (typeof h.max_file_mb === "number" && h.max_file_mb > 0) setMaxMb(h.max_file_mb);
         if (Array.isArray(h.accepted) && h.accepted.length) setAccepted(h.accepted);
+        setHasLibreOffice(!!h.verify_engine);
       })
       .catch(() => undefined);
     api
@@ -69,22 +71,49 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
     return () => clearTimeout(id);
   }, [toast]);
 
+  // The list is shared with other tabs: always merge into what is stored now (not this tab's copy),
+  // and follow changes made in other tabs (the storage event fires only in the other tabs).
   const onRecent = useCallback((job: RecentJob) => {
-    setRecent((list) => {
-      const next = storage.upsertRecent(list, job);
-      storage.saveRecent(next);
-      return next;
-    });
+    const next = storage.upsertRecent(storage.loadRecent(), job);
+    storage.saveRecent(next);
+    setRecent(next);
   }, []);
   const onRecentRemoved = useCallback((jobId: string) => {
-    setRecent((list) => {
-      const next = storage.removeRecent(list, jobId);
-      storage.saveRecent(next);
-      return next;
-    });
+    const next = storage.removeRecent(storage.loadRecent(), jobId);
+    storage.saveRecent(next);
+    setRecent(next);
+  }, []);
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === storage.KEY_RECENT) setRecent(storage.loadRecent());
+      if (e.key === null || e.key === storage.KEY_TRAINING) setAllowTraining(storage.loadAllowTraining());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const ctl = useController(state, dispatch, { maxMb, accepted, presets, formats: formats ?? [], allowTraining, onRecent, onRecentRemoved, notify });
+
+  // The job on screen is part of the address (?job=…), so a reload or a shared tab comes back to it.
+  const started = useRef(false);
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    const id = new URLSearchParams(window.location.search).get("job");
+    if (id && /^[A-Za-z0-9_-]{1,64}$/.test(id)) {
+      const known = storage.loadRecent().find((j) => j.jobId === id);
+      void ctl.openJob(known ?? { jobId: id, filename: id, format: "", createdAt: Date.now() });
+    }
+  }, [ctl]);
+  useEffect(() => {
+    if (!started.current) return;
+    const url = new URL(window.location.href);
+    const want = state.jobId ?? null;
+    if (url.searchParams.get("job") === want) return;
+    if (want) url.searchParams.set("job", want);
+    else url.searchParams.delete("job");
+    window.history.replaceState(window.history.state, "", url.pathname + url.search + url.hash);
+  }, [state.jobId]);
 
   // Dropping a file anywhere else must not navigate away from the app.
   useEffect(() => {
@@ -107,8 +136,17 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   return (
     <div className="app">
       <header className="header">
-        <a className="brand" href="/" aria-label={t("header.home")} onClick={(e) => e.preventDefault()}>
-          <Logo size={36} />
+        <a
+          className="brand"
+          href="/"
+          aria-label={t("header.home")}
+          onClick={(e) => {
+            // Back to the empty frame (like File → Start over), except while a file is converting.
+            e.preventDefault();
+            if (!isWorking(state)) ctl.startOver();
+          }}
+        >
+          <Logo size={35} />
           <span className="brand__name">{t("brand")}</span>
         </a>
         <div className="header__actions">
@@ -120,7 +158,8 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
             onOpen={pickFile}
             onStartOver={ctl.startOver}
             onDelete={() => void ctl.deleteFromServer()}
-            canStartOver={state.phase !== "empty"}
+            canStartOver={state.phase !== "empty" && !isWorking(state)}
+            canOpen={!isWorking(state)}
           />
           <AccountMenu
             lang={lang}
@@ -157,6 +196,8 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
           state={state}
           dispatch={dispatch}
           maxMb={maxMb}
+          serverHasLibreOffice={hasLibreOffice}
+          onJobMissing={() => void ctl.checkJob()}
           onPickFile={pickFile}
           onDropFile={(f) => void ctl.openFile(f)}
           onCancel={() => void ctl.cancel()}
@@ -186,6 +227,14 @@ export default function App() {
   const setLang = useCallback((l: Lang) => {
     setLangState(l);
     storage.saveLang(l);
+  }, []);
+  useEffect(() => {
+    // A language chosen in another tab applies here too.
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === storage.KEY_LANG) setLangState(storage.loadLang());
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
   return (
     <I18nProvider lang={lang}>

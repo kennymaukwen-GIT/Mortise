@@ -64,6 +64,7 @@ from .docx_common import (
     font_first_baseline_em,
     worst_case_width_pt,
     condense_spacing,
+    fit_source_lines,
     hard_breaks,
     image_descriptor,
     line_props,
@@ -95,6 +96,8 @@ DEFAULT_PARAMS = {
     "nowrap_page_margin_pt": 1.0,  # 加寬時與紙邊保持的距離（pt）
     "condense_wider_fonts": True,  # 寫入的字型比量測用的字型寬時緊縮字距（見 docx_common.condense_spacing）
     "condense_max_ratio": 0.03,  # 每個字最多緊縮字級的這個比例
+    "fit_source_lines": True,  # 會換行的框逐段模擬換行，寫入的字型多排出行數時再緊縮字距，讓行數回到原圖（見 _fit_lines）
+    "fit_max_ratio": 0.04,  # 為了行數再緊縮時，每個字最多緊縮字級的這個比例（含上面抵消字寬差的部分）
 }
 
 MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -212,6 +215,26 @@ def _single_line_room(item, x: float, w: float, W: float, ctx: Ctx, params: dict
     return x, w, None
 
 
+def _fit_lines(item, paras, spacing, w: float, ctx: Ctx, latin: str, params: dict) -> list:
+    """會自動換行的框：逐段用寫入的字型模擬換行，比原圖多出行數的段落再緊縮字距（見 docx_common.fit_source_lines）。
+    為什麼需要：⑤選的驗證字型不一定和原圖的字一樣寬（例如履歷的一段被配上較寬的字型、第二行量起來就超過框寬），
+    原樣輸出時目標軟體會多排一行，框往下長，蓋到下面的框（例如「Produced and edited…」那一行蓋到「Restaurant — Zhubei」）。"""
+    out = []
+    for sp, sv in zip(paras, spacing):
+        if not sp.runs or any("\n" in r.text for r in sp.runs):
+            out.append(sv)
+            continue
+        base = list(sv) if sv else [0] * len(sp.runs)
+        new, before, after = fit_source_lines(sp, w, ctx, latin, base, params["fit_max_ratio"])
+        target = max(1, sp.source_line_count)
+        if after < before:
+            ctx.degrade(item.id, "換行", f"原圖 {target} 行，寫入的字型會排成 {before} 行：緊縮字距讓行數回到原圖（框才不會往下長、蓋到下面的框）", False)
+        elif before > target:
+            ctx.degrade(item.id, "換行", f"原圖 {target} 行，寫入的字型會排成 {before} 行，緊縮字距到上限仍放不下：框會往下長", True)
+        out.append(new if any(new) else sv)
+    return out
+
+
 def _page_items(page: StyledPage) -> list[tuple[int, int, str, object]]:
     items = [(t.z, 0, "text", t) for t in page.text_boxes] + [(i.z, 1, "image", i) for i in page.images]
     items += [(s.z, 2, "shape", s) for s in page.shapes] + [(t.z, 3, "table", t) for t in page.tables]
@@ -277,6 +300,8 @@ def _add_page(docx_doc, page: StyledPage, ctx: Ctx, styles: dict[str, WordStyle]
                        for sp in paras]
             if any(any(v) for v in spacing if v):
                 ctx.degrade(item.id, "字距", "寫入的字型比量測用的字型寬：緊縮字距抵消字寬差，換行位置才與原圖一樣（框不會多一行而蓋到下一個框）", False)
+            if params["fit_source_lines"] and wrap and not rot:
+                spacing = _fit_lines(item, paras, spacing, w, ctx, latin, params)
             blocks = [build_paragraph(sp, ctx, item.id, latin, ea, styles.get(sp.style_id or ""), align_override=align_override, run_spacing=sv)
                       for sp, sv in zip(paras, spacing)]
             if params["baseline_compensation"] and not rot:

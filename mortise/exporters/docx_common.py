@@ -40,6 +40,12 @@ python-docx（MIT）只負責封裝（部件、關聯、圖片部件）；文字
   等寬字型只有在整個文字框都是等寬字時才保留（程式碼之類）；夾在一般內文裡的等寬字多半是辨識誤判，改用同框內文的字型。
   成品文件裡的推論字型不改（不回寫上游），原本推論的字型名稱寫在 OutputFile.degradations。
   docx_font_names = "inferred" 時照推論的名稱寫（舊做法），只補字型表的資訊。
+
+字型表（word/fontTable.xml）：只列檔內實際用到的字型，每個都寫 family（swiss 無襯線、roman 有襯線、modern 等寬）、
+  pitch、panose1（有就寫）、charset 與 altName（同一字型的其他名稱與字寬相容的替代字型），讓找不到字型的軟體
+  退回同類的字型（ECMA-376 第 1 部 17.8.3）。各軟體是否真的照這些資訊退回：需查證（只在 LibreOffice 上看過結果）。
+
+內嵌字型（設定 docx_embed_fonts，預設關）：評估與做法見本檔「內嵌字型」一節。
 """
 
 from __future__ import annotations
@@ -154,6 +160,7 @@ class Ctx:
     doc_ea: str
     degradations: list[Degradation] = field(default_factory=list)
     fonts: set[str] = field(default_factory=set)
+    faces: set[tuple[str, bool, bool]] = field(default_factory=set)  # 拉丁字型實際用到的字面（名稱, 粗體, 斜體）：內嵌字型用
     scale: float = 1.0
     _seen: set = field(default_factory=set)
     _next_id: int = 1
@@ -226,6 +233,8 @@ FONT_DEFAULTS: dict = {
     "docx_fallback_fonts": {"sans": "Arial", "serif": "Times New Roman", "mono": "Courier New",
                             "cjk_sans": "Microsoft JhengHei", "cjk_serif": "PMingLiU", "cjk_kai": "DFKai-SB"},
     "docx_embed_fonts": False,
+    "docx_embed_max_kb": 3072,
+    "docx_embed_deny_prefixes": ["Unifont"],
 }
 
 _CATEGORY_LABEL = {"sans": "無襯線", "serif": "有襯線", "mono": "等寬", "cjk_sans": "中文黑體", "cjk_serif": "中文明體", "cjk_kai": "中文楷體"}
@@ -318,6 +327,9 @@ class FontPolicy:
         self.font_map = dict(settings["docx_font_map"])
         self.portable = set(settings["docx_portable_fonts"])
         self.fallback = dict(settings["docx_fallback_fonts"])
+        self.embed = bool(settings["docx_embed_fonts"])
+        self.embed_max_kb = float(settings["docx_embed_max_kb"])
+        self.embed_deny = tuple(settings["docx_embed_deny_prefixes"])
         self._cache: dict[tuple, tuple[str, str]] = {}
         self.mono_names: set[str] = set()  # 寫入名稱中屬於等寬字型的
 
@@ -661,6 +673,7 @@ def build_paragraph(
             if sr.color.a < 0.999:
                 ctx.degrade(eid, "文字透明度", "Word 的文字顏色沒有透明度，以不透明顏色輸出", True)
             ctx.fonts.update({fmt.ascii, fmt.east_asia})
+            ctx.faces.add((fmt.ascii, fmt.bold, fmt.italic))
             hint = sr.font.east_asian and bool(_AMBIGUOUS.search(text))
             runs_out.append((fmt, text, hint))
 
@@ -724,10 +737,16 @@ def setup_package(docx_doc, ctx: Ctx, default_size_pt: float) -> None:
     sub(ppr, "w:snapToGrid", {"w:val": "0"})  # 不對齊文件格線
     sub(ppr, "w:spacing", {"w:after": 0, "w:line": 240, "w:lineRule": "auto"})
     ctx.fonts.update({ctx.doc_latin, ctx.doc_ea})
+    ctx.faces.add((ctx.doc_latin, False, False))
     settings = docx_doc.settings.element
     for cs in settings.iter(q("w:compatSetting")):
         if cs.get(q("w:name")) == "compatibilityMode":
             cs.set(q("w:val"), "15")
+
+
+def _is_cjk_name(name: str) -> bool:
+    """看名稱判斷是不是中日韓字型（字型表的類別與內嵌字型用）。"""
+    return bool(re.search(r"[⺀-鿿豈-﫿]", name)) or any(k in name.lower() for k in ("cjk", " tc", " sc", "hei", "ming", "song", "kai", "gothic"))
 
 
 _FAMILY_OF_CATEGORY = {"sans": "swiss", "serif": "roman", "mono": "modern", "cjk_sans": "swiss", "cjk_serif": "roman", "cjk_kai": "script"}
@@ -739,7 +758,7 @@ def font_table_entry(name: str, ctx: Ctx) -> etree._Element:
     f = el("w:font", {"w:name": name})
     info = FONT_TABLE_INFO.get(name)
     if info is None:
-        cjk = bool(re.search(r"[⺀-鿿豈-﫿]", name)) or any(k in name.lower() for k in ("cjk", " tc", " sc", "hei", "ming", "song", "kai", "gothic"))
+        cjk = _is_cjk_name(name)
         cat = font_category(name, name, cjk)
         fi = font_file_info(name)
         panose = fi["panose"] if fi and fi["panose"][:2] not in ("00",) else ""
@@ -770,10 +789,150 @@ def finish_package(docx_doc, ctx: Ctx) -> None:
                 root.remove(ch)
             for name in sorted(ctx.fonts):
                 root.append(font_table_entry(name, ctx))
+            if ctx.policy is not None and ctx.policy.embed:
+                embed_fonts(docx_doc, part, root, ctx)
             part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
     for rid, rel in list(pkg.rels.items()):
         if rel.reltype.endswith("/metadata/thumbnail"):
             del pkg.rels[rid]
+
+
+# ---------- 內嵌字型（設定 docx_embed_fonts，預設關） ----------
+#
+# 評估（2026-11，只在這台機器用 LibreOffice 實測過）：
+#   做法：ECMA-376 第 1 部 17.8.1：字型檔放在 word/fonts/*.odttf，前 32 位元組與 fontKey（GUID 去掉括號與連字號、
+#     16 個位元組反序）做 XOR；fontTable.xml 的 w:font 加 w:embedRegular／embedBold／embedItalic／embedBoldItalic
+#     （r:id 指向字型部件、w:fontKey）；settings.xml 寫 w:embedTrueTypeFonts（Word 再存檔時才會保留內嵌）。
+#   哪些軟體會讀：LibreOffice 24.2 會（實測：只留 DejaVu 的環境下，以「Arial」名稱內嵌的 Liberation Sans 確實被拿來排版）。
+#     Word for Windows 會讀內嵌的 TrueType 字型（微軟說明文件）；Word for Mac（16.17 以後）、Word for iOS／Android、
+#     Pages、Google 文件：需查證，這台機器無法實測。不讀的軟體照字型表的 altName、family 退回同類字型，和不內嵌時一樣。
+#   授權：只內嵌 OS/2 fsType 允許「可安裝」（0）或「可編輯」（8）的字型；「限制」（2）、「預覽與列印」（4，會讓文件唯讀）、
+#     「只能內嵌點陣」（0x200）都不內嵌。伺服器上用來代替 Arial、Times New Roman、Courier New、Calibri、Cambria 的
+#     Liberation、Carlito、Caladea 都是 SIL OFL 1.1、fsType 0：字型檔原封不動放進檔案（只做規格要求的混淆）。
+#     以「Arial」這個名稱引用 Liberation Sans 檔是否有商標上的疑慮：需查證（字型檔本身沒有改名、沒有修改）。
+#     docx_embed_deny_prefixes 列的字族不內嵌（同 PDF 輸出，GNU Unifont 授權待確認）。
+#   只內嵌 TrueType 外框（有 glyf 表）的字型：規格稱內嵌字型為 obfuscated TrueType，CFF 外框（例如 Inter 的 .otf）
+#     各軟體能不能讀：需查證，所以不內嵌。中日韓字型動輒十幾 MB，超過 docx_embed_max_kb 也不內嵌。
+#   只內嵌「寫入的名稱本身、或與它字寬相容」的字型檔（例如 Arial ← Liberation Sans）：寫入的名稱依類別退回而來的
+#     （字寬不同）不內嵌，否則內嵌的字和寫入的名稱字寬不一致，反而在有那個字型的裝置上排得不一樣。
+#   檔案大小：一個字面約 300 到 600 KB（壓縮後約一半）；實測履歷的兩個字面讓 docx 由 37 KB 變成 451 KB。
+#   整個字型內嵌（不做子集）：使用者改字、加字時才不會缺字。
+#   結論：字型表的 family、altName 加上寫入常見字型名稱已經處理大多數裝置；內嵌只在「裝置上真的沒有 Arial、Calibri」
+#     而且「軟體會讀內嵌字型」時才有差，檔案卻變大十倍，所以做成設定、預設關。
+
+_FS_RESTRICTED, _FS_PREVIEW_PRINT, _FS_BITMAP_ONLY = 0x0002, 0x0004, 0x0200
+_EMBED_TAGS = ((False, False, "w:embedRegular"), (True, False, "w:embedBold"), (False, True, "w:embedItalic"), (True, True, "w:embedBoldItalic"))
+CT_OBFUSCATED_FONT = "application/vnd.openxmlformats-officedocument.obfuscatedFont"
+REL_FONT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/font"
+# settings.xml 裡排在 w:embedTrueTypeFonts 前面的元素（CT_Settings 的順序）
+_SETTINGS_BEFORE_EMBED = ("writeProtection", "view", "zoom", "removePersonalInformation", "removeDateAndTime", "doNotDisplayPageBoundaries",
+                          "displayBackgroundShape", "printPostScriptOverText", "printFractionalCharacterWidth", "printFormsData")
+
+
+def obfuscate_font(data: bytes, font_key: str) -> bytes:
+    """ECMA-376 第 1 部 17.8.1 的字型混淆：fontKey（{XXXXXXXX-XXXX-…}）去掉括號與連字號得到 16 個位元組，反序後
+    與字型檔的前 32 位元組逐一 XOR（第 0 到 15、16 到 31 位元組各用一次）。同一個函式也能還原。"""
+    key = bytes.fromhex(font_key.strip("{}").replace("-", ""))[::-1]
+    out = bytearray(data)
+    for i in range(min(32, len(out))):
+        out[i] ^= key[i % 16]
+    return bytes(out)
+
+
+def _metric_compatible(a: str, families: Iterable[str]) -> bool:
+    from ..tools import fontfind
+
+    na = fontfind.norm(a)
+    names = {fontfind.norm(f) for f in families}
+    return na in names or any(na in {fontfind.norm(x) for x in g} and names & {fontfind.norm(x) for x in g} for g in fontfind.METRIC_ALIASES)
+
+
+def embeddable_face(name: str, bold: bool, italic: bool, deny: Iterable[str] = ()) -> tuple[Optional[bytes], str]:
+    """寫入的字型名稱的一個字面 → （可以內嵌的字型檔內容, 說明）。不能內嵌時內容為 None，說明寫原因。"""
+    from fontTools.ttLib import TTFont
+
+    from ..tools import fontfind
+
+    m = fontfind.match(name, bold, italic)
+    if m is None:
+        return None, "伺服器上找不到這個字型或字寬相容的字型"
+    fam = m.families[0] if m.families else name
+    if not _metric_compatible(name, m.families):
+        return None, f"伺服器上只有字寬不同的「{fam}」，內嵌它會讓字寬和寫入的名稱不一致"
+    if any(fam.startswith(p) for p in deny):
+        return None, f"「{fam}」列在不內嵌的字型清單（docx_embed_deny_prefixes）"
+    if (bold and m.weight < 150) or (italic and m.slant <= 0):
+        return None, f"伺服器上沒有「{fam}」的{'粗' if bold else ''}{'斜' if italic else ''}體字面"
+    try:
+        f = TTFont(m.path, fontNumber=m.index, lazy=True)
+        fs = int(f["OS/2"].fsType) if "OS/2" in f else 0
+        has_glyf = "glyf" in f
+    except Exception as e:  # pragma: no cover - 字型檔讀不了
+        return None, f"字型檔讀不了（{type(e).__name__}）"
+    if fs & (_FS_RESTRICTED | _FS_PREVIEW_PRINT | _FS_BITMAP_ONLY):
+        return None, f"「{fam}」的內嵌旗標（OS/2 fsType = {fs:#06x}）不允許可編輯的內嵌"
+    if not has_glyf:
+        return None, f"「{fam}」是 CFF 外框（.otf），各軟體能不能讀內嵌的 CFF 字型需查證，不內嵌"
+    if m.path.lower().endswith((".ttc", ".otc")):  # 字型集合：取出其中一個字型
+        buf = io.BytesIO()
+        TTFont(m.path, fontNumber=m.index).save(buf)
+        return buf.getvalue(), fam
+    with open(m.path, "rb") as fh:
+        return fh.read(), fam
+
+
+def embed_fonts(docx_doc, font_part, root: etree._Element, ctx: Ctx) -> None:
+    """把用到的拉丁字型的字面內嵌進檔案（見上面的評估）。root 是改寫中的 fontTable.xml 根元素。"""
+    import hashlib
+    import uuid
+
+    from docx.opc.packuri import PackURI
+    from docx.opc.part import Part
+
+    pkg = docx_doc.part.package
+    budget = ctx.policy.embed_max_kb * 1024
+    used = 0
+    n = 0
+    entries = {f.get(q("w:name")): f for f in root.findall(q("w:font"))}
+    for name in sorted(entries):
+        faces = {(b, i) for fam, b, i in ctx.faces if fam == name}
+        if not faces:
+            continue
+        if _is_cjk_name(name) or name in {v for k, v in ctx.policy.fallback.items() if k.startswith("cjk")}:
+            ctx.degrade("document", f"內嵌字型「{name}」", "中日韓字型檔太大（通常十幾 MB），不內嵌", False)
+            continue
+        done = []
+        for bold, italic, tag in _EMBED_TAGS:
+            if (bold, italic) not in faces and (bold or italic):  # 一般字面一定內嵌（使用者取消粗體時用得到），其他只內嵌用到的
+                continue
+            data, why = embeddable_face(name, bold, italic, ctx.policy.embed_deny)
+            if data is None:
+                if (bold, italic) in faces:
+                    ctx.degrade("document", f"內嵌字型「{name}」", f"沒有內嵌：{why}", False)
+                continue
+            if used + len(data) > budget:
+                ctx.degrade("document", f"內嵌字型「{name}」", f"沒有內嵌：超過內嵌字型的大小上限 {ctx.policy.embed_max_kb:g} KB（docx_embed_max_kb）", False)
+                continue
+            used += len(data)
+            n += 1
+            digest = hashlib.sha256(data + tag.encode()).hexdigest()
+            key = "{" + str(uuid.uuid5(uuid.NAMESPACE_URL, "mortise-font:" + digest)).upper() + "}"  # 同一個字型檔每次得到同一把鑰匙（輸出可重現）
+            part = Part(PackURI(f"/word/fonts/font{n}.odttf"), CT_OBFUSCATED_FONT, obfuscate_font(data, key), pkg)
+            rid = font_part.relate_to(part, REL_FONT)
+            sub(entries[name], tag, {"r:id": rid, "w:fontKey": key})
+            done.append((tag.removeprefix("w:embed"), why))
+        if done:
+            ctx.degrade("document", f"內嵌字型「{name}」", f"內嵌伺服器上的「{done[0][1]}」（{'、'.join(t for t, _ in done)}）：讀得懂內嵌字型的軟體"
+                        f"不必另外安裝（LibreOffice 實測會讀；Word 及其他軟體需查證）", False)
+    if n:
+        st = docx_doc.settings.element
+        if st.find(q("w:embedTrueTypeFonts")) is None:
+            e = el("w:embedTrueTypeFonts")
+            prev = [c for c in st if etree.QName(c).localname in _SETTINGS_BEFORE_EMBED]
+            if prev:
+                prev[-1].addnext(e)
+            else:
+                st.insert(0, e)
 
 
 def _style_el(styles_root, style_id: str) -> Optional[etree._Element]:
@@ -835,6 +994,7 @@ def build_styles(docx_doc, doc: StyledDoc, ctx: Ctx, builtin_headings: bool = Tr
         pf = pf_counts.most_common(1)[0][0] if pf_counts else ParaFmt()
         run = RunFmt(latin_f, ea_f, half_pt(s.size_pt * ctx.scale), s.bold, s.italic, s.color.hex)
         ctx.fonts.update({latin_f, ea_f})
+        ctx.faces.add((latin_f, s.bold, s.italic))
         outline = None
         if s.role in (Role.TITLE, Role.SUBTITLE):
             lvl = title_sizes.index(round(s.size_pt, 1)) if s.role == Role.TITLE else len(title_sizes) + sub_sizes.index(round(s.size_pt, 1))
@@ -1431,6 +1591,93 @@ def condense_spacing(sp: StyledParagraph, ctx: Ctx, latin: str, max_ratio: float
         per_char = min((w_out - w_ref) / len(r.text), max_ratio * r.size_pt.value) * ctx.scale
         out.append(-int(round(per_char * 20)))
     return out
+
+
+def _char_advances(text: str, family: str, size_pt: float, bold: bool) -> Optional[list[float]]:
+    """每個字的前進寬度（pt）；找不到字型回傳 None。缺字的估計同 text_width_pt。"""
+    adv = _advances(family, bold)
+    if adv is None:
+        return None
+    cmap, hmtx, upm = adv
+    out = []
+    for ch in text:
+        g = cmap.get(ord(ch))
+        out.append(hmtx[g][0] / upm * size_pt if g is not None else (1.0 if ord(ch) >= 0x2E80 else 0.6) * size_pt)
+    return out
+
+
+def wrapped_line_count(chars: list[tuple[str, float, float]], width_pt: float, first_indent_pt: float = 0.0) -> int:
+    """逐字（字, 前進寬度, 字距）模擬文字引擎的自動換行，回傳行數：只在空白處斷行（中日韓文字每個字前後都可以斷），
+    行尾的空白不算寬度；一個字比整行還寬時才在字中間斷。強制換行（\n）另起一行。"""
+    tokens: list[tuple[str, float]] = []
+    word = 0.0
+    for ch, w, sp in chars:
+        if ch == "\n" or ch.isspace() or ord(ch) >= 0x2E80:
+            if word:
+                tokens.append(("w", word))
+                word = 0.0
+            tokens.append(("n" if ch == "\n" else ("s" if ch.isspace() else "w"), w + sp))
+        else:
+            word += w + sp
+    if word:
+        tokens.append(("w", word))
+    lines, x, pend = 1, 0.0, 0.0
+    avail = width_pt - max(0.0, first_indent_pt)
+    for kind, w in tokens:
+        if kind == "n":
+            lines, x, pend, avail = lines + 1, 0.0, 0.0, width_pt
+        elif kind == "s":
+            if x > 0:
+                pend += w
+        else:
+            if x > 0 and x + pend + w > avail:
+                lines, x, avail = lines + 1, 0.0, width_pt
+            if x == 0 and w > avail > 0:
+                extra = int(w // avail)
+                lines += extra
+                x = w - extra * avail
+            else:
+                x += w if x == 0 else pend + w
+            pend = 0.0
+    return lines
+
+
+def fit_source_lines(sp: StyledParagraph, width_pt: float, ctx: Ctx, latin: str, spacing: list[int], max_ratio: float,
+                     margin_pt: float = 0.75) -> tuple[list[int], int, int]:
+    """版面固定模式：用寫入的字型（伺服器上字寬相容的字型檔）模擬這段在框寬裡的自動換行；行數比原圖多（框會往下長、
+    蓋到下面的框）時，每個字再多緊縮一點字距，直到行數回到原圖的行數，最多緊縮到字級的 max_ratio。
+    例如⑤用的驗證字型本來就比原圖的字寬、量出來第二行就超過框寬的段落。中日韓文字只當成可以斷行的位置，不另外處理。
+    spacing 是已經算好的字距（twip，condense_spacing 的結果）。回傳（新的字距, 寫入字型的行數, 調整後的行數）。
+    找不到字型、或緊縮到上限仍多一行，就照原樣回傳（行數照實回報，呼叫端記錄）。"""
+    runs = []
+    for k, r in enumerate(sp.runs):
+        fam = ctx.font_name(r.font, context_latin=latin, record=False) if not r.font.east_asian else (r.font.verification_family or r.font.family.value)
+        adv = _char_advances(r.text, fam, r.size_pt.value * ctx.scale, r.bold)
+        if adv is None:
+            return spacing, 0, 0
+        runs.append((r, adv, spacing[k] if k < len(spacing) else 0))
+    target = max(1, sp.source_line_count)
+    avail = width_pt - margin_pt
+    first = sp.first_line_indent_pt * ctx.scale
+
+    def count(extra_tw: int) -> int:
+        chars = []
+        for r, adv, base in runs:
+            tw = min(base, -extra_tw) if not r.font.east_asian else base
+            chars.extend((ch, a, tw / 20.0) for ch, a in zip(r.text, adv))
+        return wrapped_line_count(chars, avail, first)
+
+    before = count(0)
+    if before <= target:
+        return spacing, before, before
+    size = max((r.size_pt.value for r in sp.runs), default=10.0) * ctx.scale
+    limit = int(max_ratio * size * 20)
+    for extra in range(1, limit + 1):
+        n = count(extra)
+        if n <= target:
+            new = [min(base, -extra) if not r.font.east_asian else base for r, _, base in runs]
+            return new, before, n
+    return spacing, before, count(limit)
 
 
 # ---------- 字型量度（基線補償用） ----------

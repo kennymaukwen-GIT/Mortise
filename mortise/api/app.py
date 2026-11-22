@@ -490,9 +490,15 @@ def _stamp(pipe, *names: str) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def _cached_png(pipe, job_id: str, key: str, stamp: str, make) -> tuple[bytes, dict[str, str]]:
+# 寫進磁碟快取的寬度（前端使用的級距與預設寬度）。其他寬度照樣畫，但不存檔：
+# 否則任意寬度 × 頁數 × 種類 × 格式都會各存一份，耗用磁碟。
+_CACHED_WIDTHS = {160, 600, 1000, 1200, 1600, 2400, 3200, 4000}
+
+
+def _cached_png(pipe, job_id: str, key: str, stamp: str, make, cacheable: bool = True) -> tuple[bytes, dict[str, str]]:
     """預覽圖的磁碟快取：<工作目錄>/previews/<key>-<stamp>.png（另存一個同名的 .json 記用什麼畫的）。
-    工作還在排隊或處理中時不寫快取（那時的產物可能只更新了一半）。同一個 key 的舊戳記檔案在寫入新檔時一併刪除。"""
+    工作還在排隊或處理中時不寫快取（那時的產物可能只更新了一半）。同一個 key 的舊戳記檔案在寫入新檔時一併刪除。
+    cacheable 為 False（不常用的寬度）時只畫不存。"""
     folder = pipe.dir / "previews"
     path = folder / f"{key}-{stamp}.png"
     info = path.with_suffix(".json")
@@ -501,7 +507,7 @@ def _cached_png(pipe, job_id: str, key: str, stamp: str, make) -> tuple[bytes, d
         return path.read_bytes(), meta
     im, meta = make()
     data = _png_bytes(im)
-    if JOBS.status(job_id)["status"] not in ("queued", "running"):
+    if cacheable and JOBS.status(job_id)["status"] not in ("queued", "running"):
         folder.mkdir(exist_ok=True)
         for old in folder.glob(f"{key}-*"):
             if old.stem != path.stem:
@@ -601,7 +607,7 @@ def page_image(
                 draw.rectangle([b.x * scale, b.y * scale, (b.x + b.w) * scale, (b.y + b.h) * scale], outline=(220, 30, 30), width=3)
         return over, {"render": engine}
 
-    data, meta = _cached_png(pipe, job_id, key, stamp, make)
+    data, meta = _cached_png(pipe, job_id, key, stamp, make, cacheable=width in _CACHED_WIDTHS)
     if meta.get("render"):
         headers["X-Mortise-Render"] = meta["render"]
     return Response(data, media_type="image/png", headers=headers)

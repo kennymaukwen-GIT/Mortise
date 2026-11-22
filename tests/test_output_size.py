@@ -371,8 +371,6 @@ def test_output_files_have_target_size(sized_runs):
 
 def _gradient_png(path: Path) -> Path:
     """漸層底的合成截圖：漸層不是任何元素，會留在底圖裡（用來測「底圖只放在 placement 範圍」）。"""
-    import subprocess
-
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont
 
@@ -382,9 +380,13 @@ def _gradient_png(path: Path) -> Path:
     arr = np.concatenate([200 - 120 * x + 0 * y, 220 - 60 * y + 0 * x, 255 - 100 * x * y], axis=2).clip(0, 255).astype("uint8")
     im = Image.fromarray(arr)
     d = ImageDraw.Draw(im)
-    font = subprocess.run(["fc-match", "-f", "%{file}", "DejaVu Sans:bold"], capture_output=True, text=True).stdout
-    d.text((100, 120), "Gradient Poster 2027", font=ImageFont.truetype(font, 72), fill=(20, 20, 40))
-    d.text((100, 300), "Background is a smooth gradient", font=ImageFont.truetype(font, 36), fill=(20, 20, 40))
+    from mortise.tools import fontfind  # 找字型一律經過 fontfind（沒有 fontconfig 的 Mac 也找得到）
+
+    m = fontfind.match("DejaVu Sans", bold=True)  # 沒有 DejaVu Sans 時退回同類的字型
+    assert m is not None, "這台電腦找不到任何字型"
+    font, index = m.path, m.index
+    d.text((100, 120), "Gradient Poster 2027", font=ImageFont.truetype(font, 72, index=index), fill=(20, 20, 40))
+    d.text((100, 300), "Background is a smooth gradient", font=ImageFont.truetype(font, 36, index=index), fill=(20, 20, 40))
     d.ellipse((1100, 450, 1450, 800), fill=(240, 120, 40))
     im.save(path)
     return path

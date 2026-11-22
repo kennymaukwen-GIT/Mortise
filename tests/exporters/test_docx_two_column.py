@@ -499,3 +499,106 @@ def test_fixture_cv_two_column_end_to_end(tmp_path):
         if mode == "fixed":
             assert len(pages) == 1, (mode, fc)
         assert not missing_chars(doc_texts(doc), pages), (mode, fc)
+
+
+# ---------- 版面固定：行數多於原圖時緊縮字距 ----------
+
+
+def test_wrapped_line_count_simulation():
+    ch = lambda t, w=1.0: [(c, w, 0.0) for c in t]  # noqa: E731
+    f = docx_common.wrapped_line_count
+    assert f(ch("aaa bbb"), 7) == 1 and f(ch("aaa bbb"), 6.9) == 2  # 行尾的空白不算寬度
+    assert f(ch("aaa bbb ccc"), 11) == 1 and f(ch("aaa bbb ccc"), 10.9) == 2
+    assert f(ch("aaa\nbbb"), 10) == 2  # 強制換行
+    assert f(ch("aaaaaaaaaa"), 4) == 3  # 一個字比整行還寬：在字中間斷
+    assert f(ch("中文字中文字"), 3) == 2  # 中日韓文字每個字都可以斷
+    assert f([(c, 1.0, -0.1) for c in "aaa bbb"], 6.5) == 1  # 字距（負值為緊縮）算進寬度
+
+
+def test_fit_source_lines_condenses_only_when_needed():
+    """原圖一行的字，寫入的字型（Arial ≈ Liberation Sans）量起來比框寬一點點：緊縮字距讓它回到一行；
+    寬太多（超過上限）就不硬擠，照實回報行數。"""
+    text = "Produced and edited Facebook ad videos for the dealer and the agency."
+    w = docx_common.text_width_pt(text, "Arial", 10.0)
+    if w is None:
+        pytest.skip("伺服器上沒有與 Arial 字寬相容的字型")
+    ctx = docx_common.make_ctx(two_column_doc(), Config.load())
+    sp = para("p-fit", [run(text, "Liberation Sans", 10.0)])
+    same, before, after = docx_common.fit_source_lines(sp, w + 2.0, ctx, "Arial", [0], 0.04)
+    assert (same, before, after) == ([0], 1, 1)  # 放得下：不改
+    new, before, after = docx_common.fit_source_lines(sp, w * 0.99, ctx, "Arial", [0], 0.04)
+    assert before == 2 and after == 1 and -8 <= new[0] < 0  # 緊縮不到字級的 4%（10 pt → 每字最多 0.4 pt = 8 twip）
+    kept, before, after = docx_common.fit_source_lines(sp, w * 0.9, ctx, "Arial", [0], 0.04)
+    assert kept == [0] and before == after == 2
+
+
+def test_fixed_fits_paragraph_back_to_source_lines(tmp_path):
+    """仿照履歷的那一段：⑤配的驗證字型比原圖寬、第二行量起來超過框寬 → 版面固定在那一段緊縮字距，行數回到原圖，
+    框不會往下長、蓋到下面的框（原本「Produced and edited…」蓋到「Restaurant — Zhubei」）。"""
+    line1 = "• The dealer needed more online visibility; as more buyers now ask AI assistants which"
+    line2 = " business to choose, I proposed GEO (generative engine optimisation) alongside SEO."
+    w2 = docx_common.text_width_pt(line2.strip(), "Arial", 10.0)
+    if w2 is None:
+        pytest.skip("伺服器上沒有與 Arial 字寬相容的字型")
+    box_w = w2 * 0.99
+    doc = two_column_doc()
+    page = doc.pages[0]
+    extra = tb("box-fit", 200.1, 460.0, box_w, 26.0, [para("p-fit", [run(line1, "Loma", 9.5), run(line2, "Loma", 10.0)], Align.RIGHT, 2, 12.7)])
+    page = page.model_copy(update={"text_boxes": page.text_boxes + [extra], "reading_order": page.reading_order + ["box-fit"]})
+    doc = doc.model_copy(update={"pages": [page]})
+    store = Store(tmp_path)
+    out = docx_fixed.export(doc, "cv", Config.load(), store)
+    root = xml_of(store.read_blob(out.file))
+    rs = [r for r in _anchor(root, "box-fit").iter(q("w:r")) if r.findall(q("w:t"))]
+    vals = [int(r.find(f"{q('w:rPr')}/{q('w:spacing')}").get(q("w:val"))) for r in rs]
+    assert all(v < 0 for v in vals)
+    d = next(d for d in out.degradations if d.element_id == "box-fit" and d.concept == "換行")
+    assert not d.lossy and "2 行" in d.action and "3 行" in d.action
+
+
+# ---------- 內嵌字型（設定 docx_embed_fonts，預設關） ----------
+
+
+def test_obfuscate_font_follows_ecma376():
+    key = "{00112233-4455-6677-8899-AABBCCDDEEFF}"
+    data = bytes(40)
+    ob = docx_common.obfuscate_font(data, key)
+    assert ob[0] == 0xFF and ob[15] == 0x00 and ob[16] == 0xFF and ob[31] == 0x00  # 鑰匙是 GUID 的 16 個位元組反序
+    assert ob[32:] == data[32:]  # 只混淆前 32 個位元組
+    assert docx_common.obfuscate_font(ob, key) == data
+
+
+def test_embed_fonts_off_by_default_and_on_when_set(tmp_path):
+    store = Store(tmp_path / "store")
+    cfg = Config.load()
+    assert cfg.section("export")["docx_embed_fonts"] is False
+    off = docx_fixed.export(two_column_doc(), "cv", cfg, store)
+    with zipfile.ZipFile(store.blob_path(off.file)) as z:
+        assert not [n for n in z.namelist() if n.startswith("word/fonts/")]
+    if docx_common.embeddable_face("Arial", False, False)[0] is None:
+        pytest.skip("伺服器上沒有可以內嵌、與 Arial 字寬相容的字型")
+    cfg.data["export"]["docx_embed_fonts"] = True
+    out = docx_fixed.export(two_column_doc(), "cv", cfg, store)
+    assert out.selfcheck_ok, out.selfcheck_notes
+    data = store.read_blob(out.file)
+    fonts = {f.get(q("w:name")): f for f in xml_of(data, "word/fontTable.xml")}
+    reg, bold = fonts["Arial"].find(q("w:embedRegular")), fonts["Arial"].find(q("w:embedBold"))
+    assert reg is not None and bold is not None  # 「S K I L L S」是粗體：粗體字面也內嵌
+    assert fonts["Arial"].find(q("w:embedItalic")) is None  # 沒用到斜體：不內嵌
+    order = [etree.QName(c).localname for c in fonts["Arial"]]
+    assert order[-2:] == ["embedRegular", "embedBold"] and order.index("pitch") < order.index("embedRegular")  # 綱要順序
+    rels = {r.get("Id"): r for r in xml_of(data, "word/_rels/fontTable.xml.rels")}
+    rel = rels[reg.get(q("r:id"))]
+    assert rel.get("Type").endswith("/relationships/font")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        raw = z.read("word/" + rel.get("Target"))
+        types = z.read("[Content_Types].xml").decode()
+    plain = docx_common.obfuscate_font(raw, reg.get(q("w:fontKey")))
+    assert plain[:4] in (b"\x00\x01\x00\x00", b"true") and raw[:4] != plain[:4]
+    assert "application/vnd.openxmlformats-officedocument.obfuscatedFont" in types
+    assert xml_of(data, "word/settings.xml").find(q("w:embedTrueTypeFonts")) is not None
+    assert any(d.concept == "內嵌字型「Arial」" and "內嵌" in d.action for d in out.degradations)
+    if libreoffice.available() and DEJAVU_DIR.is_dir():
+        # 只留 DejaVu 的環境：LibreOffice 用內嵌的字型排版（PDF 裡出現 Liberation Sans），不是退回 DejaVu Sans
+        pdf = to_pdf(store.blob_path(out.file), fonts_conf(tmp_path))
+        assert b"LiberationSans" in pdf

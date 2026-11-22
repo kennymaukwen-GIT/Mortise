@@ -2,9 +2,9 @@ import { useId, useRef, useState, type Dispatch } from "react";
 import { downloadUrl } from "../api/client";
 import type { FormatInfo, PageSizePreset } from "../api/types";
 import { useI18n } from "../i18n/I18n";
-import { formatLabel } from "../lib/catalog";
-import { fmtMm, orient, ptToMm, type Orientation } from "../lib/units";
-import { effectiveOrientation, resolveOrigin, resolveTarget, sourceOrientation } from "../state/derive";
+import { formatLabel, shortFormatLabel } from "../lib/catalog";
+import { fmtMm, orient, ptToMm, SIZE_MAX_MM, SIZE_MIN_MM, type Orientation } from "../lib/units";
+import { blocks, effectiveOrientation, resolveOrigin, resolveTarget, sourceOrientation } from "../state/derive";
 import type { Action, State } from "../state/store";
 import { ArrowCircle, Caret, Landscape, Portrait } from "./Icons";
 
@@ -86,9 +86,17 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
 
   const origin = resolveOrigin(s);
   const target = resolveTarget(s, presets, src);
-  const originMsg = touched.origin && (origin.kind === "incomplete" ? t("card.pairIncomplete") : origin.kind === "invalid" ? t("card.pairInvalid") : null);
+  const range = { min: SIZE_MIN_MM, max: SIZE_MAX_MM };
+  // Out-of-range sizes are flagged as soon as they are typed (they would only fail on the server).
+  const originMsg =
+    origin.kind === "range"
+      ? t("card.rangeOrigin", range)
+      : touched.origin && (origin.kind === "incomplete" ? t("card.pairIncomplete") : origin.kind === "invalid" ? t("card.pairInvalid") : null);
   const targetMsg =
-    touched.target && s.sizeMode === "custom" && (target.kind === "incomplete" ? t("card.pairIncomplete") : target.kind === "invalid" ? t("card.pairInvalid") : null);
+    s.sizeMode === "custom" &&
+    (target.kind === "range"
+      ? t("card.rangeTarget", range)
+      : touched.target && (target.kind === "incomplete" ? t("card.pairIncomplete") : target.kind === "invalid" ? t("card.pairInvalid") : null));
 
   // Placeholders: the PDF's own page size for Origin, the preset's size for Size.
   const page0 = state.doc?.sizes[0];
@@ -101,13 +109,26 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
 
   const available = (formats ?? []).filter((f) => f.available);
   const sizeValue = s.sizeMode === "original" ? "original" : s.sizeMode === "custom" ? "custom" : s.presetId ?? "original";
-  const pct = Math.round((state.phase === "uploading" ? (state.progress.upload ?? 0) * 0.05 : state.progress.fraction) * 100);
+  const uploading = state.phase === "uploading";
+  const pct = Math.round((uploading ? (state.progress.upload ?? 0) : state.progress.fraction) * 100);
+  const current = (formats ?? []).find((f) => f.format === s.format);
+  const shortLabel = current ? shortFormatLabel(formatLabel(current, lang)) : null;
 
   const convert = () => {
     setTouched({ origin: true, target: true });
-    if (origin.kind === "incomplete" || origin.kind === "invalid") return;
-    if (target.kind === "incomplete" || target.kind === "invalid") return;
+    if (blocks(origin) || blocks(target)) return;
     onConvert();
+  };
+
+  // Orientation radio group (WAI-ARIA): arrow keys move the choice, only the chosen button is in the Tab order.
+  const orientKey = (e: React.KeyboardEvent) => {
+    const keys: Record<string, Orientation> = { ArrowLeft: "portrait", ArrowUp: "portrait", ArrowRight: "landscape", ArrowDown: "landscape" };
+    const o = keys[e.key];
+    if (!o) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dispatch({ type: "SETTINGS", patch: { orientation: o } });
+    (e.currentTarget.querySelector(`[data-orient="${o}"]`) as HTMLElement | null)?.focus();
   };
 
   const convertDisabled = !hasFile || busy || !available.length;
@@ -129,7 +150,12 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
           <label className="card-label" htmlFor={uid + "-fmt"}>
             {t("card.convertTo")}
           </label>
-          <div className="pill-select">
+          <div className={"pill-select" + (shortLabel ? " pill-select--short" : "")}>
+            {shortLabel && (
+              <span className="pill-select__value" aria-hidden="true">
+                {shortLabel}
+              </span>
+            )}
             <select
               id={uid + "-fmt"}
               value={formats ? s.format : ""}
@@ -183,13 +209,15 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
           <div className="card-label card-label--stack card-label--size">
             <span id={uid + "-size"}>{t("card.size")}</span>
             {s.sizeMode === "preset" && (
-              <div className="orient" role="radiogroup" aria-label={t("card.orientation")}>
+              <div className="orient" role="radiogroup" aria-label={t("card.orientation")} onKeyDown={orientKey}>
                 {(["portrait", "landscape"] as const).map((o) => (
                   <button
                     key={o}
                     type="button"
                     role="radio"
+                    data-orient={o}
                     aria-checked={orientation === o}
+                    tabIndex={orientation === o ? 0 : -1}
                     className="orient__btn"
                     title={t(o === "portrait" ? "card.portrait" : "card.landscape")}
                     aria-label={t(o === "portrait" ? "card.portrait" : "card.landscape")}
@@ -270,7 +298,9 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
           style={busy ? ({ "--pct": `${pct}%` } as React.CSSProperties) : undefined}
         >
           <span className="convert-btn__fill" aria-hidden="true" />
-          <span className="convert-btn__label">{busy && state.phase !== "opening" ? t("card.converting", { pct }) : t("card.convert")}</span>
+          <span className="convert-btn__label">
+            {uploading ? t("card.uploading", { pct }) : busy && state.phase !== "opening" ? t("card.converting", { pct }) : t("card.convert")}
+          </span>
           <ArrowCircle className="convert-btn__icon" size={28} />
         </button>
         {!hasFile && (
@@ -288,6 +318,11 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
               {state.score != null ? `${Math.round(state.score * 100)}%` : "—"}
             </span>
           </div>
+          {state.noGraphics && (
+            <p className="result-card__warn" role="note" data-testid="no-graphics">
+              {t("done.noGraphics")}
+            </p>
+          )}
           <div className="result-card__actions">
             <a className="btn btn--primary" href={downloadUrl(state.jobId!, state.jobFormat ?? s.format)} download>
               {t("card.download")}

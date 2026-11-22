@@ -471,7 +471,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
           aspect={aspect}
           resetKey={`${index}:${view === "original" ? "o" : "r"}:${state.jobId ?? "local"}:${state.doc?.id ?? 0}`}
           label={t("nav.pageLabel", { n: index + 1, total })}
-          inset={{ top: isDone ? 72 : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0) + (isDone && (renderNote || scoreNone) ? 40 : 0), left: 24 }}
+          inset={{ top: isDone ? 72 + (renderNote || scoreNone ? 46 : 0) : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0), left: 24 }}
           disabled={busy}
         >
           {(info) => <div className={"page-sheet" + (view === "compare" && isDone ? " page-sheet--compare" : "")}>{content!(info)}</div>}
@@ -594,9 +594,11 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
             <button type="button" className="tool-btn" onClick={() => dispatch({ type: "SET_PAGE", index: index - 1 })} disabled={index <= 0} aria-label={t("nav.prev")} title={t("nav.prev")}>
               <ChevronLeft size={18} />
             </button>
-            <span className="page-nav__count" aria-live="polite" data-testid="page-count">
+            <span className="page-nav__count" aria-live="polite">
               <span className="visually-hidden">{t("nav.pageLabel", { n: index + 1, total })}</span>
-              <span aria-hidden="true">{t("nav.pageOf", { n: index + 1, total })}</span>
+              <span aria-hidden="true" data-testid="page-count">
+                {t("nav.pageOf", { n: index + 1, total })}
+              </span>
             </span>
             <button type="button" className="tool-btn" onClick={() => dispatch({ type: "SET_PAGE", index: index + 1 })} disabled={index >= total - 1} aria-label={t("nav.next")} title={t("nav.next")}>
               <ChevronRight size={18} />

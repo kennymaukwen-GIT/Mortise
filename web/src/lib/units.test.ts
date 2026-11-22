@@ -29,6 +29,8 @@ describe("units", () => {
     expect(checkPair("0", "297")).toEqual({ kind: "invalid" });
     expect(checkPair("x", "")).toEqual({ kind: "invalid" });
     expect(checkPair("210", "297")).toEqual({ kind: "ok", width: 210, height: 297 });
+    expect(checkPair("100000", "50000")).toEqual({ kind: "range" });
+    expect(checkPair("0.01", "0.01")).toEqual({ kind: "range" });
   });
 
   it("orients sizes", () => {

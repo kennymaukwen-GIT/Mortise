@@ -31,7 +31,14 @@ export function AccountMenu(p: AccountMenuProps) {
   const [open, setOpen] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLDivElement>(null);
-  usePopoverDismiss(open, () => setOpen(false), [btn, panel]);
+  usePopoverDismiss(
+    open,
+    (why) => {
+      setOpen(false);
+      if (why === "escape") btn.current?.focus();
+    },
+    [btn, panel],
+  );
   useEffect(() => {
     if (open) panel.current?.focus();
   }, [open]);
@@ -67,12 +74,28 @@ export function AccountMenu(p: AccountMenuProps) {
             <h2 className="acct-heading" id="acct-lang">
               {t("account.language")}
             </h2>
-            <div className="segmented" role="radiogroup" aria-labelledby="acct-lang">
+            <div
+              className="segmented"
+              role="radiogroup"
+              aria-labelledby="acct-lang"
+              onKeyDown={(e) => {
+                const i = langs.findIndex((l) => l.id === p.lang);
+                const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+                if (!step) return;
+                e.preventDefault();
+                const group = e.currentTarget;
+                const next = langs[(i + step + langs.length) % langs.length];
+                p.onLang(next.id);
+                requestAnimationFrame(() => (group.querySelector(`[data-lang="${next.id}"]`) as HTMLElement | null)?.focus());
+              }}
+            >
               {langs.map((l) => (
                 <button
                   key={l.id}
                   type="button"
                   role="radio"
+                  data-lang={l.id}
+                  tabIndex={p.lang === l.id ? 0 : -1}
                   aria-checked={p.lang === l.id}
                   className="segmented__item"
                   lang={l.id === "zh-Hant" ? "zh-Hant" : "en"}

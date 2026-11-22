@@ -1,27 +1,35 @@
 // A small anchored popover: closes on Escape, outside click, or when focus leaves.
 import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 
-export function usePopoverDismiss(open: boolean, onClose: () => void, refs: RefObject<HTMLElement | null>[]) {
+/** Why a popover closed. Only "escape" gives the focus back to the button that opened it. */
+export type DismissReason = "escape" | "outside" | "blur";
+
+export function usePopoverDismiss(open: boolean, onClose: (reason: DismissReason) => void, refs: RefObject<HTMLElement | null>[]) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
     if (!open) return;
+    const inside = (t: EventTarget | null) => !!t && refs.some((r) => r.current?.contains(t as Node));
     const onDown = (e: PointerEvent) => {
-      const t = e.target as Node;
-      if (refs.some((r) => r.current?.contains(t))) return;
-      closeRef.current();
+      if (!inside(e.target)) closeRef.current("outside");
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        closeRef.current();
+        closeRef.current("escape");
       }
+    };
+    // Tab (or anything else) moved the focus out of the button and the panel.
+    const onFocusIn = (e: FocusEvent) => {
+      if (!inside(e.target)) closeRef.current("blur");
     };
     document.addEventListener("pointerdown", onDown, true);
     document.addEventListener("keydown", onKey, true);
+    document.addEventListener("focusin", onFocusIn, true);
     return () => {
       document.removeEventListener("pointerdown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
+      document.removeEventListener("focusin", onFocusIn, true);
     };
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 }

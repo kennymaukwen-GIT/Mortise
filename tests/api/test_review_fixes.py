@@ -147,3 +147,33 @@ def test_verify_dpi_caps_page_pixels():
     assert (big.width_pt * d / 72) * (big.height_pt * d / 72) <= MAX_RENDER_PIXELS * 1.0001
     a4 = SimpleNamespace(width_pt=595.0, height_pt=842.0, placement=None)
     assert verify_dpi(100.0, a4, None) == 100.0  # 一般頁面不受影響
+
+
+def test_report_lists_outputs_and_empty_vector_zip(client):
+    """「SVG 向量圖」找不到任何向量圖時，報告的 outputs 帶 vector_count 0，前端在下載前提醒（不必等使用者打開 zip 才發現是空的）。"""
+    r = _post(client, "slide_basic.pdf", outputs="svg_assets")
+    job = r.json()["job_id"]
+    assert _wait(client, job)["status"] == "done"
+    rep = client.get(f"/api/jobs/{job}/report").json()
+    outs = {o["format"]: o for o in rep["outputs"]}
+    assert set(outs) == {"svg_assets"}
+    o = outs["svg_assets"]
+    assert o["filename"].endswith(".zip") and isinstance(o["notes"], list)
+    assert isinstance(o["vector_count"], int)
+    import zipfile, io
+
+    z = zipfile.ZipFile(io.BytesIO(client.get(f"/api/jobs/{job}/download/svg_assets").content))
+    assert json.loads(z.read("manifest.json"))["count"] == o["vector_count"]
+
+
+def test_no_direct_fontconfig_calls():
+    """找字型一律經過 mortise.tools.fontfind（Mac 沒有 fc-match、fc-list）。我們負責的程式與測試不可直接呼叫它們。"""
+    root = Path(__file__).parents[2]
+    mine = [*(root / "mortise" / "api").glob("*.py"), *(root / "mortise" / "verify").glob("*.py"),
+            root / "mortise" / "stages" / "s5_settings.py", root / "mortise" / "stages" / "s7_verify.py",
+            *(root / "tests" / "api").glob("*.py"), root / "tests" / "test_output_size.py"]
+    for path in mine:
+        if path.name == Path(__file__).name:
+            continue
+        text = path.read_text(encoding="utf-8")
+        assert '"fc-match"' not in text and '"fc-list"' not in text, path

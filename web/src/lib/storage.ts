@@ -1,9 +1,9 @@
 // Small wrappers around localStorage. Everything here stays in this browser.
 import type { Lang } from "../i18n/dict";
 
-const KEY_LANG = "mortise.lang";
-const KEY_TRAINING = "mortise.allowTraining";
-const KEY_RECENT = "mortise.recentJobs";
+export const KEY_LANG = "mortise.lang";
+export const KEY_TRAINING = "mortise.allowTraining";
+export const KEY_RECENT = "mortise.recentJobs";
 const MAX_RECENT = 20;
 
 export interface RecentJob {

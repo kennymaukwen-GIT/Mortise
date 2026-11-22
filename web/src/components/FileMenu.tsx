@@ -13,9 +13,11 @@ export interface FileMenuProps {
   onStartOver: () => void;
   onDelete: () => void;
   canStartOver: boolean;
+  /** False while a file is uploading or converting (opening another file would drop that job). */
+  canOpen?: boolean;
 }
 
-export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, onDelete, canStartOver }: FileMenuProps) {
+export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, onDelete, canStartOver, canOpen = true }: FileMenuProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
@@ -24,7 +26,7 @@ export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, o
     setOpen(false);
     if (focus) btn.current?.focus();
   };
-  usePopoverDismiss(open, () => close(false), [btn, panel]);
+  usePopoverDismiss(open, (why) => close(why === "escape"), [btn, panel]);
   useEffect(() => {
     if (open) panel.current?.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')?.focus();
   }, [open]);
@@ -72,7 +74,7 @@ export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, o
       </button>
       {open && (
         <PopoverPanel id="file-menu" role="menu" label={t("file.menu")} panelRef={panel} className="popover--menu" onKeyDown={(e) => onMenuKeyDown(e)}>
-          {item(t("file.open"), onOpen)}
+          {item(t("file.open"), canOpen ? onOpen : null)}
           <div className="menu-sep" role="separator" />
           {item(t("file.download"), null, { href: done && jobId && format ? downloadUrl(jobId, format) : undefined })}
           {item(t("file.downloadReport"), null, { href: done && jobId ? downloadUrl(jobId, "report") : undefined })}

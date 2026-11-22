@@ -13,8 +13,8 @@
   --c-muted-light: #55585c; /* secondary text on white (7.2:1) */
   --c-placeholder: #9ea1a6; /* placeholder on black (7.6:1) */
   --c-disabled-dark: #8d9095; /* disabled text on black (6.4:1) */
-  --c-chrome: rgba(26, 28, 30, 0.94); /* floating toolbars inside the frame */
-  --c-chrome-line: rgba(255, 255, 255, 0.24);
+  --c-chrome: #000; /* floating toolbars inside the frame: solid black with a white outline, like the File button */
+  --c-chrome-line: rgba(255, 255, 255, 0.7);
   --c-hover-dark: rgba(255, 255, 255, 0.14);
   --c-hover-light: #eceeef;
   --c-danger: #ff6b63; /* on dark */
@@ -24,8 +24,8 @@
 
   /* type */
   --font: "Barlow", "Noto Sans TC Variable", "Noto Sans TC", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --fs-brand: 16px;
-  --fs-label: 16px;
+  --fs-brand: 17px; /* Barlow caps are 0.7 em: 17 px gives the mockup's 12 px cap height */
+  --fs-label: 17px;
   --fs-control: 16px;
   --fs-convert: 19px;
   --fs-tiny: 10px;
@@ -41,25 +41,26 @@
   --gap: 45px;
   --side-extra-right: 6px;
 
-  --frame-radius: 32px;
+  --frame-radius: 42px; /* mockup: 41.6–42.1 px on all four corners */
   --frame-border: 2px;
 
   --card-w: 414px;
-  --card-radius: 36px;
+  --card-radius: 41px; /* mockup: 40.9–41.5 px */
   --card-pad: 47px 37px 30px 38px;
   --label-col: 92px;
-  --select-h: 32px;
-  --select-r: 8px;
-  --input-w: 71px;
-  --input-h: 31px;
-  --input-r: 9px;
+  --select-h: 33px;
+  --select-r: 11px;
+  --input-w: 72px;
+  --input-h: 33px;
+  --input-r: 11px;
   --convert-h: 79px;
   --convert-r: 32px;
 
   --btn-h: 37px;
+  --account-d: 38px; /* mockup: 38.5 px */
   --file-w: 107px;
   --file-r: 10px;
-  --logo: 36px;
+  --logo: 35px;
 
   --focus-dark: 0 0 0 3px #000, 0 0 0 5px #fff;
   --focus-light: 0 0 0 2px #fff, 0 0 0 4px #000;
@@ -123,12 +124,18 @@ p {
   outline: none;
 }
 :focus-visible {
-  outline: none;
+  /* The transparent outline shows up in forced-colors (high contrast) mode, where box-shadow is removed. */
+  outline: 2px solid transparent;
+  outline-offset: 2px;
   box-shadow: var(--focus-dark);
+}
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 2px solid CanvasText;
+  }
 }
 .card :focus-visible,
 .result-card :focus-visible,
-.popover :focus-visible,
 .dialog :focus-visible {
   box-shadow: var(--focus-light);
 }
@@ -174,7 +181,7 @@ p {
 .header__actions {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 7px;
 }
 
 .header-anchor {
@@ -207,8 +214,8 @@ p {
 }
 
 .account-button {
-  width: var(--btn-h);
-  height: var(--btn-h);
+  width: var(--account-d);
+  height: var(--account-d);
   border-radius: 50%;
   border: 2px solid var(--c-line);
   background: #000;
@@ -234,14 +241,15 @@ p {
 
 .popover {
   position: absolute;
-  top: calc(100% + 10px);
+  top: calc(100% + 8px);
   right: 0;
   z-index: 50;
-  background: var(--c-card);
-  color: var(--c-ink);
-  border-radius: 18px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(0, 0, 0, 0.06);
-  padding: 8px;
+  background: #000;
+  color: #fff;
+  border: 2px solid var(--c-line);
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 6px;
   min-width: 230px;
 }
 .popover--account {
@@ -257,9 +265,9 @@ p {
   width: 100%;
   padding: 10px 14px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 9px;
   background: none;
-  color: var(--c-ink);
+  color: #fff;
   text-align: left;
   font-size: var(--fs-body);
   font-weight: 500;
@@ -268,25 +276,28 @@ p {
 }
 .menu-item:hover,
 .menu-item:focus-visible {
-  background: var(--c-hover-light);
+  background: var(--c-hover-dark);
+}
+.menu-item:focus-visible {
+  box-shadow: inset 0 0 0 2px #fff;
 }
 .menu-item[aria-disabled="true"] {
-  color: #85888c;
+  color: var(--c-disabled-dark);
   cursor: default;
   background: none;
 }
 .menu-item--danger:not([aria-disabled="true"]) {
-  color: var(--c-danger-ink);
+  color: var(--c-danger);
 }
 .menu-sep {
   height: 1px;
-  background: #e3e4e6;
+  background: rgba(255, 255, 255, 0.25);
   margin: 6px 8px;
 }
 
 .acct-section {
   padding: 12px 0;
-  border-bottom: 1px solid #e6e7e8;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.2);
 }
 .acct-section:last-child {
   border-bottom: 0;
@@ -298,7 +309,7 @@ p {
 .acct-muted {
   margin-top: 4px;
   font-size: var(--fs-small);
-  color: var(--c-muted-light);
+  color: var(--c-muted-dark);
 }
 .acct-heading {
   font-size: var(--fs-small);
@@ -306,7 +317,7 @@ p {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   margin-bottom: 8px;
-  color: var(--c-muted-light);
+  color: var(--c-muted-dark);
 }
 :lang(zh-Hant) .acct-heading {
   text-transform: none;
@@ -316,7 +327,7 @@ p {
 .segmented {
   display: inline-flex;
   padding: 3px;
-  border: 1.5px solid #000;
+  border: 1.5px solid #fff;
   border-radius: 999px;
   gap: 2px;
 }
@@ -326,11 +337,11 @@ p {
   border-radius: 999px;
   padding: 6px 14px;
   font-weight: 600;
-  color: #000;
+  color: #fff;
 }
 .segmented__item[aria-checked="true"] {
-  background: #000;
-  color: #fff;
+  background: #fff;
+  color: #000;
 }
 
 .switch-row {
@@ -348,23 +359,25 @@ p {
   width: 46px;
   height: 26px;
   border-radius: 999px;
-  border: 0;
-  background: #b9bcc0;
+  border: 1.5px solid #fff;
+  background: #000;
   padding: 0;
   transition: background 0.15s;
 }
 .switch__knob {
   position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 20px;
-  height: 20px;
+  top: 2.5px;
+  left: 2.5px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  background: var(--c-muted-dark);
   transition: transform 0.15s;
 }
 .switch[aria-checked="true"] {
+  background: #fff;
+}
+.switch[aria-checked="true"] .switch__knob {
   background: #000;
 }
 .switch[aria-checked="true"] .switch__knob {
@@ -382,7 +395,7 @@ p {
   justify-content: space-between;
   gap: 10px;
   padding: 8px 0;
-  border-top: 1px solid #eeeff0;
+  border-top: 1px solid rgba(255, 255, 255, 0.14);
 }
 .recent:first-child {
   border-top: 0;
@@ -403,7 +416,7 @@ p {
 }
 .recent__meta {
   font-size: 12px;
-  color: var(--c-muted-light);
+  color: var(--c-muted-dark);
 }
 .recent__actions {
   display: flex;
@@ -414,18 +427,18 @@ p {
   height: 28px;
   padding: 0 11px;
   border-radius: 999px;
-  border: 1.5px solid #000;
-  background: #fff;
-  color: #000;
+  border: 1.5px solid #fff;
+  background: #000;
+  color: #fff;
   font-size: var(--fs-small);
   font-weight: 600;
 }
 .mini-btn:hover {
-  background: var(--c-hover-light);
+  background: var(--c-hover-dark);
 }
 .mini-btn--danger {
-  border-color: var(--c-danger-ink);
-  color: var(--c-danger-ink);
+  border-color: var(--c-danger);
+  color: var(--c-danger);
 }
 
 /* ------------------------------------------------------------------ the big frame */
@@ -444,13 +457,18 @@ p {
 .stage.is-dragover {
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.35), 0 0 32px rgba(255, 255, 255, 0.25);
 }
+/* While a file is dragged over the frame only the drop hint is shown (nothing shows through it). */
+.stage.is-dragover .empty,
+.stage.is-dragover .frame-toast {
+  visibility: hidden;
+}
 
 .drop-hint {
   position: absolute;
   inset: 14px;
   border: 2px dashed rgba(255, 255, 255, 0.85);
-  border-radius: calc(var(--frame-radius) - 10px);
-  background: rgba(255, 255, 255, 0.07);
+  border-radius: calc(var(--frame-radius) - 14px);
+  background: #0b0c0d;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -532,13 +550,22 @@ p {
 .layer-msg {
   position: absolute;
   inset: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   padding: 16px;
   background: #f1f2f3;
   color: #3a3d41;
   font-size: var(--fs-body);
   text-align: center;
+}
+.layer-msg__why,
+.layer-msg__detail {
+  max-width: 420px;
+  font-size: var(--fs-small);
+  color: var(--c-muted-light);
 }
 
 /* viewer */
@@ -747,17 +774,27 @@ p {
 .chip {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   height: 30px;
   padding: 0 12px;
   border-radius: 999px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
   font-size: 14px;
   font-weight: 500;
   white-space: nowrap;
 }
 .chip--score {
   font-weight: 600;
+}
+.spinner--inline {
+  position: relative;
+  left: auto;
+  top: auto;
+  margin: 0;
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
 }
 
 .view-tabs {
@@ -766,7 +803,7 @@ p {
   gap: 2px;
   border-radius: 999px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
 }
 .view-tabs__tab {
   height: 32px;
@@ -787,23 +824,64 @@ p {
   color: #000;
 }
 
-.stage-note {
+.stage-notes {
   position: absolute;
   top: 62px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 20px;
+  right: 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 9;
+  pointer-events: none;
+}
+.stage-note {
+  max-width: min(100%, 720px);
   padding: 5px 12px;
   border-radius: 999px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
   color: #fff;
   font-size: var(--fs-small);
   white-space: nowrap;
-  max-width: calc(100% - 40px);
   overflow: hidden;
   text-overflow: ellipsis;
-  z-index: 9;
-  pointer-events: none;
+}
+.stage-note--info {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  white-space: normal;
+  border-radius: 14px;
+  text-align: left;
+}
+.stage-note--info svg {
+  flex: none;
+  margin-top: 1px;
+}
+.stage-note--why {
+  display: block;
+  pointer-events: auto;
+}
+.stage-note--why summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+}
+.stage-note--why summary::-webkit-details-marker {
+  display: none;
+}
+.stage-note--why p,
+.stage-note--why ul {
+  margin: 6px 0 2px 24px;
+  color: var(--c-muted-dark);
+}
+.stage-note--why ul {
+  padding-left: 16px;
 }
 
 .tool-btn {
@@ -826,7 +904,7 @@ p {
 }
 .stage-top__right .tool-btn {
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
 }
 .tool-btn:hover:not(:disabled) {
   background: var(--c-hover-dark);
@@ -851,7 +929,7 @@ p {
   padding: 4px;
   border-radius: 999px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
   z-index: 10;
 }
 .zoom-controls__level {
@@ -883,7 +961,7 @@ p {
   padding: 4px;
   border-radius: 999px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
 }
 .page-nav__count {
   min-width: 64px;
@@ -899,7 +977,7 @@ p {
   padding: 10px;
   border-radius: 16px;
   background: var(--c-chrome);
-  border: 1px solid var(--c-chrome-line);
+  border: 1.5px solid var(--c-chrome-line);
   scrollbar-width: thin;
 }
 .thumb {
@@ -973,6 +1051,19 @@ p {
   color: #fff;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.progress-panel__detail,
+.progress-panel__details {
+  max-width: 480px;
+  color: var(--c-muted-dark);
+  font-size: var(--fs-small);
+  overflow-wrap: anywhere;
+}
+.progress-panel__details summary {
+  cursor: pointer;
+}
+.progress-panel__details p {
+  margin-top: 4px;
 }
 .progress-panel--failed svg {
   color: var(--c-danger);
@@ -1145,6 +1236,18 @@ textarea.field__input {
 .field__input:focus-visible {
   border-color: #000;
 }
+input.field__input {
+  height: var(--select-h);
+  min-height: 0;
+  border: 0;
+  border-radius: var(--input-r);
+  background: #000;
+  color: #fff;
+  font-weight: 600;
+}
+.pill-select--field select {
+  height: var(--select-h);
+}
 .color-field {
   display: flex;
   gap: 6px;
@@ -1152,11 +1255,11 @@ textarea.field__input {
 }
 .color-field__swatch {
   width: 40px;
-  height: 38px;
-  padding: 2px;
-  border: 1.5px solid #b7babe;
-  border-radius: 10px;
-  background: #fff;
+  height: var(--select-h);
+  padding: 3px;
+  border: 0;
+  border-radius: var(--input-r);
+  background: #000;
 }
 .color-field__hex {
   width: 104px;
@@ -1250,12 +1353,20 @@ textarea.field__input {
 .side {
   min-width: 0;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 16px;
+  display: grid;
+  /* The card sits in the middle row (centred on the frame, as in the mockup) whether or not the result card is shown:
+     the result card goes in the bottom row, so nothing above it moves. Rows grow instead of clipping when space runs out. */
+  grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr);
   overflow-y: auto;
   padding: 6px 0; /* room for focus rings */
+}
+.side > .card {
+  grid-row: 2;
+}
+.side > .result-card {
+  grid-row: 3;
+  align-self: start;
+  margin-top: 16px;
 }
 
 .card {
@@ -1275,10 +1386,10 @@ textarea.field__input {
   align-items: center;
 }
 .card-row--origin {
-  margin-top: 45px;
+  margin-top: 42px;
 }
 .card-row--size {
-  margin-top: 38px;
+  margin-top: 36px;
 }
 .card-label {
   font-size: var(--fs-label);
@@ -1290,6 +1401,15 @@ textarea.field__input {
   flex-direction: column;
   align-items: flex-start;
   gap: 1px;
+}
+/* "Origin Size:" sits level with its W/H boxes, "(Optional)" hangs below it (as in the mockup). */
+.card-row--origin .card-label--stack {
+  position: relative;
+}
+.card-row--origin .card-optional {
+  position: absolute;
+  top: 100%;
+  left: 0;
 }
 .card-optional {
   font-size: var(--fs-tiny);
@@ -1315,15 +1435,39 @@ textarea.field__input {
   background: #000;
   color: #fff;
   font-size: var(--fs-control);
-  font-weight: 600;
+  font-weight: 700;
   text-align: center;
   text-align-last: center;
   text-overflow: ellipsis;
   cursor: pointer;
 }
 .pill-select select:disabled {
+  opacity: 1; /* Chromium dims disabled selects; keep the black pill and only grey the text, like the W/H boxes */
+  background: #000;
   color: var(--c-disabled-dark);
   cursor: default;
+}
+/* The closed format menu shows a short name ("SVG"); the open list keeps the full names with the extension. */
+.pill-select__value {
+  position: absolute;
+  inset: 0 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: var(--fs-control);
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.pill-select--short select {
+  color: transparent;
+}
+.pill-select--short select:disabled + .pill-select__caret,
+.pill-select--short:has(select:disabled) .pill-select__value {
+  color: var(--c-disabled-dark);
 }
 .pill-select option {
   color: #000;
@@ -1393,7 +1537,7 @@ textarea.field__input {
   flex-direction: column;
 }
 .card-or {
-  height: 17px;
+  height: 15px;
   display: grid;
   place-items: center;
   font-size: var(--fs-tiny);
@@ -1430,7 +1574,7 @@ textarea.field__input {
 
 .convert-btn {
   position: relative;
-  margin-top: 34px;
+  margin-top: 33px;
   width: 100%;
   height: var(--convert-h);
   border: 0;
@@ -1439,7 +1583,7 @@ textarea.field__input {
   color: #fff;
   font-size: var(--fs-convert);
   font-weight: 600;
-  letter-spacing: 0.01em;
+  letter-spacing: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1481,8 +1625,8 @@ textarea.field__input {
   flex: none;
   background: var(--c-card);
   color: var(--c-ink);
-  border-radius: 28px;
-  padding: 20px 26px 22px;
+  border-radius: var(--card-radius);
+  padding: 22px 37px 24px 38px; /* same side padding as the card above, so the labels line up */
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -1502,6 +1646,13 @@ textarea.field__input {
   font-weight: 600;
   line-height: 1;
   font-variant-numeric: tabular-nums;
+}
+.result-card__warn {
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: #fff4e0;
+  color: #5a3a00;
+  font-size: var(--fs-small);
 }
 .result-card__actions {
   display: flex;
@@ -1531,7 +1682,23 @@ textarea.field__input {
 
 /* ------------------------------------------------------------------ narrower screens */
 
-@media (max-width: 1099px) {
+/* 900–1099 px: keep frame and card side by side (a narrower card), so CONVERT stays on the first screen. */
+@media (min-width: 900px) and (max-width: 1099px) {
+  :root {
+    --card-w: 380px;
+    --card-pad: 40px 24px 28px 26px;
+    --gap: 28px;
+    --side-extra-right: 0px;
+    --label-col: 90px;
+  }
+  .result-card {
+    padding-left: 26px;
+    padding-right: 24px;
+  }
+}
+
+/* Below 900 px: the card goes under the frame. The frame leaves room for the top of the card to show. */
+@media (max-width: 899px) {
   :root {
     --gap: 24px;
     --side-extra-right: 0px;
@@ -1542,16 +1709,24 @@ textarea.field__input {
     grid-template-columns: minmax(0, 1fr);
   }
   .stage {
-    height: min(78vh, 900px);
-    min-height: 440px;
+    height: min(78vh, 900px, calc(100dvh - var(--header-h) - 200px));
+    min-height: 420px;
   }
   .side {
+    display: flex;
+    flex-direction: column;
     overflow: visible;
     align-items: center;
     justify-content: flex-start;
+    gap: 16px;
+  }
+  .side > .result-card {
+    margin-top: 0;
+    align-self: center;
   }
   .card,
   .result-card {
+    width: 100%;
     max-width: var(--card-w);
   }
 }
@@ -1563,8 +1738,8 @@ textarea.field__input {
     --pad-bottom: 20px;
     --header-h: 60px;
     --header-top: 10px;
-    --frame-radius: 22px;
-    --card-radius: 26px;
+    --frame-radius: 26px;
+    --card-radius: 28px;
     --card-pad: 26px 18px 20px 18px;
     --label-col: 84px;
     --input-w: 58px;
@@ -1606,11 +1781,29 @@ textarea.field__input {
     overflow-x: auto;
   }
   .view-tabs__tab {
-    padding: 0 10px;
-    font-size: 14px;
+    height: 30px;
+    padding: 0 8px;
+    font-size: 13px;
+  }
+  /* Edit becomes an icon button (its text stays for screen readers) so all four tabs fit. */
+  .stage-top__right .tool-btn--text {
+    width: 36px;
+    padding: 0;
+  }
+  .stage-top__right .tool-btn--text span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+  .stage-notes {
+    top: 54px;
+    left: 10px;
+    right: 10px;
   }
   .stage-note {
-    top: 56px;
     font-size: 12px;
   }
   .stage-bottom {
