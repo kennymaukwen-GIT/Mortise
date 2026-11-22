@@ -215,6 +215,8 @@ class Pipeline:
             if self.store.has(f"s6/{fmt.value}"):
                 out = self.store.load(f"s6/{fmt.value}", OutputFile)
                 target = dest_dir / out.filename
+                if target in written:  # 兩種格式同副檔名同檔名（例如 Word 的版面固定與可重排都是 .docx）：後者加上格式名，不互相覆蓋
+                    target = dest_dir / f"{Path(out.filename).stem}_{fmt.value}{Path(out.filename).suffix}"
                 shutil.copyfile(self.store.blob_path(out.file), target)
                 written.append(target)
         if self.store.has("s7/fidelity_report"):

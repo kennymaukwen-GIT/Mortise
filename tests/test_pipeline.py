@@ -76,3 +76,15 @@ def test_user_font_correction_survives_rerun(job):
     fam = styled.pages[0].text_boxes[0].paragraphs[0].runs[0].font.family
     assert fam.value == "Carlito" and fam.locked and fam.confidence == 1.0
     assert isinstance(pipe.store.load("s7/fidelity_report", FidelityReport), FidelityReport)
+
+
+def test_export_keeps_both_word_files(tmp_path):
+    """Word 的版面固定與可重排都叫「檔名.docx」：一起匯出時不可互相覆蓋（實際發生過，只剩一份）。"""
+    pipe = Pipeline(tmp_path / "job")
+    from mortise.artifacts import OutputFormat
+
+    pipe.start(FIXTURE, "slide_basic.pdf", Intent(outputs=[OutputFormat.DOCX_FIXED, OutputFormat.DOCX_FLOW]))
+    pipe.run()
+    written = pipe.export_to(tmp_path / "out")
+    docx = sorted(p.name for p in written if p.suffix == ".docx")
+    assert len(docx) == 2 and len(set(docx)) == 2, docx
