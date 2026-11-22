@@ -61,6 +61,19 @@ def _lap_grad(F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return lap, grad
 
 
+def _ring_level(lap: np.ndarray, grad: np.ndarray, t_grad: float) -> float:
+    """邊緣旁邊（離強邊緣 1.5 到 4.5 像素）的 Laplacian 中位數：量壓縮振鈴的大小（色階）。沒有強邊緣回傳 0。"""
+    edge = grad > t_grad
+    n_edge = int(edge.sum())
+    if n_edge < 16 or n_edge > 0.5 * edge.size:
+        return 0.0
+    dist = cv2.distanceTransform((~edge).astype(np.uint8), cv2.DIST_L2, 3)
+    band = (dist >= 1.5) & (dist <= 4.5)
+    if int(band.sum()) < 64:
+        return 0.0
+    return float(np.median(lap[band]))
+
+
 def _rdp_profile(s: np.ndarray, c: np.ndarray, tol: float) -> list[int]:
     """色彩剖面（位置 s、顏色 c）的折線簡化，回傳保留的序號。"""
     keep = [0, len(s) - 1]
@@ -201,6 +214,11 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
     # ---------- 1. 雜訊
     lap, grad = _lap_grad(I)
     s_lap = float(np.median(lap))
+    # 壓縮振鈴（JPEG）：整張圖大多是完全平坦的，雜訊只出現在邊緣旁邊幾個像素內，全圖的中位數量不到。
+    # 所以另外只看「離強邊緣 1.5 到 4.5 像素」的那一圈：乾淨、縮放、模糊過的圖在那裡是平的，壓縮過的才會起伏。
+    s_ring = _ring_level(lap, grad, float(P["smooth_grad"]))
+    stats["ring"] = round(s_ring, 3)
+    s_lap = max(s_lap, s_ring)
     sigma = s_lap / 4.5
     F = I
     if s_lap > float(P["denoise_lap"]):
