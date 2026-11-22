@@ -63,7 +63,7 @@ def test_small_heading_near_bottom_with_content_below_is_not_footer():
         return TextLine(id=f"l{i}", quad=q, z=i, baseline=(Point(x=x0, y=y + size), Point(x=x1, y=y + size)), runs=[run])
 
     lines = [line(0, "Body text " * 6, 0.30, 0.020), line(1, "More body " * 6, 0.60, 0.020),
-             line(2, "EDUCATION", 1.25, 0.0185), line(3, "BA (Hons) Urban Design and Planning", 1.29, 0.020),
+             line(2, "EDUCATION", 1.25, 0.0185), line(3, "BSc (Hons) Food Science and Nutrition", 1.29, 0.020),
              line(4, "Company footer", 1.385, 0.012, 0.3, 0.7)]
     paras = [Paragraph(id=f"p{i}", line_ids=[ln.id], quad=ln.quad, alignment=measured(Align.LEFT, 0.9, Provenance.MEASURED, "t"),
                        role=measured(Role.UNKNOWN, 0.1, Provenance.INFERRED, "t")) for i, ln in enumerate(lines)]
