@@ -35,11 +35,20 @@ def _summary(report: FidelityReport, pipe: Pipeline) -> str:
     for r in pipe.state.get("rounds", []):
         kept = "" if "kept" not in r else ("，採用" if r["kept"] else "，沒有進步，已退回")
         lines.append(f"  第 {r['round']} 輪：分數 {r['score']}，提出 {r['proposed']} 張修正單{kept}")
+    fmt_pages = {(fr.format.value, fp.page_index): fp for fr in report.format_reports for fp in fr.pages}
     for p in report.pages:
         boxes = [e for e in p.elements if e.kind == "text_box"]
-        ok = sum(1 for e in boxes if e.text_match and e.linebreak_match)
-        sim = "—" if p.target_similarity is None else f"{p.target_similarity:.3f}"
-        lines.append(f"第 {p.page_index + 1} 頁：相似度 {sim}；文字框 {len(boxes)} 個，其中 {ok} 個文字與斷行都一致")
+        parts = []
+        if p.target_similarity is not None:  # PowerPoint 的目標驗證（LibreOffice 渲染）
+            ok = sum(1 for e in boxes if e.text_match and e.linebreak_match)
+            parts.append(f"PowerPoint 渲染相似度 {p.target_similarity:.3f}；文字框 {len(boxes)} 個，其中 {ok} 個文字與斷行都一致")
+        if p.neutral_similarity is not None:
+            parts.append(f"成品自行渲染相似度 {p.neutral_similarity:.3f}")
+        for (fmt, idx), fp in sorted(fmt_pages.items()):
+            if idx == p.page_index and fp.similarity is not None:
+                extra = f"，讀回文字一致 {fp.text_match_ratio:.0%}" if fp.text_match_ratio is not None else ""
+                parts.append(f"{fmt} 讀回相似度 {fp.similarity:.3f}{extra}")
+        lines.append(f"第 {p.page_index + 1} 頁：" + ("；".join(parts) if parts else "沒有做渲染比對"))
         for i in p.issues:
             if i.severity.value != "info":
                 lines.append(f"  [{i.severity.value}] {i.message}" + (f"（{i.element_id}）" if i.element_id else ""))

@@ -172,19 +172,14 @@ def _fc_escape(name: str) -> str:
 
 
 def _fc_match(family: str, bold: bool, italic: bool) -> Optional[_Match]:
-    """用 fontconfig 找字型檔。回傳 None 表示 fc-match 不能用。"""
-    pattern = _fc_escape(family) + (":bold" if bold else "") + (":italic" if italic else "")
-    if pattern not in _MATCH_CACHE:
-        m = None
-        try:
-            out = subprocess.run(["fc-match", "-f", "%{file}\t%{index}\t%{family}\t%{weight}\t%{slant}", pattern], capture_output=True, text=True, timeout=20).stdout
-            parts = out.strip().split("\t")
-            if len(parts) == 5 and parts[0]:
-                m = _Match(path=parts[0], index=int(parts[1] or 0), families=[f.strip().replace("\\-", "-") for f in parts[2].split(",")], weight=int(float(parts[3] or 80)), slant=int(float(parts[4] or 0)))
-        except Exception:
-            m = None
-        _MATCH_CACHE[pattern] = m
-    return _MATCH_CACHE[pattern]
+    """找字型檔（mortise.tools.fontfind：有 fontconfig 用 fc-match，沒有就掃描系統字型目錄，macOS、Windows 也能用）。
+    回傳 None 表示這台電腦一個字型都找不到。"""
+    from ..tools import fontfind
+
+    m = fontfind.match(family, bold, italic)
+    if m is None:
+        return None
+    return _Match(path=m.path, index=m.index, families=list(m.families), weight=m.weight, slant=m.slant)
 
 
 def _single_font_file(path: str, index: int) -> str:
@@ -318,8 +313,8 @@ class _Fonts:
                 if i > 0:
                     self._note(("sub", want, face.family), Degradation(element_id=element_id, concept="字型", action=f"系統沒有推論的字型「{want}」，內嵌「{face.family}」代替（{self.p.get('editor_name', 'Illustrator')} 編輯文字時需要安裝字型）", lossy=True))
                 break
-        if chosen is None:  # 最後手段：fontconfig 給什麼用什麼
-            for fam in ("sans-serif", "serif"):
+        if chosen is None:  # 最後手段：這台電腦的同類常見字型（中日韓文字先找中日韓字型，否則會變成方塊）
+            for fam in (("cjk-sans",) if fc.east_asian else ()) + ("sans-serif", "serif"):
                 m = _fc_match(fam, bold, italic)
                 if m is not None:
                     face, why = self._load(m, self.metric, rename)

@@ -115,16 +115,17 @@ _ASC_CACHE: dict[str, Optional[float]] = {}
 
 
 def _ascent_ratio(family: str) -> Optional[float]:
-    """用 fontconfig 找字型檔，回傳 hhea 上緣 ÷ 字身（找不到或字族不符時回傳 None）。"""
+    """找字型檔（mortise.tools.fontfind），回傳 hhea 上緣 ÷ 字身（找不到或字族不符時回傳 None）。"""
     if family not in _ASC_CACHE:
         val = None
         try:
-            out = subprocess.run(["fc-match", "-f", "%{file}\t%{index}\t%{family}", re.sub(r"([\\\-:,])", r"\\\1", family)], capture_output=True, text=True, timeout=20).stdout.split("\t")
-            norm = lambda s: re.sub(r"[\s_\-]", "", s).casefold()  # noqa: E731
-            if len(out) == 3 and norm(family) in {norm(f) for f in out[2].split(",")}:
+            from ..tools import fontfind
+
+            found = fontfind.find_file(family)
+            if found is not None:
                 from fontTools.ttLib import TTFont
 
-                ft = TTFont(out[0], fontNumber=int(out[1] or 0), lazy=True)
+                ft = TTFont(found[0], fontNumber=found[1], lazy=True)
                 val = ft["hhea"].ascent / ft["head"].unitsPerEm
         except Exception:
             val = None

@@ -108,8 +108,10 @@ class FontBook:
     def _generic(self, name: str) -> Optional[str]:
         """通用字型在這台伺服器上對應到哪個家族：先問 fontconfig，問不到就從常見的開放字型裡挑一個有的。"""
         try:
-            out = subprocess.run(["fc-match", "-f", "%{family}", name], capture_output=True, text=True, timeout=20).stdout
-            for fam in (f.strip().replace("\\-", "-") for f in out.split(",")):
+            from ..tools import fontfind
+
+            m = fontfind.match(name)
+            for fam in (m.families if m is not None else []):
                 if fam in self.by_family:
                     return fam
         except Exception:
@@ -203,16 +205,19 @@ _BOOKS: dict[tuple, FontBook] = {}
 
 
 def font_files(dirs: Optional[list[str]] = None) -> list[str]:
-    """渲染用的字型檔。沒有指定目錄時用 fontconfig 列出的字型（輸出器量行寬時也是透過 fontconfig 找字型）。"""
+    """渲染用的字型檔。沒有指定目錄時用這台電腦的字型（mortise.tools.fontfind；輸出器量行寬時也是透過它找字型）。"""
     files: set[str] = set()
     if not dirs:
         try:
-            out = subprocess.run(["fc-list", "--format", "%{file}\n"], capture_output=True, text=True, timeout=30).stdout
-            files = {ln.strip() for ln in out.splitlines() if ln.strip().lower().endswith(_FONT_EXT)}
+            from ..tools import fontfind
+
+            files = {e.path for e in fontfind.list_fonts() if e.path.lower().endswith(_FONT_EXT)}
         except Exception:
             files = set()
         if not files:
-            dirs = ["/usr/share/fonts", "/usr/local/share/fonts", str(Path.home() / ".fonts"), str(Path.home() / ".local/share/fonts")]
+            from ..tools import fontfind
+
+            dirs = fontfind.system_font_dirs()
     for d in dirs or []:
         root = Path(d)
         if root.is_dir():

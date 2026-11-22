@@ -79,14 +79,13 @@ _INSTALLED: set[str] | None = None
 
 
 def installed_families() -> set[str]:
-    """這台機器上裝了哪些字族（用 fontconfig 查；查不到就回傳空集合）。"""
+    """這台機器上裝了哪些字族（mortise.tools.fontfind：有 fontconfig 用它查，沒有就掃描系統字型目錄；查不到就回傳空集合）。"""
     global _INSTALLED
     if _INSTALLED is None:
-        import subprocess
-
         try:
-            out = subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True, timeout=20).stdout
-            _INSTALLED = {name.strip().replace("\\-", "-") for line in out.splitlines() for name in line.split(",") if name.strip()}
+            from .fontfind import installed_families as _families
+
+            _INSTALLED = _families()
         except Exception:
             _INSTALLED = set()
     return _INSTALLED

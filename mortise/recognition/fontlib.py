@@ -56,8 +56,8 @@ DEFAULT_PARAMS: dict = {
     "font_dirs": [],
     # 是否使用 fc-list 列舉系統字型（False 時只掃描 font_dirs 與 fallback_dirs）
     "use_fc_list": True,
-    # 沒有 fc-list 時掃描的系統目錄
-    "fallback_dirs": ["/usr/share/fonts", "/usr/local/share/fonts", "~/.fonts", "~/.local/share/fonts"],
+    # 沒有 fc-list 時掃描的目錄；None 表示這台電腦的系統字型目錄（Linux、macOS、Windows 各自的位置，見 mortise.tools.fontfind）
+    "fallback_dirs": None,
     # 接受的副檔名（HarfBuzz 與 FreeType 都能處理的向量格式）
     "extensions": [".ttf", ".otf", ".ttc", ".otc"],
     # 排除的字族（彩色點陣表情、符號字型不適合拿來比對文字）
@@ -626,11 +626,16 @@ def _build_library(key: tuple, p: dict) -> FontLibrary:
         return _LIB_CACHE[key]
     dirs, use_fc = key[0], key[1]
     entries: list[tuple[str, int, str, str]] = []
-    if use_fc:
+    from ..tools.fontfind import fontconfig_available
+
+    if use_fc and fontconfig_available():
         entries += _fc_list()
     if not entries:
-        for d in p["fallback_dirs"]:
-            entries += _scan_dir(os.path.expanduser(d), p["extensions"])
+        from ..tools.fontfind import system_font_dirs
+
+        fallback = system_font_dirs() if p["fallback_dirs"] is None else [os.path.expanduser(d) for d in p["fallback_dirs"]]
+        for d in fallback:
+            entries += _scan_dir(d, p["extensions"])
     for d in dirs:
         entries += _scan_dir(os.path.expanduser(d), p["extensions"])
     exts = tuple(e.lower() for e in p["extensions"])
