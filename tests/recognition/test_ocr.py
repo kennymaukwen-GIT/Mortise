@@ -694,7 +694,7 @@ TRACKED = [  # (文字, 字型, 字級 px, 字距 em)：不同字型、字級、
 ]
 UNTOUCHED = [  # 一般字距的行：開不開這個功能，讀出來都要一樣
     ("Made in the U S A today", SANS, 26), ("U S A", SANS_B, 30), ("A B C D", SANS, 26), ("I am a student", INTER_R, 26),
-    ("Call +44 7707 391793", SANS, 24), ("Normal body text stays the same", INTER_R, 22), ("第二季 Word 與 Excel 輸出", WQY, 30),
+    ("Call +44 20 7946 0123", SANS, 24), ("Normal body text stays the same", INTER_R, 22), ("第二季 Word 與 Excel 輸出", WQY, 30),
 ]
 ROW = 80
 
