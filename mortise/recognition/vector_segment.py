@@ -62,7 +62,11 @@ def _lap_grad(F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _ring_level(lap: np.ndarray, grad: np.ndarray, t_grad: float) -> float:
-    """邊緣旁邊（離強邊緣 1.5 到 4.5 像素）的 Laplacian 中位數：量壓縮振鈴的大小（色階）。沒有強邊緣回傳 0。"""
+    """壓縮振鈴的大小（換算成與全圖 Laplacian 中位數同一個尺度的色階）。
+
+    取「離強邊緣 1.5 到 4.5 像素」那一圈的 Laplacian 第 75 百分位，減掉遠離邊緣處的同一個統計量
+    （漸層本身的色階、均勻的雜訊兩邊都有，會互相抵銷），剩下的就是只出現在邊緣旁邊的起伏。沒有強邊緣回傳 0。
+    """
     edge = grad > t_grad
     n_edge = int(edge.sum())
     if n_edge < 16 or n_edge > 0.5 * edge.size:
@@ -71,7 +75,12 @@ def _ring_level(lap: np.ndarray, grad: np.ndarray, t_grad: float) -> float:
     band = (dist >= 1.5) & (dist <= 4.5)
     if int(band.sum()) < 64:
         return 0.0
-    return float(np.median(lap[band]))
+    far = dist > 6.5
+    base = float(np.percentile(lap[far], 75)) if int(far.sum()) >= 64 else 0.0
+    return _RING_K * max(0.0, float(np.percentile(lap[band], 75)) - base)
+
+
+_RING_K = 1.5
 
 
 def _rdp_profile(s: np.ndarray, c: np.ndarray, tol: float) -> list[int]:
@@ -337,6 +346,41 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
         single = d0 <= tau0
         two = (~single) & (best_d <= tau0)
         unexplained = ~(single | two)
+        # 第二輪：上面只看「最近的核心」，斜的細線常常只有零星幾段核心（線的兩側每隔一段才換一列），
+        # 兩段核心中間的邊緣像素四周的最近核心全是底色，找不到另一種顏色。這裡改看鄰近像素「已經解釋好」的區域
+        # （純色像素已貼上自己的區域），再試一次兩色混合；仍解釋不了的才當成細節。
+        if unexplained.any():
+            lab_now = L1.copy()
+            ok1 = single | two
+            lab_now[nys[ok1], nxs[ok1]] = np.where(two[ok1] & (best_t[ok1] > 0.5), best_j[ok1], l1[ok1])
+            lab_now[nys[unexplained], nxs[unexplained]] = -1
+            ui = np.nonzero(unexplained)[0]
+            uy, ux = nys[ui], nxs[ui]
+            Iu, Cu, lu = Ip[ui], C1[ui], l1[ui]
+            bd = np.full(len(ui), np.inf, dtype=np.float32)
+            bt = np.zeros(len(ui), dtype=np.float32)
+            bj = np.full(len(ui), -1, dtype=np.int32)
+            for r in (1, 2):
+                for dy, dx in ((0, r), (0, -r), (r, 0), (-r, 0), (r, r), (r, -r), (-r, r), (-r, -r)):
+                    yy = np.clip(uy + dy, 0, H - 1)
+                    xx = np.clip(ux + dx, 0, W - 1)
+                    j = lab_now[yy, xx]
+                    diff = (j >= 0) & (j != lu)
+                    if not diff.any():
+                        continue
+                    Cj = flat_tab[np.maximum(j, 0)]
+                    d, t, vv = _seg_dist(Iu, Cu, Cj)
+                    d = np.where(diff & (vv > 2.0 * tau0), d - float(P["explain_slack"]) * vv * np.minimum(t, 1 - t) * 2.0, np.inf)
+                    better = d < bd
+                    bd = np.where(better, d, bd)
+                    bt = np.where(better, t, bt)
+                    bj = np.where(better, j, bj)
+            fix = bd <= tau0
+            if fix.any():
+                two[ui[fix]] = True
+                best_t[ui[fix]] = bt[fix]
+                best_j[ui[fix]] = bj[fix]
+                unexplained = ~(single | two)
         t2 = best_t[two]
         swap = t2 > 0.5
         ty, tx = nys[two], nxs[two]
