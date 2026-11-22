@@ -58,14 +58,17 @@ DEFAULTS: dict[str, Any] = {
     "line_partial_min": 0.8,  # 一行找到的比例低於此值：一部分找不到
     "line_ncc_min": 0.5,  # 一段算「找到」的最低相關係數
     "line_mass_min": 0.4,  # 一段算「找到」時，渲染結果的墨跡量至少是原圖的多少倍（太少是殘影或被蓋住）
-    "line_extra_max": 0.6,  # 渲染結果在這一行的位置多出的墨跡超過原本的此比例：和別的東西疊在一起
+    "line_extra_max": 0.12,  # 疊字：渲染結果在這一行多出、原圖附近沒有的墨跡，至少是原本墨跡的此比例
+    "line_overlap_mass": 1.3,  # 疊字：而且渲染結果這一行的墨跡總量至少是原圖的此倍數（正常的行實測最多 1.16 倍）
     "line_offset_tolerance_pt": 2.0,  # 位置偏移的容許差（pt）
-    "line_offset_tolerance_ratio": 0.2,  # 位置偏移的容許差（字高的比例）；兩者取大
-    "line_min_share": 0.02,  # 逐行分數：每一個有問題的行至少扣這麼多（乘上嚴重程度）
+    "line_offset_tolerance_ratio": 0.1,  # 位置偏移的容許差（字高的比例）；兩者取大
+    "line_problem_floor": 0.02,  # 逐行分數：每一個內容問題（找不到、疊在一起）另外至少扣這麼多（乘上嚴重程度）
+    "line_problem_cap": 0.10,  # 上一項最多扣到這麼多
     "line_min_ink_px": 12.0,  # 原圖上一行的墨跡少於這麼多像素（以字高 1 的墨跡計）就不判斷
 }
 
-_SEVERITY_OVERLAP = 0.6
+_OVERLAP_SEVERITY = 0.6  # 疊在一起的嚴重程度（找不到是 1）
+_OFFSET_SEVERITY = (0.15, 0.35)  # 位置偏移的嚴重程度：剛超過容許差、多偏一個字高以上
 
 
 def params(cfg) -> dict:
@@ -106,6 +109,7 @@ class LineResult:
     dx_pt: float = 0.0  # 找到的各段的平均偏移（pt）
     dy_pt: float = 0.0
     extra: float = 0.0  # 多出的墨跡 ÷ 原本的墨跡
+    mass: float = 0.0  # 找到的位置上，渲染結果的墨跡量 ÷ 原圖的墨跡量
     overlap_with: Optional[str] = None  # 疊在一起的另一行（行編號）
     severity: float = 0.0  # 嚴重程度（0 到 1）
     chunks: list[Chunk] = field(default_factory=list)
@@ -201,18 +205,27 @@ def _containing_image(page: Optional[StyledPage], cx: float, cy: float, scale: f
 # ================================================================ 分段
 
 
+def _even(x0: float, x1: float, min_w: float) -> list[tuple[float, float]]:
+    n = max(1, int((x1 - x0) // min_w))
+    step = (x1 - x0) / n
+    return [(x0 + i * step, x0 + (i + 1) * step) for i in range(n)]
+
+
 def _chunks(line: TextLine, W: float, x0: float, x1: float, min_w: float) -> list[tuple[float, float]]:
-    """依每個字的位置把一行切成幾段（像素）。每段至少 min_w 寬，盡量在空白處切；量不到字的位置就整行一段。"""
+    """依每個字的位置把一行切成幾段（像素）。每段至少 min_w 寬，盡量在空白處切；量不到字的位置就平均切。"""
     starts: list[tuple[float, bool]] = []  # （字的起點 x，這個字前面可不可以切：前面是空白，或是中日韓字）
+    all_x = [cx for r in line.runs for cx in r.char_x]
+    base = min(all_x) if all_x else 0.0  # 字的位置是沿基線、從行首量起（與 pdf_target 讀法相同）
+    origin = line.baseline[0].x
     for r in line.runs:
         vis = [i for i, ch in enumerate(r.text) if ch.strip()]
         if len(vis) != len(r.char_x):
-            return [(x0, x1)]
+            return _even(x0, x1, min_w)
         for i, cx in zip(vis, r.char_x):
             breakable = (i > 0 and not r.text[i - 1].strip()) or (i == 0 and bool(starts)) or ord(r.text[i]) >= 0x2E80
-            starts.append((cx * W, breakable))
+            starts.append(((origin + cx - base) * W, breakable))
     if len(starts) < 2:
-        return [(x0, x1)]
+        return _even(x0, x1, min_w)
     starts.sort(key=lambda t: t[0])
     cuts = [x0]
     last = x0
@@ -267,21 +280,45 @@ def check_page(working: Image.Image, rendered: Image.Image, el: ElementList, lay
     return _summarize(results, scale_pt, p, where)
 
 
+def _best(score: np.ndarray, ox: np.ndarray, oy: np.ndarray, centers: list[tuple[float, float]], radius: tuple[float, float],
+          penalty: float) -> Optional[tuple[int, int]]:
+    """在相關係數圖上，只看離 centers 任一點不超過 radius（水平、垂直）的位置，取「相關係數 − 距離懲罰」最大的。
+    ox、oy 是每個位置對應的偏移（像素）。距離懲罰讓離預期位置遠的地方要更像才會被選上，減少誤認成隔壁的字。"""
+    rx, ry = max(radius[0], 1e-6), max(radius[1], 1e-6)
+    best_val, best_at = None, None
+    for cx, cy in centers:
+        nx = (ox - cx) / rx
+        ny = (oy - cy) / ry
+        inside = (np.abs(nx) <= 1.0) & (np.abs(ny) <= 1.0)
+        if not inside.any():
+            continue
+        val = np.where(inside, score - penalty * np.hypot(nx, ny), -np.inf)
+        iy, ix = np.unravel_index(int(np.argmax(val)), val.shape)
+        if best_val is None or val[iy, ix] > best_val:
+            best_val, best_at = float(val[iy, ix]), (int(iy), int(ix))
+    return best_at
+
+
 def _match_line(line: TextLine, res: LineResult, O: np.ndarray, R: np.ndarray, W: float, font_px: float, p: dict) -> None:
+    """一行的比對，分兩步：
+    1. 整行當一個樣板，在較大的範圍（水平約一個字高、垂直約四分之三個字高）找整行的位置。整行很長，不容易誤認成別行。
+    2. 每一段只在「原位置」與「整行找到的位置」附近的小範圍（約 0.4 個字高）找，量出行內各段各自的偏移；
+       小範圍裡找不到就算這一段不見了（例如換了字寬不同的字型、後半行跑到別處去）。"""
     Hr, Wr = R.shape[:2]
     x0, y0, x1, y1 = res.box_px
     h = max(y1 - y0, 1.0)
     unit = max(font_px, 0.6 * h)  # 字高（像素）：取③量的字級，量得太小時以框高補
     pad = max(1.0, 0.1 * h)
-    wx = max(4.0, 1.0 * unit)  # 搜尋範圍
+    wx = max(4.0, 1.0 * unit)  # 整行的搜尋範圍
     wy = max(3.0, 0.75 * unit)
+    local = (max(2.0, 0.4 * unit), max(2.0, 0.3 * unit))  # 每一段的搜尋範圍
     ty0, ty1 = int(math.floor(y0 - pad)), int(math.ceil(y1 + pad))
     if ty1 <= 0 or ty0 >= Hr or x1 <= 0 or x0 >= Wr:
         res.status, res.skip_reason = "skipped", "在頁面外"
         return
     ty0, ty1 = max(ty0, 0), min(ty1, Hr)
-    # 底色：以這一行連同搜尋範圍的區域估（兩張影像各自估）
-    ry0, ry1 = max(0, int(ty0 - wy)), min(Hr, int(ty1 + wy))
+    # 墨跡：以這一行連同搜尋範圍的區域估底色（兩張影像各自估）
+    ry0, ry1 = max(0, int(ty0 - wy)), min(Hr, int(math.ceil(ty1 + wy)))
     rx0, rx1 = max(0, int(x0 - wx)), min(Wr, int(math.ceil(x1 + wx)))
     ink_o = _ink(O[ry0:ry1, rx0:rx1])
     ink_r = _ink(R[ry0:ry1, rx0:rx1])
@@ -290,49 +327,63 @@ def _match_line(line: TextLine, res: LineResult, O: np.ndarray, R: np.ndarray, W
     blur_r = cv2.GaussianBlur(ink_r, (0, 0), sigma)
     rad = max(1, int(round(0.12 * unit)))
     dil_o = cv2.dilate(ink_o, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rad + 1, 2 * rad + 1)))
-    total_ink = float(ink_o[ty0 - ry0:ty1 - ry0, max(0, int(x0) - rx0):int(math.ceil(x1)) - rx0].sum())
-    if total_ink < p["line_min_ink_px"] * unit:
+    la, lb = max(int(math.floor(x0)), rx0), min(int(math.ceil(x1)), rx1)
+    total_ink = float(ink_o[ty0 - ry0:ty1 - ry0, la - rx0:lb - rx0].sum())
+    if total_ink < p["line_min_ink_px"] * unit or lb - la < 2:
         res.status, res.skip_reason = "skipped", "原圖上這一行幾乎沒有墨跡"
         return
-    min_w = max(3.0 * unit, 12.0)
-    horizontal = line.direction.value == "horizontal" and abs(line.baseline[1].y - line.baseline[0].y) * W <= max(2.0, 0.15 * h)
-    spans = _chunks(line, W, x0, x1, min_w) if horizontal else [(x0, x1)]
-    for cx0, cx1 in spans:
-        a, b = int(math.floor(cx0)), int(math.ceil(cx1))
-        a, b = max(a, rx0), min(b, rx1)
-        if b - a < 2:
-            continue
+
+    def search(a: int, b: int):
+        """樣板（原圖 a 到 b 欄）與它在渲染結果的搜尋區：回傳（樣板、原始墨跡、相關係數圖、偏移 x、偏移 y、搜尋區左上角）。"""
         T = blur_o[ty0 - ry0:ty1 - ry0, a - rx0:b - rx0]
         T_raw = ink_o[ty0 - ry0:ty1 - ry0, a - rx0:b - rx0]
-        ink = float(T_raw.sum())
-        ch = Chunk(x0=cx0, x1=cx1, ink=ink)
-        res.chunks.append(ch)
-        if ink < 0.5 * unit or float(T.std()) < 1e-4:
-            ch.ink = 0.0  # 這一段幾乎沒有墨跡（例如只有標點）：不判斷
-            continue
-        # 搜尋區（相對於 ink 區域的座標）
         sx0, sx1 = max(0, a - rx0 - int(wx)), min(ink_r.shape[1], b - rx0 + int(wx))
         sy0, sy1 = max(0, ty0 - ry0 - int(wy)), min(ink_r.shape[0], ty1 - ry0 + int(wy))
         S = blur_r[sy0:sy1, sx0:sx1]
-        if S.shape[0] < T.shape[0] or S.shape[1] < T.shape[1]:
-            continue
-        if float(S.max()) <= 1e-6:
-            continue  # 渲染結果這一帶完全沒有墨跡
-        score = cv2.matchTemplate(S, T, cv2.TM_CCOEFF_NORMED)
-        score = np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
-        # 偏好離原位置近的地方：相關係數相同時取距離最近的（扣一點點距離）
-        oy_idx = np.arange(score.shape[0])[:, None] + sy0 - (ty0 - ry0)
-        ox_idx = np.arange(score.shape[1])[None, :] + sx0 - (a - rx0)
-        score_d = score - 0.02 * np.hypot(ox_idx / max(wx, 1.0), oy_idx / max(wy, 1.0))
-        iy, ix = np.unravel_index(int(np.argmax(score_d)), score_d.shape)
+        if S.shape[0] < T.shape[0] or S.shape[1] < T.shape[1] or float(T.std()) < 1e-4 or float(S.max()) <= 1e-6:
+            return None
+        score = np.nan_to_num(cv2.matchTemplate(S, T, cv2.TM_CCOEFF_NORMED), nan=0.0, posinf=0.0, neginf=0.0)
+        oy = (np.arange(score.shape[0])[:, None] + sy0 - (ty0 - ry0)).astype(np.float32) * np.ones((1, score.shape[1]), np.float32)
+        ox = (np.arange(score.shape[1])[None, :] + sx0 - (a - rx0)).astype(np.float32) * np.ones((score.shape[0], 1), np.float32)
+        return T, T_raw, score, ox, oy, sx0, sy0
+
+    def measure(ch: Chunk, a: int, b: int, found_at, T, T_raw, score, ox, oy, sx0, sy0) -> None:
+        iy, ix = found_at
         ch.ncc = float(score[iy, ix])
-        ch.dx, ch.dy = float(ox_idx[0, ix]), float(oy_idx[iy, 0])
+        ch.dx, ch.dy = float(ox[iy, ix]), float(oy[iy, ix])
         py0, px0 = sy0 + iy, sx0 + ix
-        patch_raw = ink_r[py0:py0 + T.shape[0], px0:px0 + T.shape[1]]
-        ch.mass = float(patch_raw.sum()) / max(ink, 1e-6)
+        patch = ink_r[py0:py0 + T.shape[0], px0:px0 + T.shape[1]]
+        ch.mass = float(patch.sum()) / max(ch.ink, 1e-6)
         dil = dil_o[ty0 - ry0:ty1 - ry0, a - rx0:b - rx0]
-        ch.extra = float(np.clip(patch_raw - dil, 0.0, None).sum()) / max(ink, 1e-6)
+        ch.extra = float(np.clip(patch - dil, 0.0, None).sum()) / max(ch.ink, 1e-6)
         ch.found = ch.ncc >= p["line_ncc_min"] and ch.mass >= p["line_mass_min"]
+
+    # 1. 整行
+    centers = [(0.0, 0.0)]
+    whole = search(la, lb)
+    if whole is not None:
+        at = _best(whole[2], whole[3], whole[4], [(0.0, 0.0)], (wx, wy), 0.1)
+        if at is not None and whole[2][at] >= p["line_ncc_min"]:
+            centers.append((float(whole[3][at]), float(whole[4][at])))
+    # 2. 每一段
+    min_w = max(2.5 * unit, 12.0)
+    horizontal = line.direction.value == "horizontal" and abs(line.baseline[1].y - line.baseline[0].y) * W <= max(2.0, 0.15 * h)
+    spans = _chunks(line, W, x0, x1, min_w) if horizontal else [(x0, x1)]
+    for cx0, cx1 in spans:
+        a, b = max(int(math.floor(cx0)), rx0), min(int(math.ceil(cx1)), rx1)
+        if b - a < 2:
+            continue
+        ch = Chunk(x0=cx0, x1=cx1, ink=float(ink_o[ty0 - ry0:ty1 - ry0, a - rx0:b - rx0].sum()))
+        res.chunks.append(ch)
+        if ch.ink < 0.5 * unit:
+            ch.ink = 0.0  # 這一段幾乎沒有墨跡（例如只有標點）：不判斷
+            continue
+        found = search(a, b)
+        if found is None:
+            continue
+        at = _best(found[2], found[3], found[4], centers, local, 0.05)
+        if at is not None:
+            measure(ch, a, b, at, *found)
     judged = [c for c in res.chunks if c.ink > 0]
     total = sum(c.ink for c in judged)
     if total <= 0:
@@ -344,10 +395,10 @@ def _match_line(line: TextLine, res: LineResult, O: np.ndarray, R: np.ndarray, W
         fw = sum(c.ink for c in found)
         res.dx_pt = sum(c.dx * c.ink for c in found) / fw
         res.dy_pt = sum(c.dy * c.ink for c in found) / fw
-        big = [c for c in found if c.ink >= 0.15 * total] or found
-        res.offset_pt = max(math.hypot(c.dx, c.dy) for c in big)
+        res.offset_pt = max(math.hypot(c.dx, c.dy) for c in found)
         res.extra = sum(c.extra * c.ink for c in found) / fw
-    # 先以像素記，_summarize 再換成 pt
+        res.mass = sum(c.mass * c.ink for c in found) / fw
+    # 偏移先以像素記，_summarize 再換成 pt
 
 
 def _overlaps(results: list[LineResult], p: dict) -> None:
@@ -389,15 +440,23 @@ def _clip(text: str, n: int = 24) -> str:
     return text if len(text) <= n else text[:n] + "…"
 
 
+def _offset_severity(d: float, tol: float, font_pt: float) -> float:
+    """偏移 d（pt）的嚴重程度：在容許差內是 0；剛超過是 0.15，再多偏一個字高就到上限 0.35。
+    偏移的行字還在、讀得懂，只是位置不對，所以比「找不到」（1）與「疊在一起」（0.6）輕得多。"""
+    if d <= tol:
+        return 0.0
+    return min(_OFFSET_SEVERITY[1], _OFFSET_SEVERITY[0] + (_OFFSET_SEVERITY[1] - _OFFSET_SEVERITY[0]) * (d - tol) / max(font_pt, 1e-6))
+
+
 def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str) -> PageLines:
     by_id = {r.line_id: r for r in results}
     checked = [r for r in results if r.status != "skipped"]
     n = len(checked)
-    share = max(1.0 / n, float(p["line_min_share"])) if n else 0.0
     issues: list[Issue] = []
     counts = {"missing": 0, "partial": 0, "overlap": 0, "offset": 0}
     prefix = f"{where}：" if where else ""
-    deduct = 0.0
+    total_sev = 0.0  # 各行嚴重程度的總和
+    content_sev = 0.0  # 其中「找不到、一部分找不到、疊在一起」的總和
     for r in checked:
         r.offset_pt *= scale_pt
         r.dx_pt *= scale_pt
@@ -412,21 +471,32 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str) 
         if r.found >= p["line_found_min"]:
             other = by_id.get(r.overlap_with) if r.overlap_with else None
             if other is not None:
-                cands.append((_SEVERITY_OVERLAP, "overlap", Severity.ERROR, "line_overlap", f"{prefix}這一行和{('「' + _clip(other.text) + '」') if other else '別的行'}疊在一起：{quote}。"))
-            elif r.extra > p["line_extra_max"]:
-                cands.append((_SEVERITY_OVERLAP, "overlap", Severity.ERROR, "line_overlap",
-                              f"{prefix}這一行的位置上多畫了原圖沒有的東西（多出約 {r.extra:.0%} 的墨跡），多半是和別的行疊在一起：{quote}。"))
-            if r.offset_pt > tol:
-                sev = 0.25 + 0.35 * min(1.0, (r.offset_pt - tol) / max(r.font_pt, 1e-6))
+                cands.append((_OVERLAP_SEVERITY, "overlap", Severity.ERROR, "line_overlap", f"{prefix}這一行和「{_clip(other.text)}」疊在一起：{quote}。"))
+            elif r.extra >= p["line_extra_max"] and r.mass >= p["line_overlap_mass"]:
+                cands.append((_OVERLAP_SEVERITY, "overlap", Severity.ERROR, "line_overlap",
+                              f"{prefix}這一行上面多畫了原圖沒有的字（墨跡是原圖的 {r.mass:.1f} 倍），多半是別的行疊了上來：{quote}。"))
+            sev = _offset_severity(r.offset_pt, tol, r.font_pt)  # 看偏最多的那一段：一行裡只要有一段明顯錯開，看起來就是錯的
+            if sev > 0:
                 cands.append((sev, "offset", Severity.WARNING, "line_offset", f"{prefix}這一行的位置與原圖相差 {r.offset_pt:.1f} pt（容許 {tol:.1f} pt）：{quote}。"))
         if not cands:
             continue
         worst = max(cands, key=lambda c: c[0])
         r.status, r.severity = worst[1], worst[0]
-        deduct += worst[0] * share
+        total_sev += worst[0]
+        if worst[1] != "offset":
+            content_sev += worst[0]
         for sev, status, level, code, msg in cands:
             counts[status] += 1
             issues.append(Issue(severity=level, code=code, element_id=r.element_id, message=msg))
-    score = max(0.0, 1.0 - deduct) if n else None
+    score = line_score(total_sev, content_sev, n, p)
     return PageLines(lines=results, score=score, checked=n, missing=counts["missing"], partial=counts["partial"],
                      overlap=counts["overlap"], offset=counts["offset"], issues=issues)
+
+
+def line_score(total_sev: float, content_sev: float, n: int, p: Optional[dict] = None) -> Optional[float]:
+    """逐行分數 = 1 − 各行嚴重程度的平均 − min(上限, 每個問題的最低扣分 × 內容問題的嚴重程度總和)。見模組開頭。"""
+    if n <= 0:
+        return None
+    p = dict(DEFAULTS) if p is None else {**DEFAULTS, **p}
+    deduct = total_sev / n + min(float(p["line_problem_cap"]), float(p["line_problem_floor"]) * content_sev)
+    return max(0.0, 1.0 - deduct)

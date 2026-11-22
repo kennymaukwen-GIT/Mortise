@@ -388,7 +388,12 @@ def test_fixture_elements_have_ids_in_z_order(job):
         for kind, item in svg.page_items(page):
             assert kinds[item.id] == kind
         assert {g.get("id") for g in top if g.get("data-master")} == {i for i in want if i in members}
-        assert (page.background_color is not None) == any(g.get("data-kind") == "background" for g in top)
+        # 頁面底色一定畫在最底層（⑤沒有底色就是白色），深色模式的看圖軟體才不會變成黑底
+        assert top[0].get("data-kind") == "background" and top[0].get("id") == f"p{page.page_index + 1:03d}-background"
+        bg = top[0][0]
+        assert bg.tag == Q + "rect" and (bg.get("x"), bg.get("y"), bg.get("width"), bg.get("height")) == ("0", "0", svg.num(page.width_pt), svg.num(page.height_pt))
+        want_fill = svg.hex_color(page.background_color) if page.background_color is not None else "#ffffff"
+        assert bg.get("fill") == want_fill
         assert all(t.get("{http://www.w3.org/XML/1998/namespace}space") == "preserve" for t in root.iter(Q + "text"))
         assert not [t for t in root.iter(Q + "text") if t.get("text-anchor")]
 
@@ -711,6 +716,59 @@ def test_svg_assets_without_vectors(doc, store):
         assert z.namelist() == ["README.txt", "manifest.json"]
         assert "沒有可以輸出的向量圖" in z.read("README.txt").decode("utf-8")
         assert json.loads(z.read("manifest.json"))["items"] == []
+
+
+# ---------------------------------------------------------------- 頁面底色
+
+
+def _alpha_render(text: str, width_px: int) -> Image.Image:
+    """不加底色（透明）地畫 SVG，看哪裡真的是透明的：深色模式的看圖軟體畫出來就是這樣，透明處會變成黑底。"""
+    rs, _ = svg_target.engine()
+    book = svg_target.font_book()
+    png = rs.svg_to_bytes(svg_string=text, width=int(width_px), dpi=96.0, skip_system_fonts=True, font_files=book.files)
+    return Image.open(io.BytesIO(png)).convert("RGBA")
+
+
+def test_page_background(doc, store, out):
+    """⑤的頁面底色是白色時 background_color 是 None（代表白）。整頁 SVG 仍要在最底層畫一個與頁面同大小的白色矩形，
+    放在 data-kind="background" 的群組裡；svg_page_background = "none" 才保持透明。單獨的向量圖一律透明。"""
+    assert doc.pages[1].background_color is None and doc.pages[0].background_color is not None
+    pages, _ = svg.unpack(out, store)
+    root = svg.parse(pages[1])
+    top = [g for g in root if g.tag == Q + "g"]
+    assert [g.get("id") for g in top] == ["p002-background", "p002-vec-mark", "p002-box-title"]  # 底色在最底層，其他元素照舊
+    bg = top[0]
+    assert bg.get("data-kind") == "background" and bg.get(INK + "label") == "背景" and len(bg) == 1
+    rect = bg[0]
+    assert rect.tag == Q + "rect" and (rect.get("x"), rect.get("y"), rect.get("width"), rect.get("height"), rect.get("fill")) == ("0", "0", "600", "400", "#ffffff")
+    im = _alpha_render(pages[1].decode("utf-8"), 600)
+    assert im.getpixel((5, 5)) == (255, 255, 255, 255) and im.getpixel((595, 395)) == (255, 255, 255, 255)  # 四角不透明、是白色
+    assert min(np.asarray(im)[..., 3].ravel()) == 255  # 整頁沒有任何透明的地方
+    # 有底色的頁面照舊畫⑤的底色
+    first = svg.parse(pages[0])
+    assert first.find(Q + "g").get("data-kind") == "background" and first.find(Q + "g")[0].get("fill") == "#faf8f0"
+
+    # svg_page_background = "none"：白色頁面不畫底色（透明），有底色的頁面照畫
+    o = svg.export(doc, "clear", cfg_with({"svg_page_background": "none"}), store)
+    assert o.selfcheck_ok, o.selfcheck_notes
+    clear, _ = svg.unpack(o, store)
+    r2 = svg.parse(clear[1])
+    assert not [g for g in r2.iter(Q + "g") if g.get("data-kind") == "background"]
+    assert _alpha_render(clear[1].decode("utf-8"), 600).getpixel((5, 5))[3] == 0
+    assert svg.parse(clear[0]).find(Q + "g")[0].get("fill") == "#faf8f0"
+    with pytest.raises(ValueError, match="svg_page_background"):
+        svg.export(doc, "bad", cfg_with({"svg_page_background": "white"}), store)
+
+    # 單獨的向量圖（svg_assets 也用它）沒有底色：圖形外框的角落是透明的
+    mark = svg.vector_svg(doc.pages[0].vectors[1], Config.load())
+    mroot = svg.parse(mark.encode("utf-8"))
+    assert not [g for g in mroot.iter(Q + "g") if g.get("data-kind") == "background"]
+    assert _alpha_render(mark, 200).getpixel((1, 1))[3] == 0
+    a = svg_assets.export(doc, "assets", Config.load(), store)
+    with zipfile.ZipFile(store.blob_path(a.file)) as z:
+        for name in z.namelist():
+            if name.endswith(".svg"):
+                assert b'data-kind="background"' not in z.read(name)
 
 
 # ---------------------------------------------------------------- 寫出後的安全檢查

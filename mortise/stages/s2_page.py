@@ -4,7 +4,7 @@
   s2.box        原生 PDF：選頁框（裁切框與媒體框的交集）、套用旋轉
   s2.corners    照片：四邊擬合找頁面四角（找不到就以整張圖為頁面，使用者可以手動拉四角）；截圖與掃描以整張圖為頁面
   s2.rectify    透視攤平，建立頁面座標系（頁寬為 1）
-  s2.enhance    去陰影、白平衡，產生工作影像（量顏色時用未增強的影像 color_image）
+  s2.enhance    去陰影、白平衡，產生工作影像（只對照片模式、像白紙、又不是平塗數位畫面的頁面做；未增強的影像另存 color_image）
   s2.size       尺寸判斷：使用者輸入永遠優先，其次檔案內建，都沒有才依長寬比推論候選規格
   s2.working    產生工作影像，計算有效解析度
 """
@@ -24,7 +24,7 @@ from ..tools import pdfium as pdf
 from ..tools.units import to_pt
 
 NAME = "s2"
-VERSION = "2"
+VERSION = "3"
 
 
 def _png(im: Image.Image) -> bytes:
@@ -209,11 +209,15 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             notes += list(getattr(quad, "notes", []))
             notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
         color = Image.fromarray(np.ascontiguousarray(image_arr))
+        work = color
         if kind in (InputType.PHOTO, InputType.SCANNED_PDF) and c.get("enhance_photos", True) and _paper_like(image_arr, c):
-            work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
-            notes.append("頁面像一般紙張，已去陰影與白平衡後再辨識（量顏色仍用原圖）。")
-        else:
-            work = color
+            digital = _digital_content(image_arr, c)
+            if digital is not None:
+                # 照片模式但畫面是平塗的數位內容（例如帶相機資訊的截圖、乾淨的掃描）：沒有光照不均可修，做了只會改掉原本的顏色
+                notes.append(f"頁面是平塗的數位畫面（{digital}），不做去陰影與白平衡，顏色照原圖。")
+            else:
+                work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
+                notes.append("頁面像一般紙張，已去陰影與白平衡後再辨識；工作影像的顏色因此與原圖不同，未增強的原圖另外保留（color_image）。")
         _ASPECT_ERR[id(work)] = aspect_err
         return work, color, matrix, corners_l, aspect, method, conf, notes
     except Exception as e:  # 幾何處理失敗不中斷：退回整張圖
@@ -232,6 +236,23 @@ def _paper_like(arr, c: dict) -> bool:
     share = counts.max() / counts.sum()
     chroma = int(dominant.max() - dominant.min())
     return share >= c.get("paper_min_share", 0.25) and dominant.mean() >= c.get("paper_min_brightness", 150) and chroma <= c.get("paper_max_chroma", 40)
+
+
+def _digital_content(arr, c: dict) -> Optional[str]:
+    """攤平後的頁面是不是平塗的數位畫面：有成片完全同色的區域（9×9 鄰域三個通道完全相同）。
+    相機拍的影像到處都有感光雜訊與光照漸變，攤平時又重新取樣，不會有這種區域；截圖、軟體匯出的頁面、乾淨的掃描才有。
+    是就回傳白話的量測值，否則回傳 None。①已依內容判斷類型（s1_input.classify_image），這裡是第二道防線：
+    ①判成照片（例如檔案帶有相機資訊）而畫面其實是數位內容時，不要做白平衡與去光照而改掉原本的顏色。"""
+    import numpy as np
+
+    from .s1_input import _flat_map
+
+    step = max(1, int(np.ceil(np.sqrt(arr.shape[0] * arr.shape[1] / 16e6))))
+    sub = np.ascontiguousarray(arr[::step, ::step, :3])
+    big = float(_flat_map(sub, int(c.get("enhance_flat_window", 9))).mean())
+    if big >= float(c.get("enhance_max_flat", 0.25)):
+        return f"成片完全同色的像素佔 {big:.0%}"
+    return None
 
 
 def _aspect_from_corners(corners) -> float:

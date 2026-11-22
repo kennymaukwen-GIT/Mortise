@@ -35,7 +35,7 @@ import statistics
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from PIL import Image
 
@@ -488,7 +488,9 @@ def verify_page(data: bytes, page, intended: list[svgx.Line], book: FontBook, p:
     return FormatPageReport(page_index=page.page_index, text_match_ratio=ratio, position_error_pt=worst, issues=issues), root, read, want_lines
 
 
-def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc, cfg: Config, store: Store) -> FormatReport:
+def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc, cfg: Config, store: Store,
+           on_render: Optional[Callable[[int, Image.Image], None]] = None) -> FormatReport:
+    """on_render：每畫好一頁就以（頁碼, 裁成與工作影像同一範圍的渲染結果）呼叫一次（⑦用它做逐行文字對照）。"""
     p = _params(cfg)
     notes: list[str] = []
     pages_svg, others = svgx.unpack(output, store)
@@ -532,7 +534,10 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
                 renders.append((image, page.width_pt, page.height_pt))
                 if spec is not None:
                     working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-                    sim = similarity(working, content_region(image, page))  # 有輸出尺寸時只比原始內容那一塊（留白不算）
+                    region = content_region(image, page)
+                    sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊（留白不算）
+                    if on_render is not None:
+                        on_render(i, region)
                     if sim < p["svg_similarity_pass"]:
                         issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"SVG 渲染後與原圖的相似度 {sim:.3f}，低於合格線 {p['svg_similarity_pass']}。"))
             except Exception as e:  # 渲染失敗：這一頁退回只做結構檢查

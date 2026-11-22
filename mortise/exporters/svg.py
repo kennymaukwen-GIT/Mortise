@@ -24,6 +24,9 @@ lxml（BSD-3-Clause，寫出後重新解析做自檢）。排版（斷行、行�
       Illustrator 不會把群組變成圖層，無解。svg_layers = "none" 可以不寫。
     - 母片：成品文件的每一頁都還留著母片取代的那些元素，SVG 沒有母片，所以每頁照畫自己的元素、不另外畫母片
       （不會重複），這些群組帶 data-master 標明屬於哪個母片。
+    - 頁面底色：最底層的 data-kind="background" 群組裡畫一個與頁面同大小的 rect。⑤的頁面底色是白色時 background_color 是 None，
+      這時也畫白色（svg_page_background = "auto"，預設）：SVG 不畫底色就是透明，深色模式的看圖軟體會變成黑底、字看不見。
+      svg_page_background = "none" 時只有⑤指定了底色才畫。單獨的向量圖（svg_assets）一律透明，不畫底色。
 
   文字（svg_text = "text"，預設）
     - 一行一個 text，x、y 是這一行的起點與基線，由自家排版算定；不寫 text-anchor、不依賴任何軟體的自動換行。
@@ -121,6 +124,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "outline_slant_deg": 12.0,  # 文字轉外框而字型沒有斜體檔時，字形傾斜的角度
     "miter_limit": 10.0,  # 尖角接合的 stroke-miterlimit（PDF 的預設值）
     "canva_limit_bytes": 3_000_000,  # 單一 SVG 超過這個大小時在自檢紀錄提醒（Canva 的上傳上限，搜尋摘要，未實測）
+    "page_background": "auto",  # "auto"：整頁最底層一定畫頁面底色（⑤沒有底色就是白色）；"none"：只有⑤指定了底色才畫，其餘保持透明
 }
 
 MIME = "image/svg+xml"
@@ -160,6 +164,8 @@ def params_for(cfg: Optional[Config]) -> tuple[dict, dict]:
         raise ValueError(f"svg_size_unit 只能是 \"pt\" 或 \"none\"，現在是 {p['size_unit']!r}。")
     if p["images"] not in ("embed", "external"):
         raise ValueError(f"svg_images 只能是 \"embed\" 或 \"external\"，現在是 {p['images']!r}。")
+    if p["page_background"] not in ("auto", "none"):
+        raise ValueError(f"svg_page_background 只能是 \"auto\" 或 \"none\"，現在是 {p['page_background']!r}。")
     p["precision"] = max(0, min(6, int(p["precision"])))
     return p, lp
 
@@ -1048,6 +1054,15 @@ class _Exporter:
             w.end("g")
 
     # ---------- 整頁
+    def page_fill(self, page: StyledPage) -> Optional[Color]:
+        """頁面底色矩形要填的顏色；None 表示不畫底色矩形。
+        ⑤在頁面底色是白色時把 background_color 設成 None（代表白）。SVG 沒有「紙張」：不畫底色就是透明，
+        在深色模式的看圖軟體或預覽裡會變成黑底、深色的字看不見。所以 svg_page_background = "auto"（預設）時一律畫，
+        沒有底色就畫白色；"none" 時只有⑤指定了底色才畫，其餘保持透明（例如要疊在別的底上）。"""
+        if page.background_color is not None:
+            return page.background_color
+        return Color(r=255, g=255, b=255) if self.p["page_background"] == "auto" else None
+
     def page(self, page: StyledPage, title: str) -> tuple[str, list[str]]:
         """把一頁寫成 SVG。回傳（SVG 內容, 這一頁畫出的文字，依文件順序）。"""
         d = self.d
@@ -1056,10 +1071,11 @@ class _Exporter:
         w = _Writer(1)
         drawn: list[str] = []
         n = page.page_index + 1
-        if page.background_color is not None or page.background_image is not None:
+        fill = self.page_fill(page)
+        if fill is not None or page.background_image is not None:
             self._group(w, ids, f"p{n:03d}-background", "background", _KIND_LABEL["background"])
-            if page.background_color is not None:
-                w.empty("rect", [("x", "0"), ("y", "0"), ("width", num(page.width_pt, d)), ("height", num(page.height_pt, d))] + fill_attrs(page.background_color))
+            if fill is not None:
+                w.empty("rect", [("x", "0"), ("y", "0"), ("width", num(page.width_pt, d)), ("height", num(page.height_pt, d))] + fill_attrs(fill))
             if page.background_image is not None:
                 self._image(w, page.background_image, Box(x=0, y=0, w=page.width_pt, h=page.height_pt), f"background-{n}")
                 self.deg.append(Degradation(element_id=f"background-{n}", concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))

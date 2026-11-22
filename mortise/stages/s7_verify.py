@@ -16,16 +16,39 @@
   - 「成品文件對輸出檔」的比對（讀回的文字與成品文件排版的位置）不受影響：兩邊都是輸出頁面的座標。
   - 「輸出檔對來源」的比對（與③來源文字行的位置差）先用 placement 把來源座標換到輸出頁面（source_frame）。
 
-整體分數（overall_score）是各頁分數的平均。每一頁的分數依下面的順序取第一個算得出來的：
-  1. 有 PowerPoint 的目標驗證：0.5 × 目標渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、位置在容許差內」的比例。
-  2. 沒有 PowerPoint 的目標驗證、但有其他格式的回讀驗證（例如可編輯 PDF、SVG）：
-     每個格式在這一頁的分數 = 0.5 × 回讀渲染的相似度 ＋ 0.5 × 文字一致率（兩者缺一個就只用另一個），
-     這一頁的分數是各格式分數的平均。
-  3. 都沒有：7A 中性渲染的相似度。
+整體分數（overall_score）是各頁分數的平均。每一頁的分數 = 畫面分數 × 逐行分數。
+
+  畫面分數：依下面的順序取第一個算得出來的。
+    1. 有 PowerPoint 的目標驗證：0.5 × 目標渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、位置在容許差內」的比例。
+    2. 沒有 PowerPoint 的目標驗證、但有其他格式的回讀驗證（例如可編輯 PDF、SVG）：
+       每個格式 0.5 × 回讀渲染的相似度 ＋ 0.5 × 文字一致率（兩者缺一個就只用另一個）。
+    3. 都沒有：7A 中性渲染的相似度。
+  逐行分數（mortise/verify/lines.py）：拿上面同一份渲染結果（PowerPoint 是 LibreOffice 的渲染，其他格式是各自的回讀渲染，
+    都沒有時是 7A 的中性渲染），逐行檢查③讀到的每一行字在成品上找不找得到、有沒有錯位、有沒有和別的行疊在一起。
+    有第 2 種回讀驗證時，每個格式各自相乘（畫面分數 × 自己的逐行分數），這一頁的分數是各格式的平均。
+    沒有任何可判斷的行（例如整頁都是圖）時，逐行分數不算，只看畫面分數。
+
+  為什麼這樣組合
+    - 畫面相似度是把整頁縮到約 480 像素寬再比，看得出整頁的樣子（底色、圖片、大區塊的位置），卻幾乎看不出少了幾行小字、
+      或一行字錯開幾 pt：A4 履歷左欄十幾行字不見、右欄幾行疊在一起，相似度仍有 0.95。逐行分數補的就是這一塊。
+    - 兩者相乘而不是相加：任何一邊有問題都要把分數往下拉，不能被另一邊的高分抵銷；兩邊都完美時（例如原生 PDF
+      輸出成可編輯 PDF）仍是 1.0 附近。
+    - 逐行分數 = 1 − 各行嚴重程度的平均 − min(10%, 2% × 內容問題的嚴重程度總和)。
+        每一行算一份：5 行的投影片少一行扣 20%，80 行的 A4 少一行扣 1.25%。
+        但長文件少一行也必須看得出來，所以「找不到、疊在一起」這類內容問題每個再多扣 2%（最多多扣 10%：
+        問題很多時第一項已經反映嚴重程度，不必再加重）。
+        嚴重程度：找不到 1（內容不見了，最嚴重）；疊在一起 0.6（字還在，但讀不清楚）；一部分找不到 = 不見的比例；
+        位置偏移 0.15 到 0.35（字在、讀得懂，只是位置不對；偏得越多越重）。
+      例：80 行的履歷有 20 行找不到、3 行疊在一起 → 逐行分數約 1 − (20 + 1.8) ÷ 80 − 10% ≈ 0.63，
+          畫面相似度 0.95 的整體分數就是 0.60，而不是 0.95。
+    - 每一行找不到、疊在一起、錯位，都開成一條問題（代碼 line_missing、line_partial、line_overlap、line_offset），
+      element_id 指到那一行所屬的文字框或表格，網頁的 Overlay 依它畫紅框。PowerPoint 與中性渲染的問題放在各頁的 issues；
+      其他格式的放在該格式的 format_reports。
 """
 
 from __future__ import annotations
 
+import inspect
 import math
 import re
 import sys
@@ -43,10 +66,15 @@ from ..config import Config
 from ..pipeline.store import Store
 from ..tools import libreoffice
 from ..tools import pdfium as pdf
+from ..verify import lines as line_check
 from . import s2_page, s3_recognize
 
 NAME = "s7"
-VERSION = "4"
+VERSION = "5"
+
+# 逐行文字對照的問題說明前面加的渲染來源
+_WHERE = {OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.PPTX: "PowerPoint 經 LibreOffice 渲染"}
+_NEUTRAL_WHERE = "成品自行渲染"
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -113,16 +141,20 @@ def run(
 ) -> FidelityReport:
     c = cfg.section("verify")
     notes: list[str] = []
+    lines_on = bool(line_check.params(cfg)["line_check"])
+    checker = _LineChecker(specs, elements, layout, styled, cfg, store, notes) if lines_on else None
     pages = [_field_report(spec, el, layout, styled) for spec, el in zip(specs, elements)]
     neutral_engine = None
+    neutral_lines: dict[int, line_check.PageLines] = {}
     if c.get("neutral", True):
         try:
-            pages, neutral_engine = _neutral_verify(specs, elements, layout, styled, pages, cfg, store)
+            pages, neutral_engine, neutral_lines = _neutral_verify(specs, elements, layout, styled, pages, cfg, store, checker)
         except Exception as e:  # 中性渲染失敗不影響其他驗證
             notes.append(f"7A 中性驗證沒有執行：{type(e).__name__}: {e}")
     target_engine = None
     target_render = None
     proposals: list[Correction] = []
+    target_lines: dict[int, line_check.PageLines] = {}
 
     pptx = next((o for o in outputs if o.format == OutputFormat.PPTX), None)
     if pptx is not None and libreoffice.available():
@@ -130,7 +162,7 @@ def run(
             rendered = libreoffice.to_pdf(store.blob_path(pptx.file), c["libreoffice_timeout_s"])
             target_render = store.put_blob(rendered, "application/pdf", "pdf")
             target_engine = f"{libreoffice.version()}（替身引擎，不是 PowerPoint；斷行與字距可能與 PowerPoint 不同）"
-            pages, proposals = _target_verify(rendered, specs, elements, layout, styled, pages, cfg, store, round_no)
+            pages, proposals, target_lines = _target_verify(rendered, specs, elements, layout, styled, pages, cfg, store, round_no, checker)
         except libreoffice.RenderError as e:
             notes.append(f"7B 目標驗證沒有執行：{e}")
     elif pptx is not None:
@@ -140,15 +172,26 @@ def run(
     from .. import verify as targets
 
     format_reports = []
+    format_lines: dict[tuple[OutputFormat, int], line_check.PageLines] = {}
     for o in outputs:
         fn = targets.verifier(o.format)
         if fn is None:
             continue
+        kwargs = {}
+        if checker is not None and "on_render" in inspect.signature(fn).parameters:
+            # 驗證模組每畫好一頁就交給逐行文字對照（只保留比對結果，不必把每一頁的影像都留在記憶體裡）
+            def on_render(page_index: int, image: Image.Image, _fmt: OutputFormat = o.format) -> None:
+                found = checker.check(page_index, image, _WHERE.get(_fmt, _fmt.value))
+                if found is not None:
+                    format_lines[(_fmt, page_index)] = found
+
+            kwargs["on_render"] = on_render
         try:
-            format_reports.append(fn(o, specs, elements, layout, styled, cfg, store))
+            fr = fn(o, specs, elements, layout, styled, cfg, store, **kwargs)
         except Exception as e:  # 單一格式的驗證失敗不影響其他驗證
             notes.append(f"{o.format.value} 的目標驗證沒有執行：{type(e).__name__}: {e}")
             continue
+        format_reports.append(_with_lines(fr, format_lines))
         # 驗證模組可以另外提供 propose：回傳要送給⑥該格式輸出器的修正單（欄位名稱以「格式.」開頭）。
         # 與 PowerPoint 的修正單一樣只影響那個格式的輸出，不改成品文件；要不要保留由執行器看整體分數有沒有進步。
         propose = getattr(sys.modules.get(fn.__module__), "propose", None)
@@ -164,18 +207,33 @@ def run(
             for status in e.fields.values():
                 counts[status.value] = counts.get(status.value, 0) + 1
     scores = []
+    scored_pages = []
     for p in pages:
         if p.target_similarity is None:
-            readback = _readback_score(format_reports, p.page_index)
+            readback = _readback_score(format_reports, p.page_index, format_lines)
             if readback is not None:
                 scores.append(readback)
+                for fr in format_reports:
+                    found = format_lines.get((fr.format, p.page_index))
+                    if found is not None:
+                        notes.append(f"第 {p.page_index + 1} 頁（{_WHERE.get(fr.format, fr.format.value)}）{found.summary()}")
             elif p.neutral_similarity is not None:
-                scores.append(p.neutral_similarity)
+                found = neutral_lines.get(p.page_index)
+                scores.append(p.neutral_similarity * _line_factor(found))
+                if found is not None:  # 中性渲染就是評分的依據：它的逐行問題列進這一頁
+                    p = p.model_copy(update={"issues": p.issues + found.issues})
+                    notes.append(f"第 {p.page_index + 1} 頁（{_NEUTRAL_WHERE}）{found.summary()}")
+            scored_pages.append(p)
             continue
         boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
         good = [e for e in boxes if e.text_match and e.linebreak_match and (e.position_error_pt or 0.0) <= c["position_tolerance_pt"]]
         text_score = len(good) / len(boxes) if boxes else 1.0
-        scores.append(0.5 * p.target_similarity + 0.5 * text_score)
+        found = target_lines.get(p.page_index)
+        scores.append((0.5 * p.target_similarity + 0.5 * text_score) * _line_factor(found))
+        if found is not None:
+            notes.append(f"第 {p.page_index + 1} 頁（{_WHERE[OutputFormat.PPTX]}）{found.summary()}")
+        scored_pages.append(p)
+    pages = scored_pages
     for o in outputs:
         for d in o.degradations:
             notes.append(f"{o.format.value}：{d.concept} → {d.action}")
@@ -187,9 +245,15 @@ def run(
     )
 
 
-def _readback_score(format_reports, page_index: int):
+def _line_factor(found) -> float:
+    """逐行分數；沒有做逐行比對、或這一頁沒有可判斷的行時是 1（只看畫面分數）。"""
+    return found.score if found is not None and found.score is not None else 1.0
+
+
+def _readback_score(format_reports, page_index: int, format_lines=None):
     """沒有 PowerPoint 目標驗證時，這一頁的分數取自各格式的回讀驗證：
-    每個格式 0.5 × 相似度 ＋ 0.5 × 文字一致率（缺一個就只用另一個），再對各格式取平均。沒有任何格式驗到這一頁就回傳 None。"""
+    每個格式（0.5 × 相似度 ＋ 0.5 × 文字一致率，缺一個就只用另一個）× 這個格式的逐行分數，再對各格式取平均。
+    沒有任何格式驗到這一頁就回傳 None。"""
     per_format = []
     for fr in format_reports:
         for fp in fr.pages:
@@ -197,8 +261,50 @@ def _readback_score(format_reports, page_index: int):
                 continue
             parts = [v for v in (fp.similarity, fp.text_match_ratio) if v is not None]
             if parts:
-                per_format.append(sum(parts) / len(parts))
+                per_format.append(sum(parts) / len(parts) * _line_factor((format_lines or {}).get((fr.format, page_index))))
     return (sum(per_format) / len(per_format)) if per_format else None
+
+
+# ---------- s7.lines（逐行文字對照）----------
+
+
+class _LineChecker:
+    """把某一份渲染結果（已裁成與工作影像同一個範圍）交給 verify/lines.py 逐行比對。比對失敗只記在 notes，不影響其他驗證。"""
+
+    def __init__(self, specs, elements, layout, styled, cfg: Config, store: Store, notes: list[str]):
+        self.specs = {s.page_index: s for s in specs}
+        self.elements = {e.page_index: e for e in elements}
+        self.layout = {pl.page_index: pl for pl in layout.pages}
+        self.styled = {sp.page_index: sp for sp in styled.pages}
+        self.p = line_check.params(cfg)
+        self.store = store
+        self.notes = notes
+
+    def check(self, page_index: int, rendered: Image.Image, where: str):
+        spec, el, sp = self.specs.get(page_index), self.elements.get(page_index), self.styled.get(page_index)
+        if spec is None or el is None or sp is None:
+            return None
+        try:
+            working = Image.open(self.store.blob_path(spec.working_image))
+            return line_check.check_page(working, rendered, el, self.layout.get(page_index), sp, source_frame(sp), self.p, where)
+        except Exception as e:  # 逐行比對失敗：這一頁只看畫面分數
+            self.notes.append(f"第 {page_index + 1} 頁（{where}）的逐行文字對照沒有執行：{type(e).__name__}: {e}")
+            return None
+
+
+def _with_lines(fr, format_lines):
+    """把某個格式的逐行比對問題併進它的 FormatReport（各頁的 issues）；有找不到或疊在一起的行，這個格式就不算通過。"""
+    pages = []
+    bad = False
+    for fp in fr.pages:
+        found = format_lines.get((fr.format, fp.page_index))
+        if found is None:
+            pages.append(fp)
+            continue
+        bad = bad or any(i.severity == Severity.ERROR for i in found.issues)
+        pages.append(fp.model_copy(update={"issues": fp.issues + found.issues}))
+    notes = list(fr.notes) + [f"第 {pg + 1} 頁{found.summary()}" for (fmt, pg), found in sorted(format_lines.items(), key=lambda kv: kv[0][1]) if fmt == fr.format]
+    return fr.model_copy(update={"pages": pages, "notes": notes, "ok": fr.ok and not bad})
 
 
 # ---------- s7.fields ----------
@@ -274,10 +380,11 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
 # ---------- s7.neutral（7A）----------
 
 
-def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store):
+def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store, checker=None):
     """7A 中性驗證：用自家確定性的渲染（給 Illustrator 的 PDF 輸出器，ReportLab 加開放字型）把成品文件畫出來，
     與工作影像比對。它不依賴任何辦公軟體，所以檢查的是③④⑤的結果本身：位置、字級、字型寬度、斷行。
-    不能檢查目標軟體的重新斷行（那是 7B 的工作）。"""
+    不能檢查目標軟體的重新斷行（那是 7B 的工作）。
+    有 checker 時也做逐行文字對照，結果另外回傳（只有在沒有其他渲染可以評分時，run 才把它的問題列進報告）。"""
     from . import s6_export
     from ..artifacts import OutputFormat
 
@@ -285,6 +392,7 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
     out = s6_export.run(styled, OutputFormat.AI_PDF, "neutral", cfg, store)
     engine = "Mortise 中性渲染（ReportLab，開放授權字型）"
     new_pages = []
+    found_lines: dict[int, line_check.PageLines] = {}
     pdoc = pdf.open_document(str(store.blob_path(out.file)))
     try:
         for spec, report in zip(specs, pages):
@@ -298,24 +406,30 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
             finally:
                 reader.close()
             working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-            sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊
+            region = content_region(image, sp)
+            sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
+            if checker is not None:
+                found = checker.check(spec.page_index, region, _NEUTRAL_WHERE)
+                if found is not None:
+                    found_lines[spec.page_index] = found
             issues = list(report.issues)
             if sim < c.get("neutral_similarity_pass", 0.95):
                 issues.append(Issue(severity=Severity.WARNING, code="neutral_low_similarity", message=f"中性渲染與原圖的相似度 {sim:.3f} 偏低：辨識、結構或設定可能有誤。"))
             new_pages.append(report.model_copy(update={"neutral_similarity": sim, "issues": issues}))
     finally:
         pdoc.close()
-    return new_pages, engine
+    return new_pages, engine, found_lines
 
 
 # ---------- s7.target、s7.compare、s7.propose ----------
 
 
-def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, cfg: Config, store: Store, round_no: int):
+def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, cfg: Config, store: Store, round_no: int, checker=None):
     c = cfg.section("verify")
     rc = cfg.section("recognize")
     proposals: list[Correction] = []
     out_pages: list[PageReport] = []
+    found_lines: dict[int, line_check.PageLines] = {}
     with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
         tmp.write(rendered_pdf)
         tmp.flush()
@@ -335,7 +449,11 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                 finally:
                     reader.close()
                 working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-                sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊
+                region = content_region(image, sp)
+                sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
+                found = checker.check(spec.page_index, region, _WHERE[OutputFormat.PPTX]) if checker is not None else None
+                if found is not None:
+                    found_lines[spec.page_index] = found
                 w = sp.width_pt
                 k, ox, oy = source_frame(sp)  # 來源文字行（原始頁面的相對座標）→ 輸出頁面 pt
                 pl = layout.pages[spec.page_index]
@@ -404,10 +522,12 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                         ))
                 if sim < c["similarity_pass"]:
                     issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"整頁相似度 {sim:.3f}，低於合格線 {c['similarity_pass']}。"))
+                if found is not None:
+                    issues.extend(found.issues)
                 out_pages.append(report.model_copy(update={"target_similarity": sim, "elements": new_elements, "issues": issues}))
         finally:
             pdoc.close()
-    return out_pages, proposals
+    return out_pages, proposals, found_lines
 
 
 def _assign(lines: list[TextLine], page, w: float) -> dict[str, list[TextLine]]:

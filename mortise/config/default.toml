@@ -9,6 +9,17 @@ native_min_chars = 5                 # 一頁至少幾個真文字字元才算�
 scan_image_coverage = 0.85           # 單張圖佔頁面面積超過此比例，視為掃描頁（初始值）
 hidden_text_ratio = 0.8              # 不可見文字超過此比例，判為 OCR 文字層（初始值）
 unicode_error_ratio = 0.3            # 缺 Unicode 對照的字元超過此比例，改走影像產線（初始值）
+# 影像是截圖還是照片：依影像內容判斷（s1_input.classify_image），不看 PNG／JPEG，相機資訊只當旁證
+classify_flat_big_screenshot = 0.25  # 9×9 鄰域完全同色的像素（大片平塗）佔這個比例以上，判為截圖（合成照片最多 0.19、fixture 截圖最少 0.28；初始值）
+classify_flat_window = 9             # 「大片平塗」的鄰域邊長（像素）：要大於 JPEG 的 8×8 區塊，照片被壓平的雜訊才不會被當成平塗
+classify_flat_screenshot = 0.55      # 沒有大片平塗時：3×3 鄰域完全同色的像素佔這個比例以上、又幾乎沒有雜訊，也判為截圖（漸層多的畫面；初始值）
+classify_noise_digital = 0.6         # 平坦區的雜訊 σ（色階）低於這個視為數位影像（與頁面幾何的 digital_noise_max 相同）
+classify_flat_photo = 0.3            # 3×3 平塗像素低於這個比例，判為照片或掃描（初始值）
+classify_quad_min_conf = 0.5         # 縮圖上找到的紙張四邊信心值至少這麼多，才算「有透視變形的紙張」
+classify_outside_flat = 0.5          # 四邊以外的大片平塗比例達到這個、四邊形又不到 classify_quad_max_area，視為截圖裡的色塊或圖片（初始值）
+classify_quad_max_area = 0.8         # 見上；佔畫面這麼大的四邊形一律當成拍到或掃到的紙張
+classify_max_side = 1200             # 找紙張四邊時縮圖的長邊（像素）
+classify_max_megapixels = 16         # 算平塗比例時，影像超過這麼多百萬像素就隔點取樣
 
 [page]                               # ② 頁面
 working_dpi = 150                    # 工作影像解析度（dpi）
@@ -16,6 +27,8 @@ max_working_pixels = 40000000        # 工作影像像素上限
 assumed_image_dpi = 96               # 影像沒有尺寸資訊時假設的 dpi（信心值低）
 size_auto_accept = 0.6               # 尺寸候選的信心值超過此值就自動採用，否則請使用者選（初始值）
 enhance_photos = true                # 照片與掃描檔先去陰影、白平衡再辨識
+enhance_max_flat = 0.25              # 照片模式下，攤平後的頁面若有這個比例以上的成片完全同色像素（平塗的數位畫面），就不做去陰影與白平衡（初始值）
+enhance_flat_window = 9              # 「成片完全同色」的鄰域邊長（像素），要大於 JPEG 的 8×8 區塊
 
 [recognize]                          # ③ 辨識
 line_gap_factor = 1.5                # 同一基線上兩字間距超過「字級 × 此值」就拆成兩行
@@ -173,6 +186,7 @@ svg_kerning_aware = true             # 置中、靠右、左右對齊的行，�
 svg_tspan_y = false                  # 行內片段的 tspan 另寫 y：resvg 這類渲染器才會逐片段選字型；編輯軟體的行為未實測，預設不寫
 svg_hairline_pt = 0.25               # 來源是 PDF 零寬細線的筆畫，在 SVG 裡寫成多寬（pt，初始值）
 svg_outline_slant_deg = 12.0         # 文字轉外框而字型沒有斜體檔時，字形傾斜的角度（初始值）
+svg_page_background = "auto"         # 頁面底色：auto（最底層一定畫頁面底色，⑤沒有底色就是白色；深色模式的看圖軟體才不會變黑底）或 none（只有⑤指定了底色才畫，其餘透明）。單獨向量圖（svg_assets）一律透明
 # ---- Word（exporters/docx_*.py）：設定加在這一行下面，名稱以 docx_ 開頭 ----
 # 寫進檔案的字型名稱（見 exporters/docx_common.py「寫入的字型名稱」）。成品文件裡⑤推論的字型不改，原本的名稱記在降級紀錄。
 docx_font_names = "portable"         # portable：換成多數裝置都有、或字寬相容的字型；inferred：照推論的名稱寫（舊做法，冷門字型也照寫）
@@ -225,6 +239,19 @@ svg_similarity_pass = 0.95           # SVG 渲染後與工作影像的相似度�
 svg_position_tolerance_pt = 0.1      # 讀回來的文字行位置與成品文件排版的容許差（pt）
 svg_emulate_bold = true              # 伺服器上的字型沒有粗體檔時，渲染前補同色描邊模擬粗體（不改輸出檔）
 svg_font_dirs = []                   # 渲染用的字型目錄；空的表示用 fontconfig 列出的字型（與輸出時量行寬用的是同一批）
+# ---- 逐行文字對照（verify/lines.py）：③讀到的每一行字在成品的渲染結果上找不找得到、有沒有錯位或疊在一起；名稱以 line_ 開頭 ----
+line_check = true                    # 是否做逐行文字對照（關掉時整體分數只看畫面相似度，與以前相同）
+line_found_min = 0.5                 # 一行在原位置附近找到的比例低於此值：這一行在成品裡找不到（初始值）
+line_partial_min = 0.8               # 找到的比例低於此值：一部分找不到（初始值）
+line_ncc_min = 0.5                   # 一段字算「找到」的最低相關係數（實測：對得上的段多在 0.6 以上；初始值）
+line_mass_min = 0.4                  # 一段字算「找到」時，渲染結果的墨跡量至少是原圖的多少倍（太少是殘影或被蓋住；初始值）
+line_extra_max = 0.12                # 疊字：這一行多出、原圖附近沒有的墨跡至少是原本的此比例（初始值）
+line_overlap_mass = 1.3              # 疊字：而且這一行的墨跡總量至少是原圖的此倍數（五個 fixture 正常的行實測最多 1.16 倍；初始值）
+line_offset_tolerance_pt = 2.0       # 位置偏移的容許差（pt；初始值）
+line_offset_tolerance_ratio = 0.1    # 位置偏移的容許差（字高的比例）；與上一項取大（初始值）
+line_problem_floor = 0.02            # 逐行分數：每個內容問題（找不到、疊在一起）另外至少扣這麼多，長文件少一行也看得出來（初始值）
+line_problem_cap = 0.10              # 上一項最多扣到這麼多（初始值）
+line_min_ink_px = 12.0               # 原圖上一行的墨跡少於「字高 × 此值」個像素就不判斷（被蓋住或與底色太接近的字；初始值）
 
 [ai]                                 # 大型 AI（只回答編號、標籤、或在候選中選擇）
 enabled = true                       # 有憑證才會真的呼叫；沒有憑證時流水線照常跑，全用規則判斷

@@ -49,7 +49,7 @@ import ctypes
 import math
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pypdfium2.raw as raw
 from PIL import Image
@@ -591,7 +591,9 @@ def compare_source(source: list[TextLine], got: list[TextLine], width_pt: float,
     return _match(_wants_from_source(source, k, ox, oy), chars)
 
 
-def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc, cfg: Config, store: Store) -> FormatReport:
+def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc, cfg: Config, store: Store,
+           on_render: Optional[Callable[[int, Image.Image], None]] = None) -> FormatReport:
+    """on_render：每畫好一頁就以（頁碼, 裁成與工作影像同一範圍的渲染結果）呼叫一次（⑦用它做逐行文字對照）。"""
     from ..stages.s7_verify import content_region, similarity, verify_dpi  # 延後匯入：s7_verify 會回頭匯入本套件
 
     p = _params(cfg)
@@ -641,7 +643,10 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
             sim: Optional[float] = None
             if spec is not None:
                 working = Image.open(store.blob_path(spec.working_image))
-                sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊（留白不算）
+                region = content_region(image, sp)
+                sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊（留白不算）
+                if on_render is not None:
+                    on_render(i, region)
                 if sim < p["pdf_similarity_pass"]:
                     issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"輸出檔重新畫出來與原圖的相似度 {sim:.3f}，低於合格線 {p['pdf_similarity_pass']}。"))
             # 2. 文字

@@ -63,6 +63,7 @@ from ..pipeline.store import atomic_write_text
 from ..stages import s6_export
 from ..tools import pdfium as pdf
 from ..tools.units import to_pt
+from ..verify.lines import CODES as LINE_CODES
 from .jobs import JobManager
 
 CFG = Config.load()
@@ -599,7 +600,7 @@ def page_image(
             src = Image.open(pipe.store.blob_path(spec.working_image)).convert("RGB").resize(region.size, Image.LANCZOS)
             over = result.copy()
             over.paste(Image.blend(src, region, 0.5), box[:2])
-        flagged = _flagged(report, n - 1)
+        flagged = _flagged(report, n - 1, fmt)
         draw = ImageDraw.Draw(over)
         for item in list(sp.text_boxes) + list(sp.tables) + list(sp.images):
             if item.id in flagged:
@@ -613,8 +614,10 @@ def page_image(
     return Response(data, media_type="image/png", headers=headers)
 
 
-def _flagged(report: FidelityReport, page_index: int) -> dict[str, list[str]]:
-    """低信心或驗證有問題的元素 → 問題說明。"""
+def _flagged(report: FidelityReport, page_index: int, fmt: Optional[OutputFormat] = None) -> dict[str, list[str]]:
+    """低信心或驗證有問題的元素 → 問題說明。
+    除了各頁的問題，也收各輸出格式回讀驗證裡「逐行文字對照」的問題（這一行找不到、疊在一起、錯位；
+    element_id 是那一行所屬的文字框或表格）：指定 fmt（Overlay 用）時只收那個格式的，不指定就收所有格式的（相同的說明只列一次）。"""
     low = CFG.section("verify").get("low_confidence", 0.7)
     out: dict[str, list[str]] = {}
     page = report.pages[page_index]
@@ -624,6 +627,17 @@ def _flagged(report: FidelityReport, page_index: int) -> dict[str, list[str]]:
     for i in page.issues:
         if i.element_id and i.severity.value in ("warning", "error"):
             out.setdefault(i.element_id, []).append(i.message)
+    for fr in report.format_reports:
+        if fmt is not None and fr.format != fmt:
+            continue
+        for fp in fr.pages:
+            if fp.page_index != page_index:
+                continue
+            for i in fp.issues:
+                if i.code in LINE_CODES and i.element_id and i.severity.value in ("warning", "error"):
+                    msgs = out.setdefault(i.element_id, [])
+                    if i.message not in msgs:
+                        msgs.append(i.message)
     return out
 
 

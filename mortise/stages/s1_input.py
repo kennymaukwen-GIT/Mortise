@@ -3,7 +3,8 @@
 步驟：
   s1.sniff      以檔案內容（不是副檔名）判斷類型，檢查大小上限
   s1.open       開啟檔案；有密碼或損壞就回報
-  s1.classify   逐頁判斷輸入類型（原生 PDF／掃描 PDF／混合 PDF／截圖／照片）
+  s1.classify   逐頁判斷輸入類型（原生 PDF／掃描 PDF／混合 PDF／截圖／照片）；
+                影像依內容判斷（平塗像素比例、雜訊、有沒有透視變形的紙張四邊），不看檔案格式，相機資訊只當旁證
   s1.fake_native 假原生初判（隱藏的 OCR 文字層、缺 Unicode 對照、文字轉外框）
   s1.metadata   擷取 Producer、Creator 等中繼資料
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Optional
 
 from PIL import Image
 
@@ -21,7 +23,7 @@ from ..pipeline.store import Store, sha256_bytes
 from ..tools import pdfium as pdf
 
 NAME = "s1"
-VERSION = "1"
+VERSION = "2"
 
 
 class InputError(Exception):
@@ -133,14 +135,130 @@ def _image_pages(data: bytes, media_type: str, c: dict) -> tuple[list[PageRef], 
         w, h = h, w
     dpi = im.info.get("dpi")
     dpi_hint = float(dpi[0]) if dpi and dpi[0] and dpi[0] > 1 else None
-    if camera:
-        kind, conf = InputType.PHOTO, 0.9
-    elif media_type == "image/png":
-        kind, conf = InputType.SCREENSHOT, 0.6
-    else:
-        kind, conf = InputType.PHOTO, 0.5
-    meta = {"format": media_type}
+    warnings: list[str] = []
+    try:
+        feats = image_features(im.convert("RGB"), c)
+        kind, conf, why = classify_image(feats, camera, c)
+    except Exception as e:  # 量不出來（例如缺少影像套件）：不中斷，退回保守的判斷
+        feats = None
+        kind, conf, why = (InputType.PHOTO, 0.5, f"影像內容量不出來（{type(e).__name__}），先當照片處理")
+    meta = {"format": media_type, "classify": why}
+    if feats is not None:
+        meta["classify_features"] = feats.summary()
     if camera:
         meta["camera"] = f"{exif.get(271, '')} {exif.get(272, '')}".strip()
+        if kind != InputType.PHOTO:
+            warnings.append(f"檔案帶有相機資訊（{meta['camera']}），但影像內容是平塗的數位畫面，依內容判為截圖。如果其實是照片，請手動拉出頁面四角。")
     page = PageRef(page_index=0, input_type=measured(kind, conf, Provenance.INFERRED, f"{NAME}.classify@{VERSION}"), pixel_size=(w, h), dpi_hint=dpi_hint)
-    return [page], meta, []
+    return [page], meta, warnings
+
+
+# ---------- 影像輸入的類型：依影像內容判斷，不看檔案格式，相機資訊只當旁證 ----------
+
+
+class ImageFeatures:
+    """判斷截圖或照片用的影像內容量測。
+
+    flat：3×3 鄰域內所有像素三個通道完全相同的比例（「平塗像素比例」）。
+    flat_big：9×9 鄰域完全相同的比例（「大片平塗比例」）。螢幕畫面、軟體匯出的頁面有大片完全同色的底，
+          JPEG 壓縮也保得住（整塊同色的 8×8 區塊解回來仍完全同色）；相機拍的影像到處都有感光雜訊與光照的漸變，
+          就算雜訊被 JPEG 壓平，完全同色的範圍也只到一個 8×8 區塊為止，不會連成一大片。
+    noise：平坦區的雜訊 σ（色階），與②頁面幾何判斷「數位影像」用的是同一個量法（只量影像中央）。
+    quad：在縮圖上找到的紙張四邊（method、信心值、佔整張圖的面積比例）；quad_outside_flat 是四邊以外那一圈的大片平塗比例
+          （照片裡四邊以外是桌面之類的真實場景；截圖裡斜放的色塊，四邊以外仍是平塗的畫面）。"""
+
+    def __init__(self, flat: float, flat_big: float, noise: float, quad_method: str, quad_conf: float, quad_area: float, quad_outside_flat: Optional[float]):
+        self.flat = flat
+        self.flat_big = flat_big
+        self.noise = noise
+        self.quad_method = quad_method
+        self.quad_conf = quad_conf
+        self.quad_area = quad_area
+        self.quad_outside_flat = quad_outside_flat
+
+    def summary(self) -> str:
+        out = f"平塗像素 {self.flat:.0%}（大片平塗 {self.flat_big:.0%}），雜訊 σ {self.noise:.2f}，紙張四邊 {self.quad_method}（信心值 {self.quad_conf:.2f}）"
+        if self.quad_method != "full_image":
+            out += f"，佔畫面 {self.quad_area:.0%}"
+        if self.quad_outside_flat is not None:
+            out += f"，四邊以外的大片平塗 {self.quad_outside_flat:.0%}"
+        return out
+
+
+def _flat_map(arr, k: int):
+    """每個像素的 k×k 鄰域是否三個通道都完全相同。"""
+    import cv2
+    import numpy as np
+
+    ker = np.ones((k, k), np.uint8)
+    spread = cv2.dilate(arr, ker).astype(np.int16) - cv2.erode(arr, ker).astype(np.int16)
+    return spread.max(axis=2) == 0
+
+
+def image_features(im: Image.Image, c: dict) -> ImageFeatures:
+    """量 ImageFeatures。im 是 RGB 影像（方向不影響結果，不必先轉正）。"""
+    import cv2
+    import numpy as np
+
+    from ..recognition import page_geometry as pg
+
+    arr = np.asarray(im)
+    H, W = arr.shape[:2]
+    # 平塗比例：影像太大時隔點取樣（平塗的底隔點看仍然平塗，雜訊隔點看仍然是雜訊）
+    step = max(1, int(np.ceil(np.sqrt(H * W / (float(c.get("classify_max_megapixels", 16)) * 1e6)))))
+    sub = np.ascontiguousarray(arr[::step, ::step])
+    flat = float(_flat_map(sub, 3).mean())
+    big = _flat_map(sub, int(c.get("classify_flat_window", 9)))
+    noise = float(pg._noise_sigma(cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)))
+    # 紙張四邊：與②同一個模組，但在縮圖上找、不指定類型（只看有沒有透視變形的紙張）
+    side = float(c.get("classify_max_side", 1200))
+    s = min(1.0, side / max(H, W))
+    small = cv2.resize(arr, (max(8, int(round(W * s))), max(8, int(round(H * s)))), interpolation=cv2.INTER_AREA) if s < 1 else arr
+    quad = pg.find_page_quad(small, {"input_type": None})
+    area, outside = 1.0, None
+    if quad.method != "full_image":
+        sh, sw = sub.shape[:2]
+        k = np.array([sw / small.shape[1], sh / small.shape[0]])
+        poly = np.round(np.asarray(quad.corners, dtype=np.float64) * k).astype(np.int32)
+        mask = np.zeros((sh, sw), np.uint8)
+        cv2.fillPoly(mask, [poly], 1)
+        area = float(mask.mean())
+        out = mask == 0
+        if out.mean() >= 0.03:
+            outside = float(big[out].mean())
+    return ImageFeatures(flat, float(big.mean()), noise, quad.method, float(quad.confidence), area, outside)
+
+
+def classify_image(f: ImageFeatures, camera: bool, c: dict) -> tuple[InputType, float, str]:
+    """依影像內容判斷是截圖還是照片。回傳（類型、信心值、白話理由）。
+
+    截圖（含軟體匯出、螢幕擷取、沒有雜訊的數位頁面）：整張圖就是頁面，不找四角、不做白平衡與去光照。
+    照片（手機翻拍、掃描）：要找頁面四角並透視攤平；白紙類頁面另外做去陰影與白平衡才辨識。
+    檔案格式（PNG 或 JPEG）不列入判斷：截圖常被聊天軟體轉成 JPEG。相機資訊只在內容分不出來時當旁證。
+    依序：
+      1. 有透視變形的紙張四邊 → 照片；除非四邊以外也是大片平塗、四邊形又只佔畫面一部分（截圖裡的色塊或圖片）。
+      2. 大片平塗比例夠高 → 截圖（相機拍的影像不會有成片完全同色的區域）。
+      3. 幾乎沒有雜訊、平塗像素又多 → 截圖（漸層多的畫面）。
+      4. 其他 → 照片（整張圖就是頁面，或紙張邊緣沒拍到）。"""
+    flat_big_min = float(c.get("classify_flat_big_screenshot", 0.25))
+    flat_min = float(c.get("classify_flat_screenshot", 0.55))
+    digital = f.noise < float(c.get("classify_noise_digital", 0.6))
+    if f.quad_method in ("edge_fit", "contour") and f.quad_conf >= float(c.get("classify_quad_min_conf", 0.5)):
+        if f.quad_outside_flat is not None and f.quad_outside_flat >= float(c.get("classify_outside_flat", 0.5)) and f.quad_area < float(c.get("classify_quad_max_area", 0.8)):
+            return InputType.SCREENSHOT, 0.6, (f"找到一個像紙張的四邊形（佔畫面 {f.quad_area:.0%}），但四邊以外是大片平塗的數位畫面（{f.quad_outside_flat:.0%}），"
+                                               "判為截圖裡的色塊或圖片，不是拍到的紙張")
+        conf = 0.95 if camera else 0.9
+        return InputType.PHOTO, conf, f"找到有透視變形的紙張四邊（信心值 {f.quad_conf:.2f}），判為照片"
+    if f.flat_big >= flat_big_min:
+        conf = 0.9 if f.flat_big >= 2 * flat_big_min else 0.75
+        if camera:
+            conf = 0.6
+        return InputType.SCREENSHOT, conf, f"有大片完全同色的平塗區域（{f.flat_big:.0%}），判為截圖或軟體匯出的頁面"
+    if digital and f.flat >= flat_min:
+        return InputType.SCREENSHOT, 0.6 if camera else 0.7, f"平塗像素多（{f.flat:.0%}）、幾乎沒有雜訊（σ {f.noise:.2f}），判為截圖或軟體匯出的頁面"
+    if camera:
+        return InputType.PHOTO, 0.8, "檔案帶有相機資訊，畫面也不是平塗的數位畫面，判為照片（整張圖就是頁面，或紙張邊緣沒拍到）"
+    if not digital or f.flat < float(c.get("classify_flat_photo", 0.3)):
+        return InputType.PHOTO, 0.7, (f"有感光雜訊（σ {f.noise:.2f}）或幾乎沒有平塗像素（{f.flat:.0%}），判為照片或掃描"
+                                      "（沒有找到紙張四邊：整張圖就是頁面，或紙張邊緣沒拍到）")
+    return InputType.PHOTO, 0.5, f"平塗像素 {f.flat:.0%}、雜訊 σ {f.noise:.2f}，介於截圖與照片之間，先當照片處理"
