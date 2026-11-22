@@ -151,7 +151,9 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         notes.append(f"有 {low_text} 行文字的辨識信心值偏低，請確認內容。")
 
     # ---------- s3.regions ----------
-    regions = regmod.find_regions(work, text_mask, text_quads=[np.asarray(ol.quad) for ol in ocr_lines])
+    # 設定檔 [recognize] 裡以 region_ 開頭的值蓋過 regions.py 的預設（去掉前綴後同名）
+    region_params = {k[7:]: v for k, v in c.items() if k.startswith("region_")}
+    regions = regmod.find_regions(work, text_mask, params=region_params or None, text_quads=[np.asarray(ol.quad) for ol in ocr_lines])
     region_mask = np.zeros((H, W), dtype=bool)
     for rg in regions:
         x0, y0, x1, y1 = rg.bbox
@@ -162,6 +164,26 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
     text_free = None
     if photos and any(text_mask[rg.bbox[1]:rg.bbox[3], rg.bbox[0]:rg.bbox[2]].any() for rg in photos):
         text_free = bgmod.reconstruct_background(color, text_mask).image
+    # 被上層的形狀或插畫（例如從照片裡拆出來的平塗圖形）蓋住的地方也先補掉，否則移動形狀會露出殘影。
+    # 補出來的像素屬於生成，記在 notes（圖片元素本身沒有生成範圍的欄位）。
+    covered_px: dict[int, tuple[int, int]] = {}
+    for rg in photos:
+        cover = np.zeros((H, W), dtype=bool)
+        for up in regions:
+            if up is rg or up.z <= rg.z or up.kind not in ("shape", "illustration"):
+                continue
+            ux0, uy0, ux1, uy1 = up.bbox
+            if ux1 <= rg.bbox[0] or ux0 >= rg.bbox[2] or uy1 <= rg.bbox[1] or uy0 >= rg.bbox[3]:
+                continue
+            cover[uy0:uy1, ux0:ux1] |= up.mask.astype(bool)
+        if not cover.any():
+            continue
+        base = text_free if text_free is not None else color
+        filled, gen_mask = regmod.fill_covered(base, rg, cover, region_params or None)
+        n_gen = int(gen_mask.sum())
+        if n_gen:
+            text_free = filled
+            covered_px[id(rg)] = (n_gen, int(rg.mask.sum()))
 
     images: list[ImageElement] = []
     shapes: list[ShapeElement] = []
@@ -179,6 +201,11 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
                 id=make_element_id(page, "img", q, blob.sha256[:12]), quad=q, z=10 + rg.z, image=blob,
                 pixel_size=(rgba.shape[1], rgba.shape[0]), kind=measured(kind, rg.confidence, Provenance.MEASURED, STEP),
             ))
+            if id(rg) in covered_px:
+                n_gen, n_all = covered_px[id(rg)]
+                what = "照片" if rg.kind == "photo" else "插畫"
+                notes.append(f"{what}（{images[-1].id}）有 {n_gen} 個像素（約 {n_gen / max(n_all, 1):.0%}）原本被疊在上面的圖形蓋住，"
+                             "已補成周圍的內容（平滑內插加上照片本身的顆粒）；這部分是生成的，不是原圖。")
             # ---------- s3.vectorize：插畫描成向量（照片不描）；對應的圖片照樣留在 images 裡
             if rg.kind == "illustration" and c.get("vector_enabled", True):
                 vg = _trace_vector(page, images[-1], rgba, (x0, y0), W, vector_params, notes)
