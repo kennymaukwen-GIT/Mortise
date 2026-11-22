@@ -562,7 +562,7 @@ def test_fit_source_lines_condenses_only_when_needed():
 def test_fixed_fits_paragraph_back_to_source_lines(tmp_path):
     """仿照真實案例的那一段（文字是虛構的）：⑤配的驗證字型比原圖寬、第二行量起來超過框寬 → 版面固定在那一段緊縮字距，行數回到原圖，
     框不會往下長、蓋到下面的框（原本一段經歷的最後一行蓋到下一個經歷標題）。"""
-    line1 = "• The dairy wanted fewer rejected batches; as more buyers now ask for test results with"
+    line1 = "• The dairy wanted fewer rejected batches; as more stores now ask for test results with"
     line2 = " every order, I proposed a shared results sheet (updated after each test) alongside labels."
     w2 = docx_common.text_width_pt(line2.strip(), "Arial", 10.0)
     if w2 is None:
