@@ -191,3 +191,64 @@ class SizeCandidate:
     aspect_score: float = 1.0  # 只看長寬比的吻合度（0 到 1；以長寬比誤差範圍為尺度）
     family: str = ""  # 規格家族，例如 "ISO A 直"（長寬比相同的尺寸歸同一家族）
     scale_evidence: bool = False  # 是否有絕對尺度線索（dpi、字級）參與排序
+
+
+# ---------------------------------------------------------------- 描圖向量化（vectorize.py）
+
+
+@dataclass
+class TracedGradient:
+    """漸層填色（像素座標）。色標之間在 sRGB 數值上線性內插，與 SVG、PDF 的預設行為一致。"""
+
+    kind: str  # "linear"、"radial"
+    coords: list[float]  # linear：[x0, y0, x1, y1]；radial：[cx, cy, r]
+    stops: list[tuple[float, RGB]]  # （位置 0 到 1、顏色），依位置由小到大
+
+
+@dataclass
+class TracedPrimitive:
+    """這條路徑其實是哪一種基本圖形（像素座標）。欄位意義與 artifacts.VectorPrimitive 相同。"""
+
+    kind: str  # "rect"、"rounded_rect"、"ellipse"、"circle"、"line"、"polygon"
+    cx: float
+    cy: float
+    w: float  # 沿自身方向的寬（line 為長度）
+    h: float  # 沿自身方向的高（line 為 0）
+    angle_deg: float = 0.0  # 順時針為正
+    corner_radius: float = 0.0  # rounded_rect 才有
+    points: list[list[float]] = field(default_factory=list)  # polygon 的頂點
+
+
+@dataclass
+class TracedPath:
+    """描圖得到的一條路徑（像素座標；像素 i 佔 [i, i+1)，中心在 i+0.5）。"""
+
+    path: list[list[float]]  # 與 ShapeElement.path 同一種編碼：[種類, x, y, ...]；0 起筆、1 直線、2 三次貝茲（後接 3 個點）、3 閉合
+    fill: Optional[RGB] = None
+    fill_rule: str = "nonzero"  # "nonzero"、"evenodd"
+    gradient: Optional[TracedGradient] = None  # 有漸層時 fill 是漸層的平均色
+    stroke: Optional[RGB] = None
+    stroke_width_px: Optional[float] = None
+    stroke_cap: str = "butt"
+    stroke_join: str = "miter"
+    primitive: Optional[TracedPrimitive] = None
+    fit_error_px: Optional[float] = None  # 路徑與次像素邊界的平均距離（只算看得到的邊界）
+    completed: bool = False  # 有一部分被上層遮住、由補全推得（不是量到的）
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class VectorResult:
+    """vectorize() 的結果。paths 由下到上；所有數值都是演算法量出來的。"""
+
+    paths: list[TracedPath]
+    size: tuple[int, int]  # （寬、高），像素
+    background: Optional[RGB]  # 被當成底色（透明）的顏色；沒有就是 None
+    render_error: float  # 重新畫出來與原圖的平均色差（CIE76 ΔE），只算遮罩內
+    error_p95: float  # 色差的第 95 百分位
+    iou: float  # 重畫的覆蓋範圍與原圖前景的交集 ÷ 聯集
+    node_count: int  # 所有路徑的節點數（線段與曲線段的數目）
+    accepted: bool  # 是否達到可以當向量圖輸出的品質
+    confidence: float  # 0 到 1
+    notes: list[str] = field(default_factory=list)
+    stats: dict = field(default_factory=dict)  # 過程中的量測：雜訊、區域數、各步驟耗時、驗證輪數等

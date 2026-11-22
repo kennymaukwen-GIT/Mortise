@@ -4,7 +4,10 @@
   擷取產線（原生 PDF）：直接讀檔案
     s3.pdf_text    讀逐字資料，合併成文字行與樣式段
     s3.pdf_images  讀內嵌圖片
-    s3.pdf_shapes  讀向量路徑：認出矩形、圓角矩形、橢圓、直線；其他較簡單的保留成自訂路徑；太複雜的留在底圖
+    s3.pdf_paths   讀所有向量路徑與漸層物件，判斷每一個讀不讀得出來（花紋、被裁切、混合模式等讀不出來的留在底圖）
+    s3.pdf_vectors 把屬於同一個圖形的路徑分群，每群交出一個向量圖（VectorGraphic）與一張對應的透明底圖片；
+                   疑似文字轉外框的路徑單獨成群（kind 為 outlined_text）
+    s3.pdf_shapes  沒有成群的路徑：認出矩形、圓角矩形、橢圓、直線；其他簡單的保留成自訂路徑
     s3.tables      由框線找表格區（區域與格線位置；列欄結構在④）
     s3.background  隱藏已擷取的物件後重繪，得到底圖（不是生成）
   影像產線（掃描、截圖、照片）：見 s3_image_line.py（文字辨識、文字屬性、區域、裁圖、底圖修補）。
@@ -15,13 +18,17 @@ from __future__ import annotations
 
 import io
 import math
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 from PIL import Image
 
 from ..artifacts import (
-    Background, Color, Correction, ElementList, FontCandidate, ImageElement, ImageKind, InputType, PageSpec, Point, TableRegion,
-    ProductionLine, Provenance, Quad, ShapeElement, ShapeGeometry, SourceDoc, TextLine, TextRun, exact, make_element_id, measured,
+    Background, Color, Correction, ElementList, FontCandidate, Gradient, GradientStop, ImageElement, ImageKind, InputType, PageSpec, Point,
+    TableRegion, ProductionLine, Provenance, Quad, ShapeElement, ShapeGeometry, SourceDoc, TextLine, TextRun, VectorGraphic, VectorPath,
+    VectorPrimitive, exact, make_element_id, measured,
 )
 from ..config import Config
 from ..pipeline.store import Store
@@ -83,15 +90,23 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
     m = spec.source_to_page
     src_w = math.hypot(spec.source_corners[1].x - spec.source_corners[0].x, spec.source_corners[1].y - spec.source_corners[0].y)
     notes: list[str] = []
-    pdoc = pdf.open_document(str(store.blob_path(doc.source)))
-    reader = pdf.PageReader(pdoc, spec.page_index)
+    flags = doc.pages[spec.page_index].fake_native
+    source_path = str(store.blob_path(doc.source))
+    pdoc = pdf.open_document(source_path)
+    reader = pdf.PageReader(pdoc, spec.page_index, source_path=source_path)
     try:
         texts = read_text_lines(reader, spec.page_index, m, src_w, c)
         images, image_z = _images(reader, spec, m, c, store, notes)
-        shapes, shape_z, page_color, _ = _shapes(reader, spec, m, src_w, c, notes)
+        # 向量路徑：先全部讀出來並判斷讀不讀得出來，再分群成向量圖，剩下的照舊轉成形狀
+        paths = _read_paths(reader, spec, m, src_w, c)
+        page_color, _ = _page_color(paths, spec, c)
+        _mark_covered(paths)
+        groups = _group_paths(paths, reader, m, c, bool(flags and flags.outlined_text_suspected))
+        vectors, vector_images, vector_z = _vector_graphics(groups, reader, spec, src_w, c, store, notes)
+        shapes, shape_z = _shapes(paths, spec, m, src_w, notes)
         _mark_shadows(images, shapes)
         # 底色物件不隱藏：底圖要帶著底色，否則隱藏後會變成白底（深色投影片就會整頁變白）
-        background = _background(reader, spec, c, store, image_z | shape_z, page_color)
+        background = _background(reader, spec, c, store, image_z | shape_z | vector_z, page_color)
         tables, absorbed = _tables(shapes, [t for t in texts if not t.hidden], spec, c)
         shapes = [sh for sh in shapes if sh.id not in absorbed]
     finally:
@@ -101,7 +116,7 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
         notes.append("這一頁有不可見文字（多半是 OCR 文字層），已標記為隱藏，不會輸出。")
     return ElementList(
         page_index=spec.page_index, production_line=ProductionLine.EXTRACT,
-        texts=texts, images=images, shapes=shapes, table_regions=tables, background=background, notes=notes,
+        texts=texts, images=images + vector_images, shapes=shapes, table_regions=tables, background=background, notes=notes, vectors=vectors,
     )
 
 
@@ -471,85 +486,955 @@ def _rounded_rect_of(segs: list[list], tol: float) -> tuple[tuple[float, float, 
     return (l, b, r, t), rad
 
 
-def _shapes(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: float, c: dict, notes: list[str]) -> tuple[list[ShapeElement], set[int], Color | None, set[int]]:
-    """向量路徑 → 形狀。矩形、圓角矩形、橢圓、直線認成基本幾何；其他較簡單的路徑保留成自訂路徑；
-    太複雜的（例如上千條路徑組成的插畫）留在底圖。回傳（形狀、已取出的物件、頁面底色、底色物件）。"""
+# ---------- s3.pdf_paths ----------
+
+# 留在底圖的原因：代碼 → 給使用者看的說法
+_REASONS = {
+    "gradient": "讀不出參數的漸層",
+    "pattern": "花紋填色",
+    "clipped": "被裁切的圖形",
+    "blend": "混合模式",
+    "soft_mask": "透明遮罩",
+    "group": "整組套用的透明效果",
+    "unknown": "無法確認填色方式",
+    "covered": "被上面留在底圖的物件蓋住",
+    "page_gradient": "整頁的漸層底",
+}
+_BOGUS_FILLS = {(255, 255, 255), (191, 191, 191)}  # 填色其實是花紋或漸層時，PDFium 回報的假顏色
+_PRIMITIVES = ("rect", "line", "ellipse", "rrect")
+
+
+@dataclass
+class _Path:
+    """一條路徑（或一個漸層物件）在分群與轉換時用到的量測。③內部使用，不是產物。"""
+
+    z: int  # 繪製順序
+    raw: pdf.RawPath
+    segs: list[list]  # 線段（PDF 座標）：[種類, x, y, ...]；種類 0 起筆、1 直線、2 三次貝茲、3 閉合
+    rel: list[list[float]]  # 同樣的線段，頁面相對座標（與 VectorPath.path 同一種編碼）
+    box: tuple[float, float, float, float]  # 幾何外框（頁面相對座標：左、上、右、下）
+    vbox: tuple[float, float, float, float]  # 看得到的外框，含筆畫寬度（頁面相對座標）
+    kind: str  # "rect"、"line"、"ellipse"、"rrect"、"free"
+    geom: tuple = ()  # 基本形狀的參數（PDF 座標）：rect 與 ellipse 是（左、下、右、上）；rrect 是（（左、下、右、上）、圓角半徑）
+    fill: Optional[Color] = None
+    stroke: Optional[Color] = None
+    fill_rule: str = "nonzero"
+    gradient: Optional[pdf.RawGradient] = None
+    reason: Optional[str] = None  # 留在底圖的原因（_REASONS 的代碼）；None 表示讀得出來
+    detail: str = ""  # 原因的補充說明（例如漸層為什麼讀不出來）
+    role: str = ""  # 去向：""（還沒決定，最後會變成形狀）、"page_color"（頁面底色）、"vector"（向量圖的一部分）
+    glyph: bool = False  # 疑似文字轉外框的一部分
+
+
+def _rel_box(m: list[float], l: float, b: float, r: float, t: float) -> tuple[float, float, float, float]:
+    """PDF 座標的外框 → 頁面相對座標的外框（左、上、右、下）；頁面有旋轉時取轉過去之後的外接矩形。"""
+    pts = [to_point(m, x, y) for x, y in ((l, b), (r, b), (r, t), (l, t))]
+    return min(q.x for q in pts), min(q.y for q in pts), max(q.x for q in pts), max(q.y for q in pts)
+
+
+def _unreadable(p: pdf.RawPath, fill: Color | None, stroke: Color | None, status: str) -> tuple[str | None, str]:
+    """這條路徑有沒有「幾何讀得到、但畫出來的樣子重現不了」的狀況。回傳（原因代碼、補充說明）。"""
+    info = p.paint
+    if info is None:
+        # 沒有掃描結果：頁面沒有花紋之類的內容時不必擔心；掃描失敗時，只有回報成假顏色或帶透明效果的才可疑
+        if status == pdf.PAINT_FAILED and (p.transparent or any(col is not None and (col.r, col.g, col.b) in _BOGUS_FILLS for col in (fill, stroke))):
+            return "unknown", ""
+        return None, ""
+    if info.in_group:
+        return "group", ""
+    if info.soft_mask:
+        return "soft_mask", ""
+    if info.blend:
+        return "blend", ""
+    if stroke is not None and info.stroke_pattern:
+        return ("gradient", "漸層用在筆畫上") if info.stroke_pattern == "shading" else ("pattern", "")
+    if fill is not None and info.fill_pattern:
+        if info.fill_pattern != "shading":
+            return "pattern", ""
+        if info.gradient is None:
+            return "gradient", info.gradient_problem
+    return None, ""
+
+
+def _bbox_of(points: list) -> tuple[float, float, float, float]:
+    xs, ys = [q[1] for q in points], [q[2] for q in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _clip_region(clips: list[list]) -> list | None:
+    """好幾條裁切路徑的交集，如果可以用「一條路徑」精確表示就回傳它的線段：
+    全部是矩形 → 交集矩形；只有一條不是矩形、其餘的矩形都把它整個包住 → 就是那一條。其他情況回傳 None。"""
+    rects, others = [], []
+    for pts in clips:
+        rect = pdf.segments_rect(pts)
+        (rects if rect is not None else others).append(rect if rect is not None else pts)
+    if len(others) > 1 or (not rects and not others):
+        return None
+    if others:
+        l, b, r, t = _bbox_of(others[0])
+        if all(rc[0] <= l + 1e-3 and rc[1] <= b + 1e-3 and rc[2] >= r - 1e-3 and rc[3] >= t - 1e-3 for rc in rects):
+            return others[0]
+        return None
+    l, b, r, t = max(rc[0] for rc in rects), max(rc[1] for rc in rects), min(rc[2] for rc in rects), min(rc[3] for rc in rects)
+    if r - l <= 0 or t - b <= 0:
+        return None
+    M, L = SEG_MOVETO, SEG_LINETO
+    return [(M, l, b, False), (L, r, b, False), (L, r, t, False), (L, l, t, True)]
+
+
+def _gradient_covers(g: pdf.RawGradient, points: list) -> bool:
+    """漸層沒有往兩端延伸時，形狀必須整個落在漸層的範圍裡，否則範圍外其實不畫（輸出格式的漸層一律會延伸）。"""
+    if g.kind == "linear":
+        x0, y0, x1, y1 = g.coords
+        n2 = (x1 - x0) ** 2 + (y1 - y0) ** 2
+        ts = [((q[1] - x0) * (x1 - x0) + (q[2] - y0) * (y1 - y0)) / n2 for q in points]
+        return (g.extend[0] or min(ts) >= -1e-3) and (g.extend[1] or max(ts) <= 1 + 1e-3)
+    cx, cy, r = g.coords
+    return g.extend[1] or max(math.hypot(q[1] - cx, q[2] - cy) for q in points) <= r * (1 + 1e-3)
+
+
+def _gradient_color(g: pdf.RawGradient, alpha: float) -> Color:
+    """漸層的平均色（各段依長度加權）：給不支援漸層的輸出器當替代填色。"""
+    stops = sorted(g.stops, key=lambda st: st[0])
+    acc, total = [0.0, 0.0, 0.0], 0.0
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        w = max(t1 - t0, 0.0)
+        total += w
+        for i in range(3):
+            acc[i] += w * (c0[i] + c1[i]) / 2
+    rgb = [int(round(v / total)) for v in acc] if total > 0 else list(stops[0][1])
+    return Color(r=rgb[0], g=rgb[1], b=rgb[2], a=alpha)
+
+
+def _classify(p: pdf.RawPath, segs: list[list], stroke: Color | None, tol: float) -> tuple[str, tuple]:
+    """這條路徑是哪一種基本形狀（判斷的順序與條件沿用原本的形狀辨識）。"""
+    rect = _rect_of(p, tol=tol)
+    if rect is not None:
+        return "rect", rect
+    if len(p.points) == 2 and stroke is not None and all(pt[0] != SEG_BEZIERTO for pt in p.points):
+        return "line", ()
+    ell = _ellipse_of(segs, tol)
+    if ell is not None:
+        return "ellipse", ell
+    rr = _rounded_rect_of(segs, tol)
+    if rr is not None:
+        return "rrect", rr
+    return "free", ()
+
+
+def _path_item(p: pdf.RawPath, m: list[float], fill: Color | None, stroke: Color | None, fill_rule: str, gradient, reason: str | None, detail: str, visual: bool) -> _Path | None:
+    tol = 0.02
+    segs = _segments(p)
+    rel: list[list[float]] = []
+    for sg in segs:
+        if sg[0] == 3:
+            rel.append([3])
+            continue
+        coords: list[float] = []
+        for x, y in zip(sg[1::2], sg[2::2]):
+            pt = to_point(m, x, y)
+            coords += [pt.x, pt.y]
+        rel.append([sg[0]] + coords)
+    xs = [v for sg in rel if sg[0] != 3 for v in sg[1::2]]
+    ys = [v for sg in rel if sg[0] != 3 for v in sg[2::2]]
+    if not xs:
+        return None
+    box = (min(xs), min(ys), max(xs), max(ys))
+    vbox = box
+    if visual and p.visual_bounds is not None:
+        vl, vt, vr, vb = _rel_box(m, *p.visual_bounds)
+        vbox = (min(vl, box[0]), min(vt, box[1]), max(vr, box[2]), max(vb, box[3]))
+    kind, geom = _classify(p, segs, stroke, tol)
+    return _Path(z=p.z, raw=p, segs=segs, rel=rel, box=box, vbox=vbox, kind=kind, geom=geom, fill=fill, stroke=stroke,
+                 fill_rule=fill_rule, gradient=gradient, reason=reason, detail=detail)
+
+
+def _read_paths(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: float, c: dict) -> list[_Path]:
+    """讀出頁面上所有看得到的路徑與漸層物件（依繪製順序），並判斷每一個讀不讀得出來。
+    讀不出來的不是丟掉：它們留在底圖，reason 記下原因；被它們蓋住的可讀路徑也一起留下（見 _mark_covered）。"""
+    status = reader.paint_status
+    out: list[_Path] = []
+    for p in reader.paths():
+        fill, stroke = _color(p.fill), _color(p.stroke)
+        if fill is None and stroke is None:
+            continue
+        reason, detail = _unreadable(p, fill, stroke, status)
+        info = p.paint
+        gradient = None
+        fill_rule = p.fill_rule
+        visual = True
+        if reason is None and fill is not None and info is not None and info.fill_pattern == "shading":
+            gradient = info.gradient
+        if reason is None and p.clip:
+            # 整塊矩形色塊被裁切：看得到的就是「裁切區」填上這個顏色，可以精確寫成一條路徑
+            region = _clip_region(p.clip) if stroke is None else None
+            rect = _rect_of(p, tol=0.02)
+            if region is not None and rect is not None:
+                cl, cb, cr, ct = _bbox_of(region)
+                inner = pdf.segments_rect(region)
+                if inner is not None:  # 矩形裁矩形：交集還是矩形
+                    region = _clip_region([region, [(SEG_MOVETO, rect[0], rect[1], False), (SEG_LINETO, rect[2], rect[1], False), (SEG_LINETO, rect[2], rect[3], False), (SEG_LINETO, rect[0], rect[3], True)]])
+                elif not (rect[0] <= cl + 1e-3 and rect[1] <= cb + 1e-3 and rect[2] >= cr - 1e-3 and rect[3] >= ct - 1e-3):
+                    region = None
+                elif info is None and sum(1 for q in region if q[0] == SEG_MOVETO) != 1:
+                    region = None  # 不知道裁切用哪一種填色規則，而路徑有好幾圈：不猜
+            else:
+                region = None
+            if region is None:
+                reason = "clipped"
+            else:
+                fill_rule = info.clip_rule if info is not None and pdf.segments_rect(region) is None else "nonzero"
+                p = pdf.RawPath(z=p.z, points=list(region), fill=p.fill, stroke=None, stroke_width=0.0, nested=p.nested, _obj=p._obj, fill_rule=fill_rule, paint=p.paint, forms=p.forms)
+                visual = False
+        if reason is None and gradient is not None and not _gradient_covers(gradient, p.points):
+            reason, detail = "gradient", "漸層沒有延伸到整個形狀"
+        if gradient is not None and fill is not None:
+            fill = _gradient_color(gradient, fill.a)
+        item = _path_item(p, m, fill, stroke, fill_rule, gradient if reason is None else None, reason, detail, visual)
+        if item is not None:
+            out.append(item)
+    for sh in reader.shadings():  # 直接畫的漸層：範圍是當時的裁切區
+        info = sh.paint
+        region = _clip_region(sh.clip)
+        reason, detail = None, ""
+        if info is None or info.gradient is None:
+            reason, detail = "gradient", (info.gradient_problem if info is not None else "")
+        elif info.in_group or info.soft_mask or info.blend:
+            reason = "group" if info.in_group else ("soft_mask" if info.soft_mask else "blend")
+        elif region is None:
+            reason, detail = ("gradient", "漸層的範圍由好幾條裁切路徑交出來") if sh.clip else ("page_gradient", "")
+        elif not _gradient_covers(info.gradient, region):
+            reason, detail = "gradient", "漸層沒有延伸到整個形狀"
+        if region is None:
+            l, b, r, t = sh.bounds
+            region = [(SEG_MOVETO, l, b, False), (SEG_LINETO, r, b, False), (SEG_LINETO, r, t, False), (SEG_LINETO, l, t, True)]
+        gradient = info.gradient if reason is None else None
+        fill = _gradient_color(gradient, 1.0) if gradient is not None else Color(r=128, g=128, b=128)
+        rule = info.clip_rule if info is not None and pdf.segments_rect(region) is None else "nonzero"
+        fake = pdf.RawPath(z=sh.z, points=list(region), fill=(fill.r, fill.g, fill.b, 255), stroke=None, stroke_width=0.0, nested=sh.nested, _obj=sh._obj, fill_rule=rule, paint=info, forms=sh.forms)
+        item = _path_item(fake, m, fill, None, rule, gradient, reason, detail, False)
+        if item is not None:
+            out.append(item)
+    out.sort(key=lambda it: it.z)
+    return out
+
+
+def _page_color(paths: list[_Path], spec: PageSpec, c: dict) -> tuple[Color | None, set[int]]:
+    """最底層的整頁色塊當成頁面底色（不輸出成形狀，也不從底圖隱藏）。最底層的整頁漸層留在底圖。"""
+    color: Color | None = None
+    taken: set[int] = set()
+    page_area = spec.aspect_ratio
+    drawn = False
+    for it in paths:
+        if it.reason is not None:
+            continue
+        full = it.kind == "rect" and (it.box[2] - it.box[0]) * (it.box[3] - it.box[1]) / page_area >= c["full_page_coverage"]
+        if full and not drawn and it.stroke is None and it.fill is not None:
+            if it.gradient is not None:
+                it.reason = "page_gradient"
+                continue
+            if it.fill.a >= 0.999:
+                color = it.fill
+                it.role = "page_color"
+                taken.add(it.z)
+                continue
+        drawn = True
+    return color, taken
+
+
+def _mark_covered(paths: list[_Path]) -> None:
+    """底圖永遠畫在最下面。留在底圖的物件原本若蓋在某條可讀路徑上面，把那條路徑取出來重畫就會反過來蓋住它，
+    畫面就錯了。所以這種路徑（繪製順序在前、外框與它相交）也留在底圖；連鎖下去直到沒有為止。"""
+    n = len(paths)
+    if not any(it.reason is not None for it in paths):
+        return
+    kept = np.zeros((n, 4))
+    count = 0
+    eps = 1e-5
+    for it in sorted(paths, key=lambda q: q.z, reverse=True):
+        if it.role == "page_color":
+            continue
+        if it.reason is None and count:
+            k = kept[:count]
+            if bool(np.any((k[:, 0] < it.vbox[2] - eps) & (k[:, 2] > it.vbox[0] + eps) & (k[:, 1] < it.vbox[3] - eps) & (k[:, 3] > it.vbox[1] + eps))):
+                it.reason = "covered"
+        if it.reason is not None:
+            kept[count] = it.vbox
+            count += 1
+
+
+def _leftover_note(paths: list[_Path]) -> str | None:
+    left = Counter(it.reason for it in paths if it.reason is not None)
+    if not left:
+        return None
+    parts = []
+    for code, n in left.most_common():
+        details = sorted({it.detail for it in paths if it.reason == code and it.detail})
+        parts.append(f"{_REASONS[code]} {n} 個" + (f"（{'；'.join(details)}）" if details else ""))
+    return f"有 {sum(left.values())} 個向量物件留在底圖中，不能個別編輯：{'、'.join(parts)}。"
+
+
+# ---------- s3.pdf_vectors：分群 ----------
+
+
+@dataclass
+class GlyphRow:
+    """一行疑似文字轉外框的字形。座標是頁面相對座標（y 向下）。"""
+
+    boxes: list[tuple[float, float, float, float]]  # 每個字形的外框（左、上、右、下），由左到右
+    owners: list[int]  # 每個字形來自第幾條路徑（傳入清單中的位置）
+    baseline: float  # 基線的 y
+    height: float  # 主要字形高度的中位數
+
+
+@dataclass
+class _Group:
+    """一個向量圖：屬於同一個圖形的路徑。"""
+
+    members: list[_Path]  # 依繪製順序
+    kind: str = "unknown"  # "unknown"、"outlined_text"
+    notes: list[str] = field(default_factory=list)
+
+
+def _contour_boxes(path: list[list[float]]) -> list[tuple[float, float, float, float]]:
+    """一條路徑裡每一圈（子路徑）的外框。"""
+    out: list[list[float]] = []
+    for sg in path:
+        if sg[0] == 3:
+            continue
+        if sg[0] == 0 or not out:
+            out.append([math.inf, math.inf, -math.inf, -math.inf])
+        b = out[-1]
+        for x, y in zip(sg[1::2], sg[2::2]):
+            b[0], b[1], b[2], b[3] = min(b[0], x), min(b[1], y), max(b[2], x), max(b[3], y)
+    return [tuple(b) for b in out if b[2] >= b[0]]
+
+
+def _glyph_blobs(path: list[list[float]]) -> list[tuple[float, float, float, float]]:
+    """把一條路徑拆成「字形」：去掉包在別圈裡面的圈（字的孔），再把水平位置重疊的圈併在一起（i 的點、上下結構）。
+    一條路徑只畫一個字時得到一個外框；整個詞或整行畫成一條路徑時得到好幾個。"""
+    boxes = _contour_boxes(path)
+    if len(boxes) <= 1:
+        return boxes
+    outer = [b for i, b in enumerate(boxes) if not any(j != i and o[0] <= b[0] and o[1] <= b[1] and o[2] >= b[2] and o[3] >= b[3] and (o != b or j < i) for j, o in enumerate(boxes))]
+    outer.sort()
+    merged: list[list[float]] = []
+    for b in outer:
+        if merged and b[0] <= merged[-1][2]:
+            last = merged[-1]
+            last[1], last[2], last[3] = min(last[1], b[1]), max(last[2], b[2]), max(last[3], b[3])
+        else:
+            merged.append(list(b))
+    return [tuple(b) for b in merged]
+
+
+def glyph_rows(paths: list[list[list[float]]], c: dict, suspected: bool = False, free: list[bool] | None = None) -> list[GlyphRow]:
+    """在一批填色路徑裡找「沿基線排成一行的小型字形」（疑似文字轉外框）。
+    paths 是每條路徑的線段（頁面相對座標，與 VectorPath.path 同一種編碼），所以也可以直接拿向量圖的路徑來用；
+    free 標出哪些是自由路徑（不是矩形、圓）：一行裡至少一半的字形要來自自由路徑，免得一排小方塊被當成字。
+    suspected 是①的旗標（整頁沒有文字但路徑很多）：這時門檻放寬。只找水平的行；直排與旋轉的文字找不到。"""
+    min_glyphs = int(c.get("pdf_outlined_min_glyphs_suspected", 3) if suspected else c.get("pdf_outlined_min_glyphs", 6))
+    aligned_share = 0.45 if suspected else float(c.get("pdf_outlined_aligned_share", 0.6))
+    max_gap = float(c.get("pdf_outlined_max_gap", 1.2))
+    max_height = float(c.get("pdf_outlined_max_height", 0.08))
+    blobs: list[tuple[float, float, float, float]] = []
+    owner: list[int] = []
+    for i, path in enumerate(paths):
+        for b in _glyph_blobs(path):
+            if b[2] - b[0] > 0 and b[3] - b[1] > 0 and b[3] - b[1] <= 2.5 * max_height:
+                blobs.append(b)
+                owner.append(i)
+    n = len(blobs)
+    if n < min_glyphs:
+        return []
+    order = sorted(range(n), key=lambda k: blobs[k][0])
+    arr = np.array([blobs[k] for k in order])
+    heights = arr[:, 3] - arr[:, 1]
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    # 左右相鄰、高度帶相容的字形連成一行：小的那個要落在大的那個上下各放寬三成的範圍裡
+    tallest_after = np.maximum.accumulate(heights[::-1])[::-1]  # 排在後面的字形裡最高的
+    for i in range(n - 1):
+        hi = int(np.searchsorted(arr[:, 0], arr[i, 2] + max_gap * max(heights[i], float(tallest_after[i + 1])), side="right"))
+        if hi <= i + 1:
+            continue
+        js = np.arange(i + 1, hi)
+        hb = np.maximum(heights[i], heights[js])
+        big_top = np.where(heights[js] > heights[i], arr[js, 1], arr[i, 1])
+        big_bottom = np.where(heights[js] > heights[i], arr[js, 3], arr[i, 3])
+        small_top = np.where(heights[js] > heights[i], arr[i, 1], arr[js, 1])
+        small_bottom = np.where(heights[js] > heights[i], arr[i, 3], arr[js, 3])
+        ok = (arr[js, 0] - arr[i, 2] <= max_gap * hb) & (small_top >= big_top - 0.3 * hb) & (small_bottom <= big_bottom + 0.3 * hb)
+        for j in js[ok]:
+            a, b = find(i), find(int(j))
+            if a != b:
+                parent[a] = b
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(i)
+    rows: list[GlyphRow] = []
+    for members in comps.values():
+        if len(members) < min_glyphs:
+            continue
+        idx = np.array(members)
+        h = heights[idx]
+        main = idx[h >= 0.45 * np.percentile(h, 90)]  # 主要字形（不含標點、i 的點）
+        if len(main) < max(3, 0.5 * len(idx)):
+            continue
+        hm = float(np.median(heights[main]))
+        if hm > max_height:
+            continue
+        widths = arr[main, 2] - arr[main, 0]
+        if float(np.mean(widths <= 2.5 * hm)) < 0.8:
+            continue  # 字形不會比字高寬很多；一排長條不是字
+        xs = arr[idx][np.argsort(arr[idx, 0])]
+        overlap = float(np.clip(xs[:-1, 2] - xs[1:, 0], 0, None).sum())
+        if overlap > 0.2 * float((xs[:, 2] - xs[:, 0]).sum()):
+            continue  # 字是一個接一個排的，不會大量左右重疊
+        bottoms, centers = arr[main, 3], (arr[main, 1] + arr[main, 3]) / 2
+        base = float(np.median(bottoms))
+        share = max(float(np.mean(np.abs(bottoms - base) <= 0.15 * hm)), float(np.mean(np.abs(centers - np.median(centers)) <= 0.15 * hm)))
+        if share < aligned_share:
+            continue  # 沒有沿著同一條基線（或同一條中線）排
+        if free is not None and sum(1 for k in main if free[owner[order[int(k)]]]) < 0.5 * len(main):
+            continue
+        by_x = sorted(members, key=lambda k: arr[k, 0])
+        rows.append(GlyphRow(boxes=[tuple(float(v) for v in arr[k]) for k in by_x], owners=[owner[order[k]] for k in by_x], baseline=base, height=hm))
+    return rows
+
+
+def _glyph_blocks(cands: list[_Path], c: dict, suspected: bool) -> list[tuple[list[_Path], int, int]]:
+    """疑似文字轉外框的路徑 → 文字區塊。回傳每個區塊的（路徑、行數、字形數）。"""
+    max_side = 10.0  # 基本形狀要當成字形（I、l、句點），長邊不能超過短邊這麼多倍：表格線與底線不算
+    pool = []
+    for it in cands:
+        if it.fill is None or it.stroke is not None or it.gradient is not None or it.kind not in ("free", "rect", "ellipse"):
+            continue
+        w, h = it.box[2] - it.box[0], it.box[3] - it.box[1]
+        if it.kind != "free" and max(w, h) > max_side * max(min(w, h), 1e-12):
+            continue
+        pool.append(it)
+    if not pool:
+        return []
+    rows = glyph_rows([it.rel for it in pool], c, suspected, free=[it.kind == "free" for it in pool])
+    if not rows:
+        return []
+    # 一條路徑的字形要大多落在合格的行裡，才算文字
+    total = Counter()
+    for i, it in enumerate(pool):
+        total[i] = len(_glyph_blobs(it.rel))
+    in_rows = Counter(o for row in rows for o in row.owners)
+    texty = {i for i in in_rows if in_rows[i] >= 0.8 * max(total[i], 1)}
+    rows = [row for row in rows if sum(1 for o in row.owners if o in texty) >= 0.8 * len(row.owners)]
+    if not rows:
+        return []
+    # 行 → 區塊：上下相鄰（基線距離不超過幾倍字高）、字高相近、左右有重疊的行是同一塊；同一條基線上隔開的片段也是
+    pitch = float(c.get("pdf_outlined_line_pitch", 3.2))
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    ext = [(min(b[0] for b in r.boxes), max(b[2] for b in r.boxes)) for r in rows]
+    for i, a in enumerate(rows):
+        for j in range(i + 1, len(rows)):
+            b = rows[j]
+            hm = max(a.height, b.height)
+            if hm > 1.5 * min(a.height, b.height):
+                continue
+            gap_x = max(ext[i][0], ext[j][0]) - min(ext[i][1], ext[j][1])  # 負的表示左右有重疊
+            dy = abs(a.baseline - b.baseline)
+            if (dy <= pitch * hm and gap_x <= 0) or (dy <= 0.25 * hm and gap_x <= 4 * hm):
+                parent[find(i)] = find(j)
+    first_row: dict[int, int] = {}
+    for i, row in enumerate(rows):  # 同一條路徑橫跨好幾行（整段畫成一條路徑）
+        for o in row.owners:
+            if o in first_row:
+                parent[find(i)] = find(first_row[o])
+            else:
+                first_row[o] = i
+    blocks: dict[int, list[int]] = {}
+    for i in range(len(rows)):
+        blocks.setdefault(find(i), []).append(i)
+    out = []
+    for members in blocks.values():
+        owners = sorted({o for i in members for o in rows[i].owners if o in texty})
+        glyphs = sum(len(rows[i].owners) for i in members)
+        if owners:
+            out.append(([pool[o] for o in owners], len(members), glyphs))
+    return out
+
+
+def _components(boxes: np.ndarray, gap_abs: float, gap_ratio: float) -> list[list[int]]:
+    """外框相交、或相距不超過 max(gap_abs, gap_ratio × 兩者中較小者的長邊) 的連在一起。回傳各群的成員位置。"""
+    n = len(boxes)
+    if n <= 1:
+        return [[i] for i in range(n)]
+    order = np.argsort(boxes[:, 0], kind="stable")
+    b = boxes[order]
+    size = np.maximum(b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n - 1):
+        hi = int(np.searchsorted(b[:, 0], b[i, 2] + max(gap_abs, gap_ratio * size[i]), side="right"))
+        if hi <= i + 1:
+            continue
+        js = np.arange(i + 1, hi)
+        g = np.maximum(gap_abs, gap_ratio * np.minimum(size[i], size[js]))
+        ok = (b[js, 0] <= b[i, 2] + g) & (b[js, 1] <= b[i, 3] + g) & (b[i, 1] <= b[js, 3] + g)
+        for j in js[ok]:
+            x, y = find(i), find(int(j))
+            if x != y:
+                parent[x] = y
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(int(order[i]))
+    return list(comps.values())
+
+
+class _Drawn:
+    """頁面上所有「會被取出來、各自疊在底圖上」的物件（文字、圖片、可讀的路徑），依繪製順序排好。
+    用來檢查一群路徑合成一個向量圖之後，前後順序還對不對。"""
+
+    def __init__(self, paths: list[_Path], others: list[tuple[int, tuple[float, float, float, float]]]):
+        items = [(it.z, it.vbox, it) for it in paths if it.reason is None and it.role != "page_color"] + [(z, box, None) for z, box in others]
+        items.sort(key=lambda q: q[0])
+        self.z = np.array([q[0] for q in items], dtype=np.int64)
+        self.box = np.array([q[1] for q in items], dtype=float).reshape(-1, 4)
+        self.path: list[_Path | None] = [q[2] for q in items]
+
+
+def _settle_order(clusters: list[list[_Path]], drawn: _Drawn, taken: set[int], c: dict, recluster: bool) -> list[list[_Path]]:
+    """一群路徑合成一個向量圖後，整群只佔一個繪製順序（最底下那條的）。如果有別的物件原本夾在這群中間、
+    而且被群裡「畫在它後面」的路徑蓋到，合起來之後它就會跑到整群上面，畫面就錯了。處理方式：
+      夾在中間的是比整群小的矩形、圓、直線 → 算進這一群（它本來就是圖的一部分）；
+      其他（文字、圖片、大色塊、別群的路徑）→ 從那裡把群切開，各自重新分群。"""
+    gap_abs = float(c.get("pdf_vector_join_gap", 0.002))
+    gap_ratio = float(c.get("pdf_vector_join_gap_ratio", 0.1))
+    max_area = float(c.get("pdf_vector_absorb_max_area", 0.6))
+    eps = 1e-5
+    done: list[list[_Path]] = []
+    work = [list(cl) for cl in clusters]
+    while work:
+        members = sorted(work.pop(), key=lambda it: it.z)
+        while True:
+            zs = np.array([it.z for it in members], dtype=np.int64)
+            boxes = np.array([it.vbox for it in members], dtype=float)
+            lo, hi = int(np.searchsorted(drawn.z, zs[0], side="right")), int(np.searchsorted(drawn.z, zs[-1], side="left"))
+            own = set(int(v) for v in zs)
+            conflicts = []
+            for k in range(lo, hi):
+                fz = int(drawn.z[k])
+                if fz in own:
+                    continue
+                fb = drawn.box[k]
+                above = zs > fz
+                if bool(np.any(above & (boxes[:, 0] < fb[2] - eps) & (boxes[:, 2] > fb[0] + eps) & (boxes[:, 1] < fb[3] - eps) & (boxes[:, 3] > fb[1] + eps))):
+                    conflicts.append(k)
+            if not conflicts:
+                done.append(members)
+                break
+            l, t, r, b = boxes[:, 0].min(), boxes[:, 1].min(), boxes[:, 2].max(), boxes[:, 3].max()
+            area = max((r - l) * (b - t), 1e-12)
+            absorbed = []
+            for k in conflicts:
+                it = drawn.path[k]
+                if it is None or it.kind not in _PRIMITIVES or it.glyph or it.z in taken or it.gradient is not None:
+                    continue
+                v = it.vbox
+                if v[0] >= l - gap_abs and v[1] >= t - gap_abs and v[2] <= r + gap_abs and v[3] <= b + gap_abs and (v[2] - v[0]) * (v[3] - v[1]) <= max_area * area:
+                    absorbed.append(it)
+            if absorbed:
+                members = sorted(members + absorbed, key=lambda it: it.z)
+                taken.update(it.z for it in absorbed)
+                continue
+            cuts = sorted(int(drawn.z[k]) for k in conflicts)
+            parts: list[list[_Path]] = [[] for _ in range(len(cuts) + 1)]
+            for it in members:
+                parts[int(np.searchsorted(cuts, it.z))].append(it)
+            for part in parts:
+                if not part:
+                    continue
+                if recluster and len(part) > 1:
+                    for comp in _components(np.array([it.box for it in part], dtype=float), gap_abs, gap_ratio):
+                        work.append([part[i] for i in comp])
+                else:
+                    work.append(part)
+            break
+    return done
+
+
+def _needs_vector(it: _Path, c: dict) -> bool:
+    """形狀（ShapeElement）表示不了、只能放進向量圖的路徑：漸層填色，或線段太多的自由路徑。"""
+    return it.gradient is not None or (it.kind == "free" and len(it.segs) > c.get("max_path_segments", 400))
+
+
+def _group_paths(paths: list[_Path], reader: pdf.PageReader, m: list[float], c: dict, suspected: bool) -> list[_Group]:
+    """把屬於同一個圖形的路徑分群。規則（門檻都在設定檔）：
+      1. 只有「自由路徑」（不是矩形、圓角矩形、橢圓、直線）會帶頭成群；外框相交或很靠近的連成一群。
+         矩形、直線這些基本形狀不會因為靠近就被吸進來，所以表格格線、文字的底線與框、色塊都維持是形狀。
+      2. 疑似文字轉外框的路徑先挑出來，自己成群（kind 為 outlined_text），不和插畫混在一起。
+      3. 合成一群後前後順序不能錯（見 _settle_order）：中間被文字或圖片隔開的群會被切開。
+      4. 一群至少要有 pdf_vector_min_paths 條路徑、pdf_vector_min_segments 段線段才算向量圖；
+         不夠的（單獨的箭頭、三角形）照舊各自變成形狀。形狀表示不了的路徑（漸層、線段太多）單獨一條也成一個向量圖。
+      5. 零散的自由路徑如果多到超過 max_vector_paths，不各自變成形狀，依繪製順序合成向量圖。"""
+    cands = [it for it in paths if it.reason is None and it.role == ""]
+    if not cands:
+        return []
+    others = [(z, _rel_box(m, *box)) for z, box in reader.object_bounds(("text", "image"))]
+    drawn = _Drawn(paths, others)
+    taken: set[int] = set()
+    groups: list[_Group] = []
+
+    # 2. 文字轉外框
+    for block, n_rows, n_glyphs in _glyph_blocks(cands, c, suspected):
+        for it in block:
+            it.glyph = True
+        taken.update(it.z for it in block)
+        for part in _settle_order([block], drawn, taken, c, recluster=False):
+            groups.append(_Group(members=part, kind="outlined_text", notes=[
+                f"疑似文字轉成的外框（約 {n_rows} 行、{n_glyphs} 個字形）：目前是向量圖，可以改形狀與顏色，還不能當文字編輯。"
+            ]))
+
+    # 1、3、4. 一般圖形
+    gap_abs = float(c.get("pdf_vector_join_gap", 0.002))
+    gap_ratio = float(c.get("pdf_vector_join_gap_ratio", 0.1))
+    min_paths = int(c.get("pdf_vector_min_paths", 3))
+    min_segments = int(c.get("pdf_vector_min_segments", 24))
+    free = [it for it in cands if it.kind == "free" and not it.glyph]
+    clusters = [[free[i] for i in comp] for comp in _components(np.array([it.box for it in free], dtype=float).reshape(-1, 4), gap_abs, gap_ratio)] if free else []
+    taken.update(it.z for it in free)
+    in_graphic: set[int] = set(it.z for g in groups for it in g.members)
+    for members in _settle_order(clusters, drawn, taken, c, recluster=True):
+        enough = len(members) >= min_paths and sum(len(it.segs) for it in members) >= min_segments
+        if enough or any(_needs_vector(it, c) for it in members):
+            groups.append(_Group(members=members))
+            in_graphic.update(it.z for it in members)
+    for it in cands:  # 形狀表示不了的基本形狀（漸層填色的矩形、圓）：單獨成一個向量圖
+        if it.z not in in_graphic and it.kind != "free" and _needs_vector(it, c):
+            groups.append(_Group(members=[it]))
+            in_graphic.add(it.z)
+
+    # 5. 零散的自由路徑太多
+    loose = [it for it in free if it.z not in in_graphic]
+    if len(loose) > c.get("max_vector_paths", 300):
+        for part in _settle_order([loose], drawn, taken, c, recluster=False):
+            if len(part) >= 2:
+                groups.append(_Group(members=part, notes=[f"這 {len(part)} 條零散的路徑數量太多，不適合各自變成形狀，依繪製順序合成一個向量圖。"]))
+                in_graphic.update(it.z for it in part)
+    for g in groups:
+        g.members.sort(key=lambda it: it.z)
+        for it in g.members:
+            it.role = "vector"
+    groups.sort(key=lambda g: g.members[0].z)
+    return groups
+
+
+# ---------- s3.pdf_vectors：轉成向量圖 ----------
+
+
+def _cubic_split(p0, p1, p2, p3, t: float):
+    """三次貝茲在 t 切成兩段（de Casteljau，精確）。"""
+    def mix(a, b):
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+    a, b, cc = mix(p0, p1), mix(p1, p2), mix(p2, p3)
+    d, e = mix(a, b), mix(b, cc)
+    f = mix(d, e)
+    return (p0, a, d, f), (f, e, cc, p3)
+
+
+_GAUSS = ((-0.9061798459386640, 0.2369268850561891), (-0.5384693101056831, 0.4786286704993665), (0.0, 0.5688888888888889),
+          (0.5384693101056831, 0.4786286704993665), (0.9061798459386640, 0.2369268850561891))
+
+
+def _cubic_length(p0, p1, p2, p3, t1: float = 1.0, depth: int = 4) -> float:
+    """三次貝茲從 0 到 t1 的弧長（分段高斯積分）。"""
+    n = 1 << depth
+    total = 0.0
+    for k in range(n):
+        a, b = t1 * k / n, t1 * (k + 1) / n
+        half, mid = (b - a) / 2, (a + b) / 2
+        for x, w in _GAUSS:
+            t = mid + half * x
+            mt = 1 - t
+            dx = 3 * (mt * mt * (p1[0] - p0[0]) + 2 * mt * t * (p2[0] - p1[0]) + t * t * (p3[0] - p2[0]))
+            dy = 3 * (mt * mt * (p1[1] - p0[1]) + 2 * mt * t * (p2[1] - p1[1]) + t * t * (p3[1] - p2[1]))
+            total += w * half * math.hypot(dx, dy)
+    return total
+
+
+def _dash_path(path: list[list[float]], dash: list[float], phase: float) -> list[list[float]]:
+    """把虛線展開成一段一段的實線（資料格式沒有虛線欄位）。每一段都是原路徑的一部分：直線精確，
+    曲線用 de Casteljau 切開（切點的位置由弧長數值求出）。每一圈（子路徑）各自從虛線樣式的起點算起。"""
+    pattern = [abs(d) for d in dash]
+    if len(pattern) % 2:
+        pattern = pattern * 2
+    if not pattern or sum(pattern) <= 1e-12:
+        return path
+    out: list[list[float]] = []
+    pieces: list[tuple] = []  # 目前這一圈的線段：("L", p0, p1) 或 ("C", p0, p1, p2, p3)
+    start = cur = None
+
+    def flush() -> None:
+        nonlocal pieces
+        idx, on, left = 0, True, pattern[0]
+        skip = phase % sum(pattern)
+        while skip > 0:  # 相位：先走掉樣式的前面一段
+            step = min(skip, left)
+            skip -= step
+            left -= step
+            if left <= 1e-12:
+                idx = (idx + 1) % len(pattern)
+                on, left = not on, pattern[idx]
+        pen_down = False
+        for piece in pieces:
+            length = math.hypot(piece[2][0] - piece[1][0], piece[2][1] - piece[1][1]) if piece[0] == "L" else _cubic_length(*piece[1:])
+            pos = 0.0
+            rest = piece
+            while length - pos > 1e-12:
+                step = min(left, length - pos)
+                if rest[0] == "L":
+                    t = step / max(length - pos, 1e-18)
+                    a, b = rest[1], rest[2]
+                    mid = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t) if t < 1 else b
+                    head, rest = ("L", a, mid), ("L", mid, b)
+                else:
+                    if step >= length - pos - 1e-12:
+                        head, rest = rest, ("C", rest[4], rest[4], rest[4], rest[4])
+                    else:
+                        lo, hi = 0.0, 1.0
+                        for _ in range(40):  # 二分法找「弧長剛好是 step」的參數
+                            mid_t = (lo + hi) / 2
+                            if _cubic_length(*rest[1:], t1=mid_t, depth=3) < step:
+                                lo = mid_t
+                            else:
+                                hi = mid_t
+                        first, second = _cubic_split(*rest[1:], (lo + hi) / 2)
+                        head, rest = ("C", *first), ("C", *second)
+                if on:
+                    if not pen_down:
+                        out.append([0, head[1][0], head[1][1]])
+                        pen_down = True
+                    if head[0] == "L":
+                        out.append([1, head[2][0], head[2][1]])
+                    else:
+                        out.append([2, head[2][0], head[2][1], head[3][0], head[3][1], head[4][0], head[4][1]])
+                pos += step
+                left -= step
+                if left <= 1e-12:
+                    idx = (idx + 1) % len(pattern)
+                    on, left = not on, pattern[idx]
+                    pen_down = False
+                    if on and left <= 1e-12 and length - pos > 1e-12:  # 長度為零的實線段（圓頭線帽會畫成圓點）
+                        pt = rest[1]
+                        out.append([0, pt[0], pt[1]])
+                        out.append([1, pt[0], pt[1]])
+        pieces = []
+
+    for sg in path:
+        if sg[0] == 0:
+            flush()
+            start = cur = (sg[1], sg[2])
+        elif sg[0] == 1 and cur is not None:
+            pieces.append(("L", cur, (sg[1], sg[2])))
+            cur = (sg[1], sg[2])
+        elif sg[0] == 2 and cur is not None:
+            pieces.append(("C", cur, (sg[1], sg[2]), (sg[3], sg[4]), (sg[5], sg[6])))
+            cur = (sg[5], sg[6])
+        elif sg[0] == 3 and cur is not None and start is not None:
+            if math.hypot(cur[0] - start[0], cur[1] - start[1]) > 1e-12:
+                pieces.append(("L", cur, start))
+            cur = start
+    flush()
+    return out
+
+
+def _primitive(it: _Path, m: list[float], src_w: float) -> VectorPrimitive | None:
+    """這條路徑其實是哪一種基本圖形（頁面相對座標）。給輸出器寫成好編輯的 <rect>、<circle> 等。"""
+    if it.kind in ("rect", "ellipse", "rrect"):
+        l, b, r, t = it.geom[0] if it.kind == "rrect" else it.geom
+        x0, y0, x1, y1 = _rel_box(m, l, b, r, t)
+        w, h = x1 - x0, y1 - y0
+        if it.kind == "rect":
+            return VectorPrimitive(kind="rect", cx=(x0 + x1) / 2, cy=(y0 + y1) / 2, w=w, h=h)
+        if it.kind == "rrect":
+            return VectorPrimitive(kind="rounded_rect", cx=(x0 + x1) / 2, cy=(y0 + y1) / 2, w=w, h=h, corner_radius=it.geom[1] / src_w)
+        return VectorPrimitive(kind="circle" if abs(w - h) <= 1e-3 * max(w, h) else "ellipse", cx=(x0 + x1) / 2, cy=(y0 + y1) / 2, w=w, h=h)
+    if it.kind == "line":
+        (xa, ya), (xb, yb) = it.rel[0][1:3], it.rel[1][1:3]
+        return VectorPrimitive(kind="line", cx=(xa + xb) / 2, cy=(ya + yb) / 2, w=math.hypot(xb - xa, yb - ya), h=0.0, angle_deg=math.degrees(math.atan2(yb - ya, xb - xa)))
+    body = [sg for sg in it.rel if sg[0] != 3]
+    if len(body) >= 3 and body[0][0] == 0 and all(sg[0] == 1 for sg in body[1:]) and it.rel[-1][0] == 3:
+        pts = [[sg[1], sg[2]] for sg in body]
+        if math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) <= 1e-9:
+            pts = pts[:-1]
+        if len(pts) >= 3:
+            xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+            return VectorPrimitive(kind="polygon", cx=(min(xs) + max(xs)) / 2, cy=(min(ys) + max(ys)) / 2, w=max(xs) - min(xs), h=max(ys) - min(ys), points=pts)
+    return None
+
+
+def _vector_paths(it: _Path, m: list[float], src_w: float, hairline: float, remarks: Counter) -> list[VectorPath]:
+    """一條路徑 → 向量圖裡的路徑（幾何、填色、填色規則、筆畫、線帽、接合、不透明度都照原樣）。"""
+    raw_path = it.raw
+    gradient = None
+    if it.gradient is not None:
+        g = it.gradient
+        if g.kind == "linear":
+            a, b = to_point(m, g.coords[0], g.coords[1]), to_point(m, g.coords[2], g.coords[3])
+            coords = [a.x, a.y, b.x, b.y]
+        else:
+            center = to_point(m, g.coords[0], g.coords[1])
+            coords = [center.x, center.y, g.coords[2] / src_w]
+        gradient = Gradient(kind=g.kind, coords=coords, stops=[GradientStop(offset=t, color=Color(r=col[0], g=col[1], b=col[2], a=it.fill.a if it.fill else 1.0)) for t, col in g.stops])
+        remarks["gradient"] += 1
+    width = None
+    if it.stroke is not None:
+        width = raw_path.stroke_width / src_w
+        if width <= 0:
+            width = hairline  # 寬度 0 在 PDF 裡是「裝置上最細的線」
+            remarks["hairline"] += 1
+        if not raw_path.uniform_scale:
+            remarks["nonuniform"] += 1
+    prim = _primitive(it, m, src_w)
+    if it.stroke is not None and raw_path.dash:
+        remarks["dash"] += 1
+        out = []
+        if it.fill is not None:
+            out.append(VectorPath(path=it.rel, fill=it.fill, fill_rule=it.fill_rule, gradient=gradient, primitive=prim))
+        dashed = _dash_path(it.rel, [d / src_w for d in raw_path.dash], raw_path.dash_phase / src_w)
+        out.append(VectorPath(path=dashed, stroke=it.stroke, stroke_width=width, stroke_cap=raw_path.stroke_cap, stroke_join=raw_path.stroke_join))
+        return out
+    return [VectorPath(
+        path=it.rel, fill=it.fill, fill_rule=it.fill_rule if it.fill is not None else "nonzero", gradient=gradient, stroke=it.stroke, stroke_width=width,
+        stroke_cap=raw_path.stroke_cap if it.stroke is not None else "butt", stroke_join=raw_path.stroke_join if it.stroke is not None else "miter", primitive=prim,
+    )]
+
+
+_REMARKS = {
+    "gradient": "含 {n} 個漸層填色（不支援漸層的輸出格式會改用平均色）。",
+    "dash": "有 {n} 條虛線已展開成一段一段的實線（資料格式沒有虛線欄位），畫面相同，但改線型時要整條重設。",
+    "hairline": "有 {n} 條寬度為 0 的極細線，以一個像素的寬度輸出。",
+    "nonuniform": "有 {n} 條筆畫被非等比縮放（原本各方向粗細不同），寬度取平均值。",
+}
+
+
+def _vector_graphics(groups: list[_Group], reader: pdf.PageReader, spec: PageSpec, src_w: float, c: dict, store: Store, notes: list[str]) -> tuple[list[VectorGraphic], list[ImageElement], set[int]]:
+    """每一群 → 一個向量圖（精確擷取）加一張對應的圖片：只畫這一群物件、透明底。兩者的位置與圖層相同。
+    回傳（向量圖、對應的圖片、已取出的物件）。"""
+    step = f"{NAME}.pdf_vectors@{VERSION}"
+    m = spec.source_to_page
+    aspect = spec.aspect_ratio
+    base_dpi = float(c.get("pdf_vector_raster_dpi", 300))
+    max_pixels = float(c.get("pdf_vector_raster_max_pixels", 8_000_000))
+    hairline = 1.0 / max(spec.working_image_size[0], 1)
+    jobs = []
+    for g in groups:
+        l = max(min(it.vbox[0] for it in g.members), 0.0)
+        t = max(min(it.vbox[1] for it in g.members), 0.0)
+        r = min(max(it.vbox[2] for it in g.members), 1.0)
+        b = min(max(it.vbox[3] for it in g.members), aspect)
+        if r <= l or b <= t:  # 整群在頁面外：看不到，不輸出
+            for it in g.members:
+                it.role = "offpage"
+            continue
+        dpi = base_dpi
+        w, h = reader.render_size(dpi)
+        area = (r - l) * w * (b - t) / aspect * h
+        if area > max_pixels:  # 太大的圖降低解析度，免得一張圖幾千萬像素
+            dpi = dpi * math.sqrt(max_pixels / area)
+            w, h = reader.render_size(dpi)
+        box = (max(math.floor(l * w) - 1, 0), max(math.floor(t / aspect * h) - 1, 0), min(math.ceil(r * w) + 1, w), min(math.ceil(b / aspect * h) + 1, h))
+        jobs.append((g, dpi, box, (w, h)))
+    rendered = reader.render_only([({it.z for it in g.members}, dpi, box) for g, dpi, box, _ in jobs]) if jobs else []
+    vectors: list[VectorGraphic] = []
+    images: list[ImageElement] = []
+    taken: set[int] = set()
+    outlined = 0
+    for (g, dpi, box, (w, h)), bitmap in zip(jobs, rendered):
+        if not np.asarray(bitmap)[..., 3].any():  # 畫出來是空的（例如完全透明）：不輸出
+            for it in g.members:
+                it.role = "offpage"
+            continue
+        quad = Quad.from_rect(box[0] / w, box[1] / h * aspect, box[2] / w, box[3] / h * aspect)
+        blob = store.put_blob(_png(bitmap), "image/png", "png")
+        z = g.members[0].z
+        image = ImageElement(id=make_element_id(spec.page_index, "img", quad, blob.sha256[:12]), quad=quad, z=z, image=blob, pixel_size=bitmap.size, kind=exact(ImageKind.ILLUSTRATION, step))
+        remarks: Counter = Counter()
+        vpaths = [vp for it in g.members for vp in _vector_paths(it, m, src_w, hairline, remarks)]
+        vectors.append(VectorGraphic(
+            id=make_element_id(spec.page_index, "vec", quad, f"{len(vpaths)}:{blob.sha256[:12]}"), image_id=image.id, quad=quad, z=z, paths=vpaths,
+            origin=exact("pdf_paths", step), kind=g.kind, notes=g.notes + [_REMARKS[k].format(n=n) for k, n in remarks.items()],
+        ))
+        images.append(image)
+        taken.update(it.z for it in g.members)
+        outlined += g.kind == "outlined_text"
+    if outlined:
+        notes.append(f"這一頁有 {outlined} 組疑似轉成外框的文字，先保留成向量圖（可以改形狀與顏色），還不能當文字編輯。")
+    return vectors, images, taken
+
+
+# ---------- s3.pdf_shapes ----------
+
+
+def _shapes(paths: list[_Path], spec: PageSpec, m: list[float], src_w: float, notes: list[str]) -> tuple[list[ShapeElement], set[int]]:
+    """沒有成群的可讀路徑 → 形狀。矩形、圓角矩形、橢圓、直線認成基本幾何；其他的保留成自訂路徑。
+    回傳（形狀、已取出的物件）。留在底圖的物件在這裡彙整成一則備註。"""
     out: list[ShapeElement] = []
     taken: set[int] = set()
-    page_color: Color | None = None
-    page_color_z: set[int] = set()
-    page_area = spec.aspect_ratio
-    paths = reader.paths()
-    tol = 0.02
-    max_paths = c.get("max_vector_paths", 300)
-    max_segs = c.get("max_path_segments", 400)
-    complex_paths = [p for p in paths if (p.fill or p.stroke) and _rect_of(p, tol) is None and len(p.points) > 2]
-    allow_free = len(complex_paths) <= max_paths
-    leftover = 0
 
     def rel_quad(l: float, b: float, r: float, t: float) -> Quad:
         a, bq = to_point(m, l, t), to_point(m, r, b)
         return Quad.from_rect(min(a.x, bq.x), min(a.y, bq.y), max(a.x, bq.x), max(a.y, bq.y))
 
-    for p in paths:
-        fill, stroke = _color(p.fill), _color(p.stroke)
-        if fill is None and stroke is None:
+    for it in paths:
+        if it.reason is not None or it.role != "":
             continue
+        p, fill, stroke = it.raw, it.fill, it.stroke
         sw = (p.stroke_width / src_w) if stroke else None
-        rect = _rect_of(p, tol=tol)
-        segs = _segments(p)
         key_col = f"{fill.hex if fill else ''}:{stroke.hex if stroke else ''}"
-        if rect is not None:
-            q = rel_quad(*rect)
-            full = (q.width * q.height) / page_area >= c["full_page_coverage"]
-            if full and fill is not None and fill.a >= 0.999 and not out and stroke is None:
-                page_color = fill  # 最底層的整頁色塊：當成頁面底色，不輸出成形狀
-                page_color_z.add(p.z)
-                continue
+        if it.kind == "rect":
+            q = rel_quad(*it.geom)
             out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"rect:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.RECT, fill=fill, stroke=stroke, stroke_width=sw))
-            taken.add(p.z)
-            continue
-        if len(p.points) == 2 and stroke is not None and all(pt[0] != SEG_BEZIERTO for pt in p.points):
+        elif it.kind == "line":
             a, bq = to_point(m, p.points[0][1], p.points[0][2]), to_point(m, p.points[1][1], p.points[1][2])
             q = Quad(tl=a, tr=bq, br=bq, bl=a)
             out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"line:{stroke.hex}"), quad=q, z=p.z, geometry=ShapeGeometry.LINE, stroke=stroke, stroke_width=sw))
-            taken.add(p.z)
-            continue
-        ell = _ellipse_of(segs, tol)
-        if ell is not None:
-            q = rel_quad(*ell)
+        elif it.kind == "ellipse":
+            q = rel_quad(*it.geom)
             out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"ellipse:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.ELLIPSE, fill=fill, stroke=stroke, stroke_width=sw))
-            taken.add(p.z)
-            continue
-        rr = _rounded_rect_of(segs, tol)
-        if rr is not None:
-            q = rel_quad(*rr[0])
-            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"rrect:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.ROUNDED_RECT, fill=fill, stroke=stroke, stroke_width=sw, corner_radius=rr[1] / src_w))
-            taken.add(p.z)
-            continue
-        if allow_free and len(segs) <= max_segs:
-            rel: list[list[float]] = []
-            for sg in segs:
-                if sg[0] == 3:
-                    rel.append([3])
-                    continue
-                coords = []
-                for x, y in zip(sg[1::2], sg[2::2]):
-                    pt = to_point(m, x, y)
-                    coords += [pt.x, pt.y]
-                rel.append([sg[0]] + coords)
+        elif it.kind == "rrect":
+            q = rel_quad(*it.geom[0])
+            out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"rrect:{key_col}"), quad=q, z=p.z, geometry=ShapeGeometry.ROUNDED_RECT, fill=fill, stroke=stroke, stroke_width=sw, corner_radius=it.geom[1] / src_w))
+        else:
+            rel = it.rel
             xs = [v for sg in rel if sg[0] != 3 for v in sg[1::2]]
             ys = [v for sg in rel if sg[0] != 3 for v in sg[2::2]]
-            if not xs or (max(xs) - min(xs)) + (max(ys) - min(ys)) <= 1e-6:
+            if (max(xs) - min(xs)) + (max(ys) - min(ys)) <= 1e-6:
                 continue
             q = Quad.from_rect(min(xs), min(ys), max(xs), max(ys))
             out.append(ShapeElement(id=make_element_id(spec.page_index, "shp", q, f"path:{key_col}:{len(rel)}:{round(xs[0], 5)}"), quad=q, z=p.z, geometry=ShapeGeometry.PATH, fill=fill, stroke=stroke, stroke_width=sw, path=rel))
-            taken.add(p.z)
-            continue
-        leftover += 1
-    if leftover:
-        notes.append(f"有 {leftover} 個向量圖形太複雜，沒有轉成可編輯形狀，已留在底圖中。")
-    return out, taken, page_color, page_color_z
+        taken.add(p.z)
+    note = _leftover_note(paths)
+    if note:
+        notes.append(note)
+    return out, taken
 
 
 # ---------- s3.tables ----------

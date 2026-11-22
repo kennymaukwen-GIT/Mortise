@@ -1,6 +1,7 @@
 """產生測試用的原生 PDF（內容與設定都已知，可當標準答案）。需要 LibreOffice。
 
-    python tests/fixtures/make_fixtures.py
+    python tests/fixtures/make_fixtures.py            全部重新產生
+    python tests/fixtures/make_fixtures.py vectors    只產生向量圖的三個（vector_*.pdf；不需要 LibreOffice，輸出的位元組固定）
 """
 
 from __future__ import annotations
@@ -225,9 +226,408 @@ def deck() -> None:
     path.unlink()
 
 
+# ====================================================================== 向量圖的 fixture
+#
+# 三個檔的內容與預期結果（tests/test_native_vectors.py 逐項檢查）：
+#   vector_logo.pdf     多路徑標誌（帶孔、筆畫樣式、半透明、虛線、夾在中間的矩形）、巢狀表單裡的標誌、
+#                       被文字隔開的圖形、單獨的形狀、三個箭頭、表格、底線與文字框
+#   vector_paint.pdf    漸層（花紋填色、sh 運算子、表單內）、讀不出來的東西（非線性漸層、花紋、混合模式、
+#                       透明遮罩、裁切、透明群組）、被蓋住的路徑、可以化簡的裁切
+#   vector_outlined.pdf 文字轉外框（一字一條路徑、整段一條路徑）、緊鄰的插畫、超過數量上限的密集插畫
+
+_SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+_SANS_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+
+
+def _vector_canvas(name: str, size: tuple[float, float]):
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.pdfgen import canvas
+
+    for font, path in (("LS", _SANS), ("LSB", _SANS_BOLD)):
+        pdfmetrics.registerFont(TTFont(font, path))
+    c = canvas.Canvas(str(HERE / name), pagesize=size, invariant=1)  # invariant：不寫日期與隨機編號，輸出固定
+    c.setTitle(name.removesuffix(".pdf"))
+    return c
+
+
+def _poly(c, pts, close=True):
+    p = c.beginPath()
+    p.moveTo(*pts[0])
+    for x, y in pts[1:]:
+        p.lineTo(x, y)
+    if close:
+        p.close()
+    return p
+
+
+def vector_logo() -> None:
+    """標誌與一般形狀同頁：標誌要成為向量圖，其他的維持是形狀、表格、文字。"""
+    import math
+
+    from reportlab.lib.colors import Color, HexColor
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("vector_logo.pdf", (w, h))
+    c.setFillColor(HexColor("#1F3A5F"))
+    c.setFont("LSB", 20)
+    c.drawString(60, 790, "Vector logo fixture")
+
+    # ---- 標誌 A：八條路徑疊在一起（盾、環、小方塊、菱形、波浪線、鋸齒線、半透明色塊、虛線）
+    p = c.beginPath()  # 盾
+    p.moveTo(70, 740)
+    p.curveTo(110, 750, 150, 750, 190, 740)
+    p.lineTo(190, 670)
+    p.curveTo(190, 630, 150, 610, 130, 600)
+    p.curveTo(110, 610, 70, 630, 70, 670)
+    p.close()
+    c.setFillColor(HexColor("#1F3A5F"))
+    c.drawPath(p, stroke=0, fill=1)
+    p = c.beginPath()  # 環：兩個同方向的圓，用奇偶規則挖孔
+    p.circle(130, 690, 34)
+    p.circle(130, 690, 20)
+    c.setFillColor(HexColor("#F2C14E"))
+    c.drawPath(p, stroke=0, fill=1, fillMode=0)
+    c.setFillColor(HexColor("#C8553D"))  # 小方塊：基本形狀，夾在標誌中間
+    c.rect(124, 684, 12, 12, stroke=0, fill=1)
+    p = _poly(c, [(130, 712), (152, 690), (130, 668), (108, 690)])  # 菱形：內圈反方向，用非零規則挖孔
+    p.moveTo(130, 702)
+    for x, y in [(118, 690), (130, 678), (142, 690)]:
+        p.lineTo(x, y)
+    p.close()
+    c.setFillColor(HexColor("#2E86AB"))
+    c.drawPath(p, stroke=0, fill=1, fillMode=1)
+    c.setStrokeColor(HexColor("#E86A33"))  # 波浪線：圓頭、圓角
+    c.setLineWidth(4)
+    c.setLineCap(1)
+    c.setLineJoin(1)
+    p = c.beginPath()
+    p.moveTo(80, 655)
+    p.curveTo(95, 670, 110, 640, 125, 655)
+    p.curveTo(140, 670, 155, 640, 180, 655)
+    c.drawPath(p, stroke=1, fill=0)
+    c.setStrokeColor(HexColor("#2B2D42"))  # 鋸齒線：方頭、斜角
+    c.setLineWidth(3)
+    c.setLineCap(2)
+    c.setLineJoin(2)
+    c.drawPath(_poly(c, [(85, 625), (100, 640), (115, 625), (130, 640), (145, 625), (160, 640), (175, 625)], close=False), stroke=1, fill=0)
+    c.setLineCap(0)
+    c.setLineJoin(0)
+    c.saveState()  # 半透明色塊：填色 50%、筆畫 80%
+    c.setFillColor(Color(0x8E / 255, 0xC0 / 255, 0x7C / 255, alpha=0.5))
+    c.setStrokeColor(Color(0x2B / 255, 0x2D / 255, 0x42 / 255, alpha=0.8))
+    c.setLineWidth(1.5)
+    p = c.beginPath()
+    p.moveTo(150, 720)
+    p.curveTo(175, 735, 195, 715, 185, 695)
+    p.curveTo(175, 680, 150, 690, 150, 720)
+    p.close()
+    c.drawPath(p, stroke=1, fill=1)
+    c.restoreState()
+    c.saveState()  # 虛線
+    c.setStrokeColor(HexColor("#C8553D"))
+    c.setLineWidth(2)
+    c.setDash([6, 3], 0)
+    p = c.beginPath()
+    p.moveTo(75, 745)
+    p.curveTo(110, 765, 150, 765, 185, 745)
+    c.drawPath(p, stroke=1, fill=0)
+    c.restoreState()
+
+    # ---- 標誌 B：畫在兩層表單（Form XObject）裡，每層都有旋轉與縮放
+    c.beginForm("mark")
+    for k, col in enumerate(["#F2C14E", "#E86A33", "#8EC07C", "#2E86AB"]):
+        c.saveState()
+        c.rotate(90 * k)
+        c.setFillColor(HexColor(col))
+        p = c.beginPath()
+        p.moveTo(4, 0)
+        p.curveTo(14, 10, 30, 14, 40, 0)
+        p.curveTo(30, -14, 14, -10, 4, 0)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
+        c.restoreState()
+    c.endForm()
+    c.beginForm("badge")
+    c.setFillColor(HexColor("#141E30"))
+    p = c.beginPath()  # 不規則的圓盤（不是正圓，所以是自由路徑）
+    p.moveTo(50, 0)
+    p.curveTo(50, 30, 28, 52, 0, 50)
+    p.curveTo(-30, 48, -52, 28, -50, 0)
+    p.curveTo(-48, -30, -28, -52, 0, -50)
+    p.curveTo(30, -48, 52, -28, 50, 0)
+    p.close()
+    c.drawPath(p, stroke=0, fill=1)
+    c.saveState()
+    c.rotate(45)
+    c.scale(0.8, 0.8)
+    c.doForm("mark")
+    c.restoreState()
+    star = [(11 * math.cos(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45), 11 * math.sin(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45)) for i in range(10)]
+    c.setFillColor(HexColor("#FFFFFF"))
+    c.setStrokeColor(HexColor("#C8553D"))
+    c.setLineWidth(1)
+    c.setLineJoin(1)
+    c.drawPath(_poly(c, star), stroke=1, fill=1)
+    c.endForm()
+    c.saveState()
+    c.translate(430, 680)
+    c.rotate(-15)
+    c.scale(1.2, 1.2)
+    c.doForm("badge")
+    c.restoreState()
+
+    # ---- 單獨的形狀：要維持是形狀
+    c.setFillColor(HexColor("#2E86AB"))
+    c.rect(60, 500, 80, 50, stroke=0, fill=1)
+    c.setFillColor(HexColor("#EDAE49"))
+    c.roundRect(160, 500, 80, 50, 10, stroke=0, fill=1)
+    c.setFillColor(HexColor("#8EC07C"))
+    c.ellipse(260, 500, 340, 550, stroke=0, fill=1)
+    c.setStrokeColor(HexColor("#2B2D42"))
+    c.setLineWidth(2)
+    c.line(360, 525, 440, 525)
+    c.setFillColor(HexColor("#C8553D"))
+    c.drawPath(_poly(c, [(460, 500), (500, 550), (540, 500)]), stroke=0, fill=1)  # 三角形：單獨的簡單路徑
+    for k, col in enumerate(["#1F3A5F", "#2E86AB", "#8EC07C"]):  # 三個相鄰的箭頭：少量簡單路徑
+        x = 60 + 64 * k
+        c.setFillColor(HexColor(col))
+        c.drawPath(_poly(c, [(x, 430), (x + 45, 430), (x + 60, 450), (x + 45, 470), (x, 470), (x + 15, 450)]), stroke=0, fill=1)
+
+    # ---- 文字的底線與框：不可被吸進向量圖
+    c.setFillColor(HexColor("#2B2D42"))
+    c.setFont("LS", 14)
+    c.drawString(60, 385, "Underlined heading")
+    c.setLineWidth(1)
+    c.line(60, 381, 181, 381)
+    c.rect(300, 375, 150, 26, stroke=1, fill=0)
+    c.drawString(310, 383, "Boxed label")
+
+    # ---- 表格：格線是直線
+    c.setLineWidth(0.75)
+    for y in (340, 310, 280, 250):
+        c.line(60, y, 420, y)
+    for x in (60, 180, 300, 420):
+        c.line(x, 250, x, 340)
+    c.setFont("LS", 11)
+    for r, row in enumerate([("Item", "Q1", "Q2"), ("Revenue", "1,250", "1,480"), ("Margin", "61%", "64%")]):
+        for k, text in enumerate(row):
+            c.drawString(68 + 120 * k, 320 - 30 * r, text)
+
+    # ---- 標誌 C：底板、文字、蓋在文字上的裝飾。文字夾在中間，所以底板與裝飾不能合成同一個向量圖
+    c.setFillColor(HexColor("#F4EBD9"))
+    p = c.beginPath()
+    p.moveTo(330, 190)
+    p.curveTo(330, 240, 380, 236, 435, 232)
+    p.curveTo(490, 236, 545, 240, 545, 190)
+    p.curveTo(545, 140, 490, 146, 435, 150)
+    p.curveTo(380, 146, 330, 140, 330, 190)
+    p.close()
+    c.drawPath(p, stroke=0, fill=1)
+    c.setFillColor(HexColor("#1F3A5F"))
+    c.setFont("LSB", 24)
+    c.drawString(360, 181, "MORTISE")
+    c.setStrokeColor(HexColor("#C8553D"))
+    c.setLineWidth(1.5)
+    c.setLineJoin(1)
+    for y0 in (204, 174):
+        c.drawPath(_poly(c, [(352 + 15 * i, y0 + (6 if i % 2 else 0)) for i in range(9)], close=False), stroke=1, fill=0)
+    star = [(492 + 22 * math.cos(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45), 190 + 22 * math.sin(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45)) for i in range(10)]
+    c.setFillColor(HexColor("#F2C14E"))
+    c.drawPath(_poly(c, star), stroke=0, fill=1)
+    c.showPage()
+    c.save()
+
+
+def vector_paint() -> None:
+    """漸層、花紋、混合模式、透明遮罩、裁切、透明群組：哪些讀得出來、哪些要留在底圖。內容串流直接手寫。"""
+    import pikepdf
+    from pikepdf import Array, Dictionary, Name, Stream
+
+    pdf = pikepdf.new()
+    page = pdf.add_blank_page(page_size=(600, 400))
+
+    def fn(c0, c1, n=1):
+        return Dictionary(FunctionType=2, Domain=[0, 1], C0=c0, C1=c1, N=n)
+
+    def axial(coords, function, extend=True):
+        return Dictionary(ShadingType=2, ColorSpace=Name.DeviceRGB, Coords=coords, Function=function, Extend=[extend, extend])
+
+    def pattern(shading, matrix):
+        return pdf.make_indirect(Dictionary(Type=Name.Pattern, PatternType=2, Shading=shading, Matrix=matrix))
+
+    three = Dictionary(FunctionType=3, Domain=[0, 1], Bounds=[0.4], Encode=[0, 1, 0, 1], Functions=Array([fn([0.12, 0.23, 0.37], [0.95, 0.76, 0.31]), fn([0.95, 0.76, 0.31], [0.78, 0.33, 0.24])]))
+    tile = Stream(pdf, b"0.78 0.33 0.24 rg 0 0 4 4 re f")
+    tile.Type, tile.PatternType, tile.PaintType, tile.TilingType = Name.Pattern, 1, 1, 1
+    tile.BBox, tile.XStep, tile.YStep, tile.Resources = [0, 0, 8, 8], 8, 8, Dictionary()
+    mask = Stream(pdf, b"0.6 g 0 0 600 400 re f", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 600, 400], Group=Dictionary(S=Name.Transparency, CS=Name.DeviceGray))
+    group = Stream(pdf, b"0.18 0.53 0.67 rg 170 70 m 250 70 l 250 130 l 170 140 l h f 0.91 0.42 0.2 rg 210 80 m 290 80 l 290 140 l 210 130 l h f",
+                   Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 600, 400], Group=Dictionary(S=Name.Transparency, CS=Name.DeviceRGB))
+    inner = Stream(pdf, b"/Pattern cs /PF scn 0 0 m 0 60 l 40 70 l 80 60 l 80 0 l h f", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 80, 70], Matrix=[1, 0, 0, 1, 320, 70],
+                   Resources=Dictionary(Pattern=Dictionary(PF=pattern(axial([0, 0, 80, 0], fn([0.56, 0.75, 0.49], [0.12, 0.23, 0.37])), [1, 0, 0, 1, 0, 0]))))
+    page.Resources = Dictionary(
+        Font=Dictionary(F1=Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)),
+        Pattern=Dictionary(
+            P1=pattern(axial([0, 0, 100, 0], fn([0.95, 0.76, 0.31], [0.78, 0.33, 0.24])), [0.8, 0.6, -0.6, 0.8, 70, 270]),  # 轉 36.87 度的線性漸層
+            P2=pdf.make_indirect(tile),
+            P3=pattern(axial([500, 0, 580, 0], fn([1, 1, 1], [0.12, 0.23, 0.37], n=2)), [1, 0, 0, 1, 0, 0]),  # 指數 2：顏色不是直線變化
+            P4=pattern(axial([380, 0, 480, 0], three), [1, 0, 0, 1, 0, 0]),  # 三個色標
+        ),
+        Shading=Dictionary(
+            Sh1=Dictionary(ShadingType=3, ColorSpace=Name.DeviceRGB, Coords=[300, 320, 0, 300, 320, 40], Function=fn([1, 1, 1], [0.18, 0.53, 0.67]), Extend=[True, True]),
+            Sh2=axial([0, 0, 0, 400], fn([0.96, 0.92, 0.85], [0.85, 0.9, 0.96])),
+        ),
+        ExtGState=Dictionary(GSm=Dictionary(BM=Name.Multiply), GSs=Dictionary(SMask=Dictionary(Type=Name.Mask, S=Name.Luminosity, G=pdf.make_indirect(mask))), GSa=Dictionary(ca=0.5)),
+        XObject=Dictionary(Grp=pdf.make_indirect(group), Inner=pdf.make_indirect(inner)),
+    )
+    k = 0.5523 * 40
+    circle = f"340 320 m 340 {320 + k:.3f} {300 + k:.3f} 360 300 360 c {300 - k:.3f} 360 260 {320 + k:.3f} 260 320 c 260 {320 - k:.3f} {300 - k:.3f} 280 300 280 c {300 + k:.3f} 280 340 {320 - k:.3f} 340 320 c h"
+    k2 = 0.5523 * 30
+    clipped_circle = f"475 205 m 475 {205 + k2:.3f} {445 + k2:.3f} 235 445 235 c {445 - k2:.3f} 235 415 {205 + k2:.3f} 415 205 c 415 {205 - k2:.3f} {445 - k2:.3f} 175 445 175 c {445 + k2:.3f} 175 475 {205 - k2:.3f} 475 205 c h"
+    import math
+
+    star = [(550 + 30 * math.cos(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45), 210 + 30 * math.sin(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45)) for i in range(10)]
+    star_path = f"{star[0][0]:.3f} {star[0][1]:.3f} m " + " ".join(f"{x:.3f} {y:.3f} l" for x, y in star[1:]) + " h"
+    content = f"""
+/Sh2 sh
+/Pattern cs /P1 scn 60 300 m 60 360 140 380 180 340 c 200 300 160 260 120 270 c 90 275 60 280 60 300 c h f
+0.12 0.23 0.37 rg 100 310 m 120 350 l 150 320 l 135 290 l h f
+1 1 1 RG 3 w 1 J 70 300 m 90 320 110 280 130 300 c 150 320 170 280 190 300 c S 0 J
+q {circle} W n /Sh1 sh Q
+/Pattern cs /P4 scn 380 290 100 60 re f
+/Pattern cs /P3 scn 500 290 80 60 re f
+/Pattern cs /P2 scn 60 180 m 100 240 l 140 180 l h f
+0.78 0.33 0.24 rg 170 180 m 210 240 l 250 180 l h f
+q /GSm gs 0 0.5 0 rg 200 170 m 240 250 l 280 170 l h f Q
+0.95 0.76 0.31 rg 255 200 m 275 235 l 295 200 l h f
+q /GSs gs 0 0 0.5 rg 310 180 m 350 240 l 390 180 l h f Q
+q 420 190 50 30 re W n 0.03 0.23 0.3 rg {clipped_circle} f Q
+q {star_path} W n 0.56 0.75 0.49 rg 500 170 100 80 re f Q
+q 60 80 60 60 re W n 0.18 0.53 0.67 rg 40 100 120 20 re f Q
+q /GSa gs /Grp Do Q
+/Inner Do
+0 0 0 rg BT /F1 12 Tf 60 30 Td (Paint fixture) Tj ET
+"""
+    page.Contents = Stream(pdf, content.encode("ascii"))
+    pdf.save(HERE / "vector_paint.pdf", static_id=True)
+
+
+def _outline_text(c, font_path: str, text: str, x: float, y: float, size: float, single_path: bool = False, lines: list[str] | None = None, leading: float = 1.25) -> float:
+    """把文字畫成外框（每個字一條填色路徑；single_path 時整段只用一條路徑）。回傳最後一行結尾的 x。"""
+    from fontTools.pens.basePen import BasePen
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(font_path)
+    glyphs, cmap, scale = font.getGlyphSet(), font.getBestCmap(), size / font["head"].unitsPerEm
+
+    class Pen(BasePen):  # TrueType 的二次曲線由 BasePen 升成三次曲線（數學上相等）
+        def __init__(self, path, ox, oy):
+            super().__init__(glyphs)
+            self.path, self.ox, self.oy = path, ox, oy
+
+        def _pt(self, pt):
+            return self.ox + pt[0] * scale, self.oy + pt[1] * scale
+
+        def _moveTo(self, pt):
+            self.path.moveTo(*self._pt(pt))
+
+        def _lineTo(self, pt):
+            self.path.lineTo(*self._pt(pt))
+
+        def _curveToOne(self, a, b, d):
+            self.path.curveTo(*self._pt(a), *self._pt(b), *self._pt(d))
+
+        def _closePath(self):
+            self.path.close()
+
+    whole = c.beginPath() if single_path else None
+    end = x
+    for row, line in enumerate(lines or [text]):
+        cx = x
+        for ch in line:
+            name = cmap.get(ord(ch))
+            if name is None:
+                continue
+            if ch.strip():
+                path = whole if single_path else c.beginPath()
+                glyphs[name].draw(Pen(path, cx, y - row * size * leading))
+                if not single_path:
+                    c.drawPath(path, stroke=0, fill=1, fillMode=1)
+            cx += glyphs[name].width * scale
+        end = cx
+    if single_path:
+        c.drawPath(whole, stroke=0, fill=1, fillMode=1)
+    return end
+
+
+def vector_outlined() -> None:
+    """文字轉外框。第 1 頁有真的文字（①不會起疑）；第 2 頁完全沒有文字、路徑很多（①會標記疑似轉外框）。"""
+    import math
+
+    from reportlab.lib.colors import HexColor
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("vector_outlined.pdf", (w, h))
+    c.setFillColor(HexColor("#555555"))
+    c.setFont("LS", 12)
+    c.drawString(60, 790, "Outlined text fixture: the lines below are paths, not text.")
+
+    def sun(cx: float, cy: float, r: float) -> None:  # 小太陽：一個不規則圓盤加八道光芒
+        c.setFillColor(HexColor("#F2C14E"))
+        p = c.beginPath()
+        p.moveTo(cx + r, cy)
+        p.curveTo(cx + r, cy + 0.6 * r, cx + 0.5 * r, cy + r, cx, cy + r)
+        p.curveTo(cx - 0.6 * r, cy + r, cx - r, cy + 0.5 * r, cx - r, cy)
+        p.curveTo(cx - r, cy - 0.6 * r, cx - 0.5 * r, cy - r, cx, cy - r)
+        p.curveTo(cx + 0.6 * r, cy - r, cx + r, cy - 0.5 * r, cx + r, cy)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
+        c.setFillColor(HexColor("#E86A33"))
+        for i in range(8):
+            a = math.radians(45 * i)
+            ux, uy = math.cos(a), math.sin(a)
+            c.drawPath(_poly(c, [(cx + 1.15 * r * ux - 0.2 * r * uy, cy + 1.15 * r * uy + 0.2 * r * ux), (cx + 1.7 * r * ux, cy + 1.7 * r * uy), (cx + 1.15 * r * ux + 0.2 * r * uy, cy + 1.15 * r * uy - 0.2 * r * ux)]), stroke=0, fill=1)
+
+    c.setFillColor(HexColor("#2B2D42"))
+    end = _outline_text(c, _SANS_BOLD, "", 60, 700, 26, lines=["Summer sale starts today", "Riverside Park, 10:00"])
+    sun(431, 709, 9)  # 緊貼第一行的結尾：不可以和文字混成一群
+    c.setFillColor(HexColor("#1F3A5F"))
+    _outline_text(c, _SANS, "", 60, 600, 18, single_path=True, lines=["Whole paragraph drawn", "as one single path"])
+    c.setFillColor(HexColor("#C8553D"))
+    _outline_text(c, _SANS_BOLD, "SALE", 60, 480, 44)  # 只有四個字：這一頁有真的文字，不夠認定成文字轉外框
+    c.showPage()
+
+    # 第 2 頁：沒有任何文字
+    c.setFillColor(HexColor("#C8553D"))
+    _outline_text(c, _SANS_BOLD, "SALE", 60, 740, 44)
+    cx, cy = 300, 420  # 密集插畫：320 片小葉子繞成螺旋，加一個 500 多段的鋸齒圓
+    c.setFillColor(HexColor("#141E30"))
+    c.drawPath(_poly(c, [(cx + (150 if i % 2 else 138) * math.cos(2 * math.pi * i / 520), cy + (150 if i % 2 else 138) * math.sin(2 * math.pi * i / 520)) for i in range(520)]), stroke=0, fill=1)
+    palette = ["#2E86AB", "#F2C14E", "#E86A33", "#8EC07C"]
+    for i in range(320):
+        a, r = 0.35 * i, 12 + 0.36 * i
+        x, y = cx + r * math.cos(a), cy + r * math.sin(a)
+        ux, uy = math.cos(a + 0.6), math.sin(a + 0.6)
+        c.setFillColor(HexColor(palette[i % 4]))
+        p = c.beginPath()
+        p.moveTo(x, y)
+        p.curveTo(x + 6 * ux - 4 * uy, y + 6 * uy + 4 * ux, x + 12 * ux - 3 * uy, y + 12 * uy + 3 * ux, x + 16 * ux, y + 16 * uy)
+        p.curveTo(x + 12 * ux + 3 * uy, y + 12 * uy - 3 * ux, x + 6 * ux + 4 * uy, y + 6 * uy - 4 * ux, x, y)
+        p.close()
+        c.drawPath(p, stroke=0, fill=1)
+    c.showPage()
+    c.save()
+
+
 if __name__ == "__main__":
-    slide_dark()
-    doc_a4()
-    poster()
-    deck()
+    import sys
+
+    if sys.argv[1:] != ["vectors"]:
+        slide_dark()
+        doc_a4()
+        poster()
+        deck()
+    vector_logo()
+    vector_paint()
+    vector_outlined()
     print(sorted(p.name for p in HERE.glob("*.pdf")))

@@ -10,6 +10,13 @@
   - 字型從單一 TrueType 檔載入；字型集合檔（TTC）先用 fontTools 抽出單一字型，避免 BaseFont 被加上「-序號」。
   - CFF 外框的 OpenType 字型 ReportLab 不吃，退回下一個候選並記降級紀錄。
 
+向量圖：成品文件的每個向量圖都對應同頁的一張圖片（StyledImage.vector_id）。畫到這種圖片時改畫向量圖、跳過圖片，
+所以 7A 中性驗證的渲染裡，描圖得到的向量圖是照向量畫的，描圖描壞了會直接反映在相似度上。
+一律「由圖片找向量圖」，不逐一畫 page.vectors。
+
+本模組的排版與繪製也給「可編輯 PDF」輸出器（pdf_editable）重用：_Fonts 可換字型載入方式、
+_Painter 在每個元素前後呼叫 begin／end 兩個掛勾（本模組不做事），子類別用它們寫結構標記。
+
 降階對照表（成品文件的概念 → PDF 的物件 → 是否有損）：
   頁面尺寸（每頁可不同）     → 每頁各自的 MediaBox                          → 無損
   整頁底色                   → 最底層的滿版填色矩形（「背景」圖層）          → 無損
@@ -25,6 +32,9 @@
   左右對齊                   → 整行一致的字距（Tc）                          → 無損（末行靠左）
   圖片                       → 影像物件，原解析度；透明用 SMask              → 無損
   形狀（矩形、圓角矩形、橢圓、直線、自訂路徑） → 路徑運算元（含三次貝茲）   → 無損
+  向量圖                     → 逐條路徑：填色規則（非零或奇偶）、筆畫寬度與端點接合照實寫；
+                               線性與放射漸層寫成 PDF 的 shading（先以路徑裁切再畫漸層）  → 無損（漸層各色標的不透明度不同時取平均，有損）
+  向量圖的基本圖形（矩形、圓…） → PDF 沒有基本圖形物件，一律寫成路徑        → 外觀無損
   表格                       → 儲存格底色矩形、框線、逐格文字                → 有損（沒有表格物件）
   數字格式、公式             → 只留顯示文字                                  → 有損
   樣式表                     → 沒有                                          → 捨棄
@@ -66,9 +76,11 @@ from ..artifacts import (
     StyledShape,
     StyledTable,
     StyledTextBox,
+    StyledVector,
+    StyledVectorPath,
 )
 from ..artifacts.common import Color
-from ..artifacts.styled_doc import Box
+from ..artifacts.styled_doc import Box, vector_index
 from ..config import Config
 from ..pipeline.store import Store
 from ..tools.fonts import is_cjk
@@ -91,6 +103,8 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "justify_word_space": True,  # 左右對齊的行有空白時撐開空白（Tw）；否則整行一致的字距（Tc）
     "faux_bold_stroke_ratio": 0.03,  # 沒有粗體字型檔時以描邊模擬：描邊寬 = 字級 × 此值
     "compress": True,  # 內容串流是否壓縮
+    "vectors": True,  # 圖片有對應的向量圖時改畫向量圖（關掉就照常畫那張圖片）
+    "editor_name": "Illustrator",  # 降級紀錄裡提到「哪個軟體編輯文字時需要安裝字型」用的名稱
 }
 
 MIME = "application/pdf"
@@ -249,9 +263,12 @@ def _ps_name(family: str, bold: bool, italic: bool) -> str:
 class _Fonts:
     """字型解析：推論字型 → 驗證字型 → 後備字型；記下替代與降級。"""
 
-    def __init__(self, params: dict, degradations: list[Degradation]):
+    def __init__(self, params: dict, degradations: list[Degradation], loader=None):
+        """loader 是「字型檔 → 字型」的載入函式，介面同 _load_face（回傳字型與失敗原因）。
+        不給就用 _load_face（登記到 ReportLab，只收 TrueType 外框）；pdf_editable 傳自己的（CID 字型，也收 CFF 外框）。"""
         self.p = params
         self.deg = degradations
+        self._load = loader or _load_face
         self.metric = params["descriptor_metric"] if params["ascent_metric"] == "auto" else params["ascent_metric"]
         self.used: dict[str, _Face] = {}  # 寫入檔案的字族 → 字型
         self.inferred: dict[str, str] = {}  # 推論字型 → 實際寫入的字族
@@ -272,7 +289,7 @@ class _Fonts:
             return None, None, "missing"
         if _norm(family) not in {_norm(f) for f in m.families}:
             return None, m, "missing"
-        face, why = _load_face(m, self.metric, rename)
+        face, why = self._load(m, self.metric, rename)
         return face, m, why or "ok"
 
     def primary(self, fc: FontChoice, bold: bool, italic: bool, element_id: str) -> tuple[_Face, bool, bool]:
@@ -296,19 +313,19 @@ class _Fonts:
             if face is not None:
                 chosen, match = face, m
                 if i > 0:
-                    self._note(("sub", want, face.family), Degradation(element_id=element_id, concept="字型", action=f"系統沒有推論的字型「{want}」，內嵌「{face.family}」代替（Illustrator 編輯文字時需要安裝字型）", lossy=True))
+                    self._note(("sub", want, face.family), Degradation(element_id=element_id, concept="字型", action=f"系統沒有推論的字型「{want}」，內嵌「{face.family}」代替（{self.p.get('editor_name', 'Illustrator')} 編輯文字時需要安裝字型）", lossy=True))
                 break
         if chosen is None:  # 最後手段：fontconfig 給什麼用什麼
             for fam in ("sans-serif", "serif"):
                 m = _fc_match(fam, bold, italic)
                 if m is not None:
-                    face, why = _load_face(m, self.metric, rename)
+                    face, why = self._load(m, self.metric, rename)
                     if face is not None:
                         chosen, match = face, m
                         self._note(("sub", want, face.family), Degradation(element_id=element_id, concept="字型", action=f"找不到推論字型「{want}」與驗證字型，內嵌「{face.family}」代替", lossy=True))
                         break
         if chosen is None:
-            raise RuntimeError("找不到任何可內嵌的 TrueType 字型。")
+            raise RuntimeError("找不到任何可內嵌的字型。")
         faux_bold = bold and not chosen.bold
         no_italic = italic and not chosen.italic
         if faux_bold:
@@ -571,7 +588,9 @@ def _rl(color: Color) -> RLColor:
 
 
 class _Painter:
-    def __init__(self, c: rl_canvas.Canvas, page: StyledPage, layout: _Layout, store: Store, params: dict, degradations: list[Degradation], drawn_text: list[str]):
+    def __init__(self, c: rl_canvas.Canvas, page: StyledPage, layout: _Layout, store: Store, params: dict, degradations: list[Degradation], drawn_text: list[str],
+                 vectors: Optional[dict[str, StyledVector]] = None):
+        """vectors 是「向量圖編號 → 向量圖」（styled_doc.vector_index 的結果）；不給就一律照常畫圖片。"""
         self.c = c
         self.page = page
         self.H = page.height_pt
@@ -580,8 +599,18 @@ class _Painter:
         self.p = params
         self.deg = degradations
         self.drawn = drawn_text
+        self.vectors = vectors or {}
         self.layer: Optional[str] = None
         self.layers_used: set[str] = set()
+
+    # ---------- 給子類別的掛勾（本模組不做事；pdf_editable 用來寫結構標記）
+    def begin(self, kind: str, item: Any = None, part: Any = None) -> None:
+        """開始畫一個元素（或它的一部分）。呼叫時所屬圖層已經進入。kind：
+        background（底色或底圖）、image、vector、shape、table_grid（表格的底色與框線）、
+        text_box、cell（表格儲存格的文字；item 是表格、part 是儲存格）。"""
+
+    def end(self) -> None:
+        """與 begin 成對。"""
 
     # ---------- 圖層（標記內容 /OC /名稱 BDC … EMC；資源在後處理補上）
     def enter(self, layer: str) -> None:
@@ -634,24 +663,114 @@ class _Painter:
                 t.setWordSpace(0)
             self.c.drawText(t)
 
-    def text_box(self, tb: StyledTextBox) -> None:
-        frame = _Frame(tb.box, self.H)
-        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h, getattr(tb, "first_baseline_pt", None))
+    def note_text_box(self, tb: StyledTextBox, lines: list[_Line]) -> None:
+        """文字框的降級紀錄（寫法不同的子類別改寫這裡的說明）。"""
         if len(lines) > 1:
             self.deg.append(Degradation(element_id=tb.id, concept="段落與文字框", action=f"PDF 沒有段落與文字框，寫成 {sum(1 for ln in lines if ln.segs)} 個逐行的文字物件", lossy=True))
         if lines and lines[-1].baseline - lines[-1].descent > tb.box.h + 0.5 * lines[-1].size:
             self.deg.append(Degradation(element_id=tb.id, concept="文字框高度", action="排出的文字超出文字框下緣（PDF 沒有文字框，照樣畫出）", lossy=False))
+
+    def text_box(self, tb: StyledTextBox) -> None:
+        frame = _Frame(tb.box, self.H)
+        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h, getattr(tb, "first_baseline_pt", None))
+        self.note_text_box(tb, lines)
+        self.begin("text_box", tb)
         self.text_lines(lines, frame, 0.0, 0.0)
+        self.end()
 
     # ---------- 圖片
-    def image(self, ref, box: Box, layer: str) -> None:
+    def image(self, ref, box: Box, layer: str, element: Any = None) -> None:
+        """element 是這張圖片在成品文件裡的元素（底圖沒有，傳 None）；只交給掛勾用。"""
         self.enter(layer)
+        self.begin("background" if layer == "background" else "image", element)
         frame = _Frame(box, self.H)
         c = self.c
         c.saveState()
         c.transform(*frame.upright(0.0, box.h))
         c.drawImage(str(self.store.blob_path(ref)), 0, 0, box.w, box.h, mask="auto")
         c.restoreState()
+        self.end()
+
+    # ---------- 向量圖
+    def _path(self, segments: list[list[float]]):
+        """成品文件的路徑編碼（0 起筆、1 直線、2 三次貝茲、3 閉合）→ ReportLab 的路徑物件。"""
+        p = self.c.beginPath()
+        for sg in segments:
+            kind = int(sg[0])
+            if kind == 0:
+                p.moveTo(sg[1], sg[2])
+            elif kind == 1:
+                p.lineTo(sg[1], sg[2])
+            elif kind == 2:
+                p.curveTo(sg[1], sg[2], sg[3], sg[4], sg[5], sg[6])
+            elif kind == 3:
+                p.close()
+        return p
+
+    def _gradient(self, v: StyledVector, vp: StyledVectorPath) -> bool:
+        """在目前的裁切範圍內畫漸層（PDF 的 shading）。畫不出來（色標或座標不合法）回傳 False，由呼叫端改用單色。"""
+        g = vp.gradient
+        stops = sorted(g.stops, key=lambda s: s.offset) if g is not None else []
+        if g is None or not stops:
+            return False
+        c = self.c
+        colors = [RLColor(s.color.r / 255.0, s.color.g / 255.0, s.color.b / 255.0) for s in stops]
+        positions = [min(1.0, max(0.0, float(s.offset))) for s in stops]
+        if len(stops) == 1:  # 只有一個色標：整片同色
+            colors, positions = colors * 2, [0.0, 1.0]
+        alphas = [float(s.color.a) for s in stops]
+        alpha = sum(alphas) / len(alphas)
+        if max(alphas) - min(alphas) > 1e-3:
+            self.deg.append(Degradation(element_id=v.id, concept="漸層的不透明度", action=f"PDF 的漸層不能逐色標設定不透明度，整個漸層改用平均值 {alpha:.2f}", lossy=True))
+        if g.kind == "linear" and len(g.coords) >= 4 and math.hypot(g.coords[2] - g.coords[0], g.coords[3] - g.coords[1]) > 1e-6:
+            c.setFillAlpha(alpha)
+            c.linearGradient(g.coords[0], g.coords[1], g.coords[2], g.coords[3], colors, positions, extend=True)
+            return True
+        if g.kind == "radial" and len(g.coords) >= 3 and g.coords[2] > 1e-6:
+            c.setFillAlpha(alpha)
+            c.radialGradient(g.coords[0], g.coords[1], g.coords[2], colors, positions, extend=True)
+            return True
+        return False
+
+    def vector_path(self, v: StyledVector, vp: StyledVectorPath) -> None:
+        """向量圖的一條路徑：填色規則、漸層、筆畫寬度與端點接合都照成品文件寫。"""
+        c = self.c
+        mode = 0 if vp.fill_rule == "evenodd" else 1  # ReportLab：0 奇偶、1 非零
+        p = self._path(vp.path)
+        fill = 0
+        if vp.gradient is not None:
+            c.saveState()  # 漸層沒有範圍：先用這條路徑裁切，再把漸層畫滿
+            c.clipPath(p, stroke=0, fill=0, fillMode=mode)
+            painted = self._gradient(v, vp)
+            c.restoreState()
+            if not painted and vp.fill is not None:
+                self.deg.append(Degradation(element_id=v.id, concept="漸層", action="漸層的色標或座標不合法，改用平均色填滿", lossy=True))
+        else:
+            painted = False
+        if not painted and vp.fill is not None:
+            c.setFillColor(_rl(vp.fill))
+            fill = 1
+        stroke = 0
+        if vp.stroke is not None:
+            c.setStrokeColor(_rl(vp.stroke))
+            c.setLineWidth(vp.stroke_width_pt or 0.0)  # 沒有寬度：來源是 PDF 的最細線（寬度 0），照寫
+            c.setLineCap({"butt": 0, "round": 1, "square": 2}.get(vp.stroke_cap, 0))
+            c.setLineJoin({"miter": 0, "round": 1, "bevel": 2}.get(vp.stroke_join, 0))
+            stroke = 1
+        if fill or stroke:
+            c.drawPath(p, stroke=stroke, fill=fill, fillMode=mode)
+
+    def vector(self, v: StyledVector) -> None:
+        """向量圖：由下到上逐條路徑畫出。座標相對於框的左上角、y 向下（框不旋轉）。"""
+        self.enter("shape")
+        self.begin("vector", v)
+        c = self.c
+        c.saveState()
+        c.transform(*_Frame(v.box, self.H, 0.0).flipped())
+        for vp in v.paths:
+            self.vector_path(v, vp)
+        c.restoreState()
+        self.end()
 
     # ---------- 形狀
     def _paint(self, fill: Optional[Color], stroke: Optional[Color], width: Optional[float]) -> tuple[int, int]:
@@ -665,6 +784,11 @@ class _Painter:
 
     def shape(self, sh: StyledShape) -> None:
         self.enter("shape")
+        self.begin("shape", sh)
+        self._shape(sh)
+        self.end()
+
+    def _shape(self, sh: StyledShape) -> None:
         c, b = self.c, sh.box
         if sh.fill is None and sh.stroke is None:
             self.deg.append(Degradation(element_id=sh.id, concept="形狀", action="沒有填色也沒有框線，畫出來看不見", lossy=False))
@@ -685,18 +809,7 @@ class _Painter:
         elif sh.geometry == "ellipse":
             c.ellipse(0, 0, b.w, b.h, stroke=stroke, fill=fill)
         elif sh.geometry == "path" and sh.path:
-            p = c.beginPath()
-            for sg in sh.path:
-                kind = int(sg[0])
-                if kind == 0:
-                    p.moveTo(sg[1], sg[2])
-                elif kind == 1:
-                    p.lineTo(sg[1], sg[2])
-                elif kind == 2:
-                    p.curveTo(sg[1], sg[2], sg[3], sg[4], sg[5], sg[6])
-                elif kind == 3:
-                    p.close()
-            c.drawPath(p, stroke=stroke, fill=fill, fillMode=0)
+            c.drawPath(self._path(sh.path), stroke=stroke, fill=fill, fillMode=0)
         else:
             if sh.geometry not in ("rect", "path"):
                 self.deg.append(Degradation(element_id=sh.id, concept="形狀種類", action=f"不認得的形狀「{sh.geometry}」，以矩形輸出", lossy=True))
@@ -723,6 +836,7 @@ class _Painter:
         c = self.c
         # 1. 底色
         self.enter("shape")
+        self.begin("table_grid", tb)
         c.saveState()
         c.transform(*frame.flipped())
         for cell, x, y, w, h in rects:
@@ -738,6 +852,7 @@ class _Painter:
                     c.setLineWidth(border.width_pt)
                     c.line(x0, y0, x1, y1)
         c.restoreState()
+        self.end()
         # 3. 文字
         for cell, x, y, w, h in rects:
             if not cell.paragraphs:
@@ -753,17 +868,29 @@ class _Painter:
                 dy = (inner_h - content) / 2
             elif cell.v_align == "bottom":
                 dy = inner_h - content
+            self.begin("cell", tb, cell)
             self.text_lines(lines, frame, x + l, y + t + dy)
+            self.end()
 
     # ---------- 整頁
+    def note_reading_order(self) -> None:
+        """閱讀順序的降級紀錄：PDF 依 z 順序繪製，本模組沒有寫結構標記（有寫結構標記的子類別改寫這裡）。"""
+        page = self.page
+        text_ids = [t.id for t in sorted(page.text_boxes + page.tables, key=lambda t: t.z)]  # type: ignore[operator]
+        ro = [i for i in page.reading_order if i in set(text_ids)]
+        if ro and ro != [i for i in text_ids if i in set(ro)]:
+            self.deg.append(Degradation(element_id=f"page-{page.page_index + 1}", concept="閱讀順序", action="PDF 依圖層前後繪製，沒有寫入結構標記（Tagged PDF），抽出文字的順序可能與閱讀順序不同", lossy=True))
+
     def page_items(self) -> None:
         page = self.page
         if page.background_color is not None:
             self.enter("background")
+            self.begin("background", None)
             self.c.saveState()
             self.c.setFillColor(_rl(page.background_color))
             self.c.rect(0, 0, page.width_pt, page.height_pt, stroke=0, fill=1)
             self.c.restoreState()
+            self.end()
         if page.background_image is not None:
             self.image(page.background_image, Box(x=0, y=0, w=page.width_pt, h=page.height_pt), "background")
             self.deg.append(Degradation(element_id=f"background-{page.page_index + 1}", concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))
@@ -773,17 +900,18 @@ class _Painter:
             if kind == "text":
                 self.text_box(item)
             elif kind == "image":
-                self.image(item.image, item.box, "image")
+                # 這張圖片其實是向量圖的點陣版：改畫向量圖、跳過圖片（由圖片找向量圖，母片成員也適用）
+                vec = self.vectors.get(item.vector_id) if (item.vector_id and self.p.get("vectors", True)) else None
+                if vec is not None and vec.paths:
+                    self.vector(vec)
+                else:
+                    self.image(item.image, item.box, "image", item)
             elif kind == "shape":
                 self.shape(item)
             else:
                 self.table(item)
         self.close()
-        # 閱讀順序：PDF 依 z 順序繪製，沒有寫結構標記
-        text_ids = [t.id for t in sorted(page.text_boxes + page.tables, key=lambda t: t.z)]  # type: ignore[operator]
-        ro = [i for i in page.reading_order if i in set(text_ids)]
-        if ro and ro != [i for i in text_ids if i in set(ro)]:
-            self.deg.append(Degradation(element_id=f"page-{page.page_index + 1}", concept="閱讀順序", action="PDF 依圖層前後繪製，沒有寫入結構標記（Tagged PDF），抽出文字的順序可能與閱讀順序不同", lossy=True))
+        self.note_reading_order()
 
 
 # ================================================================ 圖層後處理與自檢
@@ -897,7 +1025,7 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     layer_pages: list[set[str]] = []
     for page in doc.pages:
         c.setPageSize((page.width_pt, page.height_pt))
-        painter = _Painter(c, page, layout, store, params, degradations, drawn)
+        painter = _Painter(c, page, layout, store, params, degradations, drawn, vector_index(doc) if params.get("vectors", True) else None)
         painter.page_items()
         layer_pages.append(painter.layers_used)
         c.showPage()
