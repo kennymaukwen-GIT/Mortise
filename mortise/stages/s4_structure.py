@@ -29,7 +29,7 @@ from ..config import Config
 from ..tools.fonts import is_cjk
 
 NAME = "s4"
-VERSION = "2"
+VERSION = "3"
 
 _BULLET = re.compile(r"^\s*([•‧·●○■□▪◆◇▶➤\-–—*]|\(?\d{1,2}[.)、]|[a-zA-Z][.)]|[一二三四五六七八九十]+[、.])\s*")
 _PAGE_NUMBER = re.compile(r"^[\-–— ]*(第\s*)?\d{1,4}(\s*頁)?(\s*[/／]\s*\d{1,4})?[\-–— ]*$")
@@ -357,6 +357,22 @@ def _alignment(group: list[TextLine], block: list[TextLine], spec: PageSpec, c: 
     return measured(Align.LEFT, 0.5, Provenance.INFERRED, step)
 
 
+def _body_below(p: Paragraph, paragraphs: list[Paragraph], by_line: dict[str, TextLine], body: float) -> bool:
+    """這一段底下（左右範圍有重疊的同一欄裡）還有一般字級的內文嗎？有的話它就不是頁尾。
+    例如履歷頁面下方的小標題「EDUCATION」：字比內文小一點、又在頁面最下方，但底下還有學歷內容，是標題不是頁尾。
+    頁尾自己可能有好幾行小字，所以底下只有小字（同樣不到內文 0.95 倍）時仍算頁尾。"""
+    l, _, r, b = p.quad.bbox
+    for q in paragraphs:
+        if q is p:
+            continue
+        ql, qt, qr, _ = q.quad.bbox
+        if qt < b - 1e-6 or min(r, qr) - max(l, ql) <= 0:
+            continue
+        if by_line[q.line_ids[0]].font_size >= body * 0.95:
+            return True
+    return False
+
+
 def _roles(paragraphs: list[Paragraph], by_line: dict[str, TextLine], spec: PageSpec, c: dict) -> list[Paragraph]:
     step = f"{NAME}.roles@{VERSION}"
     if not paragraphs:
@@ -383,7 +399,7 @@ def _roles(paragraphs: list[Paragraph], by_line: dict[str, TextLine], spec: Page
             title_done = True
         elif size >= body * c["title_size_ratio"]:
             role, conf = Role.SUBTITLE, 0.5
-        elif in_bottom and size < body * 0.95:
+        elif in_bottom and size < body * 0.95 and not _body_below(p, paragraphs, by_line, body):
             role, conf = Role.FOOTER, 0.5
         out.append(p.model_copy(update={"role": measured(role, conf, Provenance.INFERRED, step)}))
     order = {p.id: i for i, p in enumerate(paragraphs)}

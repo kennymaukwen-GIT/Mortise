@@ -48,3 +48,29 @@ def test_formula_candidates_and_confirmation():
                     pages=[StyledPage(page_index=0, width_pt=600, height_pt=800, tables=[table])])
     fixed = _apply_corrections(doc, [user_correction(5, "formula", "accept", "p001-table-x#3,1")], {})
     assert next(c for c in fixed.pages[0].tables[0].cells if (c.row, c.col) == (3, 1)).formula == "=SUM(B2:B3)"
+
+
+def test_small_heading_near_bottom_with_content_below_is_not_footer():
+    """頁面最下方、字比內文小一點的小標題（例如履歷的 EDUCATION），底下還有內文就不是頁尾；真正的頁尾仍是頁尾。"""
+    from mortise.artifacts import Align, Paragraph, Point, Provenance, Quad, Role, TextLine, TextRun, measured
+    from mortise.stages.s4_structure import _roles
+
+    def line(i, text, y, size, x0=0.1, x1=0.6):
+        q = Quad.from_rect(x0, y, x1, y + size)
+        run = TextRun(text=text, quad=q, font_size=measured(size, 0.9, Provenance.MEASURED, "t"),
+                      bold=measured(False, 0.9, Provenance.MEASURED, "t"), italic=measured(False, 0.9, Provenance.MEASURED, "t"),
+                      color=measured(__import__("mortise.artifacts", fromlist=["Color"]).Color(r=0, g=0, b=0), 0.9, Provenance.MEASURED, "t"))
+        return TextLine(id=f"l{i}", quad=q, z=i, baseline=(Point(x=x0, y=y + size), Point(x=x1, y=y + size)), runs=[run])
+
+    lines = [line(0, "Body text " * 6, 0.30, 0.020), line(1, "More body " * 6, 0.60, 0.020),
+             line(2, "EDUCATION", 1.25, 0.019), line(3, "BA (Hons) Urban Design and Planning", 1.29, 0.020),
+             line(4, "Company footer", 1.385, 0.012, 0.3, 0.7)]
+    paras = [Paragraph(id=f"p{i}", line_ids=[ln.id], quad=ln.quad, alignment=measured(Align.LEFT, 0.9, Provenance.MEASURED, "t"),
+                       role=measured(Role.UNKNOWN, 0.1, Provenance.INFERRED, "t")) for i, ln in enumerate(lines)]
+
+    class Spec:
+        aspect_ratio = 1.414
+
+    roles = {p.id: p.role.value for p in _roles(paras, {ln.id: ln for ln in lines}, Spec(), {"page_number_band": 0.12, "title_size_ratio": 1.4})}
+    assert roles["p2"] != Role.FOOTER, roles
+    assert roles["p4"] == Role.FOOTER, roles
