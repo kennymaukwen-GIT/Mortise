@@ -19,6 +19,7 @@ import os
 import subprocess
 import tempfile
 import zipfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -182,6 +183,14 @@ def overlapping(lines: list[dict], min_ratio: float = 0.25) -> list[tuple[str, s
             if ix > 0 and iy > 0 and ix * iy > min_ratio * max(small, 1e-6):
                 out.append((a["text"], b["text"]))
     return out
+
+
+def missing_chars(texts: list[str], pages: list[list[dict]]) -> str:
+    """成品文件的字有哪些沒畫出來（只比字元的數量，不比順序：並排的兩欄在 PDF 裡同一高度的行會交錯）。
+    項目符號改成 Word 的自動編號後由編號畫出，不一定是同一個字元，不比。"""
+    want = Counter(norm_text("".join(texts)).replace("•", ""))
+    got = Counter(norm_text("".join(ln["text"] for lines in pages for ln in lines)).replace("•", ""))
+    return "".join(sorted((want - got).elements()))
 
 
 def outside(lines: list[dict], w: float, h: float) -> list[str]:
@@ -351,8 +360,8 @@ def test_mono_only_kept_for_all_mono_box(two_col, mode):
     root = xml_of(two_col["data"][mode])
 
     def run_font(text):
-        for r in root.iter(q("w:r")):
-            if text in "".join(t.text or "" for t in r.iter(q("w:t"))):
+        for r in root.iter(q("w:r")):  # 只看直接含字的文字段（版面固定的繪圖物件也是 w:r，裡面包著整個文字方塊）
+            if text in "".join(t.text or "" for t in r.findall(q("w:t"))):
                 f = r.find(f"{q('w:rPr')}/{q('w:rFonts')}")
                 return f.get(q("w:ascii")) if f is not None else None
         raise AssertionError(text)
@@ -460,9 +469,7 @@ def test_libreoffice_no_overlap(two_col, mode, fc):
         assert len(pages) == 1
     else:
         assert len(pages) <= 2  # 可重排：字變寬可以變長，但不可重疊
-    got = norm_text("".join(ln["text"] for lines in pages for ln in lines))
-    for t in doc_texts(two_col["doc"]):
-        assert norm_text(t).replace("•", "") in got.replace("•", ""), t
+    assert not missing_chars(doc_texts(two_col["doc"]), pages)
 
 
 # ---------- 完整流水線：假資料的兩欄履歷 fixture ----------
@@ -489,6 +496,4 @@ def test_fixture_cv_two_column_end_to_end(tmp_path):
             assert not overlapping(lines), (mode, fc, overlapping(lines)[:5])
         if mode == "fixed":
             assert len(pages) == 1, (mode, fc)
-        got = norm_text("".join(ln["text"] for lines in pages for ln in lines))
-        for t in doc_texts(doc):
-            assert norm_text(t).replace("•", "") in got.replace("•", ""), (mode, fc, t)
+        assert not missing_chars(doc_texts(doc), pages), (mode, fc)
