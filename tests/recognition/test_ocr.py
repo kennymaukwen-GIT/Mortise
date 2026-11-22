@@ -577,12 +577,13 @@ if __name__ == "__main__":
 
 def test_rule_line_above_text_keeps_spaces():
     """文字上方有一條橫線（海報常見的分隔線）時，橫線不可被當成 i 的點那樣併進這一行：
-    併進來會填滿字間空隙，「12 – 14 JULY 2027」就會讀成「12–14JULY2027」（實際發生過的錯誤）。"""
-    canvas = Image.new("RGB", (1500, 260), (245, 235, 215))
-    draw = ImageDraw.Draw(canvas)
-    draw.rectangle([40, 40, 1460, 50], fill=(40, 45, 70))  # 橫線：離字上緣約 30 像素
-    font = ImageFont.truetype(SANS_B, 150)
-    draw.text((40, 80), "12 – 14 JULY 2027", font=font, fill=(40, 45, 70))
-    lines = engine().read(np.asarray(canvas))
-    texts = [ln.text for ln in lines]
+    併進來會填滿字間空隙，「12 – 14 JULY 2027」就會讀成「12–14JULY2027」。
+    用實際出錯的頁面：poster.pdf 以 200 dpi 畫成影像（合成的單行圖重現不了，模型自己會讀出空白）。"""
+    import pypdfium2 as pdfium
+
+    img = np.asarray(pdfium.PdfDocument(str(FIX / "poster.pdf"))[0].render(scale=200 / 72).to_pil().convert("RGB"))
+    texts = [ln.text for ln in engine().read(img)]
     assert "12 – 14 JULY 2027" in texts, texts
+    # 對照：拿掉寬度上限就會重現錯誤（確保這個測試真的在測這件事）
+    old = [ln.text for ln in OcrEngine(params={"cc_attach_max_width": 1e9}).read(img) if "JULY" in ln.text]
+    assert old == ["12–14JULY2027"], old
