@@ -8,45 +8,58 @@
     MORTISE_CORS      允許的前端來源，逗號分隔（預設不開放跨來源）
     MORTISE_RETENTION_DAYS  檔案保留天數（預設 30）
     MORTISE_FEEDBACK  回饋資料庫的目錄（預設 工作目錄/_feedback）：只收上傳時同意用於改善辨識的檔案
+    MORTISE_WEB_DIST  前端建置結果的目錄（預設 專案根目錄/web/dist）
 
 端點一覽（詳細說明見各函數）：
-    GET  /api/health                         服務狀態
-    GET  /api/formats                        可選的輸出格式
-    POST /api/jobs                           上傳檔案，建立工作
+    GET  /api/health                         服務狀態（含檔案大小上限與接受的檔案類型）
+    GET  /api/formats                        可選的輸出格式（label 為中文、label_en 為英文）
+    GET  /api/page-sizes                     輸出尺寸的預設清單（A0…Tabloid 一律直式，另有簡報尺寸）
+    POST /api/jobs                           上傳檔案，建立工作（可指定原始尺寸與輸出尺寸）
     GET  /api/jobs/{id}                      工作狀態與進度
     GET  /api/jobs/{id}/events               進度串流（Server-Sent Events）
     GET  /api/jobs/{id}/report               還原度報告
     GET  /api/jobs/{id}/pages                各頁尺寸與預覽圖網址
-    GET  /api/jobs/{id}/pages/{n}/image      預覽圖：original（原圖）、result（輸出檔渲染）、overlay（疊圖）
+    GET  /api/jobs/{id}/pages/{n}/image      預覽圖：original（原圖）、result（某個輸出格式的成品渲染）、overlay（疊圖）
     GET  /api/jobs/{id}/pages/{n}/elements   可修正的元素清單（文字框、表格、圖片、形狀，含信心值與問題）
     POST /api/jobs/{id}/corrections          送出修正，只從受影響的階段重跑
     GET  /api/jobs/{id}/download/{format}    下載輸出檔（format 為輸出格式或 report）
     POST /api/jobs/{id}/feedback             回饋（評分、意見）
     DELETE /api/jobs/{id}                    立即刪除這份工作的所有檔案
+
+網頁：
+    /                                        前端（web/ 建置後的 web/dist；還沒建置時顯示建置說明）
+    /dev                                     開發用的簡易測試頁
+    /api 開頭的路徑永遠由 API 處理，不會被前端攔走；其他不是實體檔案的路徑一律回前端的 index.html（單頁應用的路由）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ..artifacts import FidelityReport, Intent, Layout, OutputFile, OutputFormat, PageSpec, PhysicalSize, SourceDoc, StyledDoc, UsageMode
+from ..artifacts import BlobRef, FidelityReport, Intent, Layout, OutputFile, OutputFormat, PageSpec, PhysicalSize, SourceDoc, StyledDoc, UsageMode
 from ..config import Config
 from ..pipeline.runner import user_correction
+from ..pipeline.store import atomic_write_text
 from ..stages import s6_export
 from ..tools import pdfium as pdf
+from ..tools.units import to_pt
 from .jobs import JobManager
 
 CFG = Config.load()
@@ -82,6 +95,21 @@ FORMAT_LABELS = {
     OutputFormat.SVG: "SVG 整頁（.svg；多頁為 .zip）",
     OutputFormat.SVG_ASSETS: "SVG 向量圖（每個圖一個 .svg，打包成 .zip）",
 }
+FORMAT_LABELS_EN = {
+    OutputFormat.PDF: "Editable PDF (.pdf)",
+    OutputFormat.SVG: "SVG (.svg)",
+    OutputFormat.SVG_ASSETS: "SVG graphics only (.zip)",
+    OutputFormat.PPTX: "PowerPoint (.pptx)",
+    OutputFormat.DOCX_FIXED: "Word, fixed layout (.docx)",
+    OutputFormat.DOCX_FLOW: "Word, reflowable (.docx)",
+    OutputFormat.XLSX: "Excel (.xlsx)",
+    OutputFormat.AI_PDF: "PDF for Illustrator (.pdf)",
+    OutputFormat.IDML: "InDesign (.idml)",
+    OutputFormat.GOOGLE_SLIDES: "Google Slides (.pptx)",
+    OutputFormat.TEMPLATE: "Layout template (.pptx)",
+}
+ACCEPTED_TYPES = ["application/pdf", "image/png", "image/jpeg"]  # 與 stages/s1_input.py 的檔案類型判斷一致
+_TARGET_MIN_PT, _TARGET_MAX_PT = 36.0, 14400.0  # 輸出尺寸的範圍：0.5 吋到 200 吋（PDF 規格建議的頁面上限）
 
 # 修正欄位 → 送給哪個階段
 FIELD_STAGE = {"size": 2, "corners": 2, "role": 4, "formula": 5, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
@@ -107,13 +135,24 @@ def _load(pipe, name: str, cls):
 def health() -> dict[str, Any]:
     from ..tools import libreoffice
 
-    return {"ok": True, "verify_engine": libreoffice.version() if libreoffice.available() else None, "formats": [f.value for f in s6_export.available()]}
+    return {
+        "ok": True, "verify_engine": libreoffice.version() if libreoffice.available() else None, "formats": [f.value for f in s6_export.available()],
+        "max_file_mb": CFG.section("input")["max_file_mb"], "accepted": list(ACCEPTED_TYPES),
+    }
 
 
 @app.get("/api/formats")
 def formats() -> list[dict[str, Any]]:
     ready = set(s6_export.available())
-    return [{"format": f.value, "label": FORMAT_LABELS.get(f, f.value), "available": f in ready} for f in OutputFormat]
+    return [{"format": f.value, "label": FORMAT_LABELS.get(f, f.value), "label_en": FORMAT_LABELS_EN.get(f, f.value), "available": f in ready} for f in OutputFormat]
+
+
+@app.get("/api/page-sizes")
+def page_sizes() -> list[dict[str, Any]]:
+    """輸出尺寸的預設清單（default.toml 的 [output_sizes]）。A、B 系列與 Letter、Legal、Tabloid 一律以直式（寬 ≤ 高）列出，
+    要橫式由前端對調寬高後送到 POST /api/jobs 的 target_width、target_height；簡報尺寸（Slide 16:9、Slide 4:3）照原樣列出（橫式）。"""
+    return [{"id": str(s["id"]), "label": str(s.get("label", s["id"])), "width_mm": float(s["width_mm"]), "height_mm": float(s["height_mm"])}
+            for s in CFG.section("output_sizes").get("sizes", [])]
 
 
 # ====================================================================== 建立工作
@@ -128,7 +167,20 @@ async def create_job(
     height: Optional[float] = Form(None, description="已知的實際高度"),
     unit: Literal["mm", "cm", "in", "pt", "px"] = Form("mm"),
     allow_training: bool = Form(False, description="是否同意用這份檔案改善辨識（預設不同意）"),
+    target_width: Optional[float] = Form(None, description="輸出尺寸的寬（可省略；與 target_height 一起填才算指定）"),
+    target_height: Optional[float] = Form(None, description="輸出尺寸的高"),
+    target_unit: Literal["mm", "cm", "in", "pt"] = Form("mm", description="輸出尺寸的單位"),
 ) -> dict[str, Any]:
+    """建立工作。輸出尺寸（target_width、target_height）兩個都有值才算指定：⑤把每一頁等比例縮放到放得進這個尺寸的最大比例並置中；
+    只填一個回 422（不默默忽略，免得使用者以為指定了尺寸）。直式或橫式由前端決定好寬高再送。"""
+    if (target_width is None) != (target_height is None):
+        raise HTTPException(422, "輸出尺寸的寬與高要一起填（或都不填，維持原始尺寸）。")
+    target = None
+    if target_width is not None and target_height is not None:
+        tw, th = to_pt(target_width, target_unit), to_pt(target_height, target_unit)
+        if not (_TARGET_MIN_PT <= tw <= _TARGET_MAX_PT and _TARGET_MIN_PT <= th <= _TARGET_MAX_PT):
+            raise HTTPException(422, f"輸出尺寸要在 {_TARGET_MIN_PT / 72 * 25.4:.1f} 到 {_TARGET_MAX_PT / 72 * 25.4:.0f} mm 之間。")
+        target = PhysicalSize(width=target_width, height=target_height, unit=target_unit)
     try:
         wanted = [OutputFormat(x.strip()) for x in outputs.split(",") if x.strip()]
     except ValueError:
@@ -150,7 +202,8 @@ async def create_job(
                 raise HTTPException(413, f"檔案超過 {CFG.section('input')['max_file_mb']} MB 上限。")
             tmp.write(chunk)
     try:
-        job_id = JOBS.create(Path(tmp.name), Path(file.filename or "upload").name, Intent(outputs=wanted or [OutputFormat.PPTX], mode=UsageMode(mode), known_size=size), allow_training)
+        intent = Intent(outputs=wanted or [OutputFormat.PPTX], mode=UsageMode(mode), known_size=size, target_size=target)
+        job_id = JOBS.create(Path(tmp.name), Path(file.filename or "upload").name, intent, allow_training)
     finally:
         os.unlink(tmp.name)
     return JOBS.status(job_id)
@@ -171,16 +224,21 @@ async def job_events(job_id: str) -> StreamingResponse:
     _job(job_id)
 
     async def stream():
-        sent = 0
+        sent = JOBS.run_start(job_id)  # 只送這一次執行的事件：修正後重跑時重新連線，不會先收到上一次的完成事件
         idle = 0
         while True:
             events = JOBS.events_since(job_id, sent)
             for e in events:
                 yield f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
             sent += len(events)
-            status = JOBS.status(job_id)["status"]
-            if status in ("done", "failed") and not events:
-                yield f"data: {json.dumps({'status': status, 'final': True}, ensure_ascii=False)}\n\n"
+            try:
+                st = JOBS.status(job_id)
+            except KeyError:  # 串流途中工作被刪除
+                yield f"data: {json.dumps({'status': 'failed', 'final': True, 'error': '這份工作已被刪除。'}, ensure_ascii=False)}\n\n"
+                return
+            if st["status"] in ("done", "failed") and not events:
+                final = {"status": st["status"], "final": True, "progress": st["progress"], "error": st["error"]}
+                yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
                 return
             idle = 0 if events else idle + 1
             if idle and idle % 50 == 0:
@@ -204,36 +262,58 @@ def job_report(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/pages")
 def job_pages(job_id: str) -> list[dict[str, Any]]:
+    """各頁的尺寸（輸出頁面，pt）、原始內容在輸出頁面上的位置（placement；沒有指定輸出尺寸時為 null）與預覽圖網址。
+    images 的 result、overlay 不帶 format，畫的是這份工作的第一個輸出格式；result_images 列出每個輸出格式各自的網址。"""
     pipe = _job(job_id)
     doc = _load(pipe, "s1/source_doc", SourceDoc)
     styled = pipe.store.load("s5/styled_doc", StyledDoc) if pipe.store.has("s5/styled_doc") else None
+    outputs = [f.value for f in _intent(pipe).outputs]
     out = []
     for ref in doc.pages:
         n = ref.page_index + 1
-        item: dict[str, Any] = {"page": n, "input_type": ref.input_type.value.value, "input_type_confidence": ref.input_type.confidence}
+        item: dict[str, Any] = {"page": n, "input_type": ref.input_type.value.value, "input_type_confidence": ref.input_type.confidence, "placement": None}
         if pipe.store.has(f"s2/page-{n:03d}"):
             spec = pipe.store.load(f"s2/page-{n:03d}", PageSpec)
             item.update({"width_pt": spec.page_width_pt.value, "height_pt": spec.page_height_pt, "size_source": spec.page_width_pt.source.value, "size_confidence": spec.page_width_pt.confidence, "notes": spec.notes})
+            item["source_width_pt"], item["source_height_pt"] = spec.page_width_pt.value, spec.page_height_pt  # 原始內容的尺寸（不受輸出尺寸影響）
         if styled and ref.page_index < len(styled.pages):
             sp = styled.pages[ref.page_index]
-            item.update({"width_pt": sp.width_pt, "height_pt": sp.height_pt})
+            item.update({"width_pt": sp.width_pt, "height_pt": sp.height_pt, "placement": _box_json(sp.placement) if sp.placement else None})
         base = f"/api/jobs/{job_id}/pages/{n}/image"
         item["images"] = {k: f"{base}?kind={k}" for k in ("original", "result", "overlay")}
+        item["result_images"] = {f: f"{base}?kind=result&format={f}" for f in outputs}
         item["elements"] = f"/api/jobs/{job_id}/pages/{n}/elements"
         out.append(item)
     return out
 
 
-def _png(im: Image.Image) -> Response:
+def _box_json(b) -> dict[str, float]:
+    return {"x": b.x, "y": b.y, "w": b.w, "h": b.h, "rotation": b.rotation}
+
+
+def _intent(pipe) -> Intent:
+    return Intent.model_validate(pipe.state.get("intent") or {})
+
+
+def _png_bytes(im: Image.Image) -> bytes:
     buf = io.BytesIO()
     im.save(buf, "PNG")
-    return Response(buf.getvalue(), media_type="image/png", headers={"Cache-Control": "no-cache"})
+    return buf.getvalue()
 
 
-def _result_image(pipe, report: FidelityReport, page_index: int, width_px: int) -> Optional[Image.Image]:
-    if report.target_render is None:
-        return None
-    path = pipe.store.blob_path(report.target_render)
+def _png(im: Image.Image) -> Response:
+    return Response(_png_bytes(im), media_type="image/png", headers={"Cache-Control": "no-cache"})
+
+
+# ---------------------------------------------------------------------- 預覽圖的渲染
+
+
+_RENDER_VERSION = "2"  # 預覽圖的畫法改了就加 1，舊的快取一起失效
+_NEUTRAL_LOCK = threading.Lock()
+
+
+def _pdf_page(path: Path, page_index: int, width_px: int) -> Optional[Image.Image]:
+    """用 PDFium 把 PDF 的一頁畫成指定寬度（像素）的影像。沒有這一頁回傳 None。"""
     doc = pdf.open_document(str(path))
     try:
         if page_index >= len(doc):
@@ -242,42 +322,192 @@ def _result_image(pipe, report: FidelityReport, page_index: int, width_px: int) 
         try:
             bx = reader.boxes()
             l, b, r, t = bx.get("crop", bx["media"])
-            return reader.render(72.0 * width_px / max(r - l, 1.0))
+            return reader.render(72.0 * width_px / max(r - l, 1.0)).convert("RGB")
         finally:
             reader.close()
     finally:
         doc.close()
 
 
+def _neutral_pdf(pipe, styled: StyledDoc) -> Path:
+    """成品文件的中性渲染（給 Illustrator 的 PDF 輸出器畫出來的 PDF，⑦的 7A 也是用它）。依成品文件的內容快取在工作目錄。"""
+    folder = pipe.dir / "previews"
+    folder.mkdir(exist_ok=True)
+    meta = folder / f"neutral-{pipe.store.hash_of('s5/styled_doc')}.json"
+    with _NEUTRAL_LOCK:
+        if meta.exists():
+            ref = BlobRef.model_validate_json(meta.read_text(encoding="utf-8"))
+            if pipe.store.blob_path(ref).exists():
+                return pipe.store.blob_path(ref)
+        out = s6_export.run(styled, OutputFormat.AI_PDF, "neutral", pipe.cfg, pipe.store)
+        atomic_write_text(meta, out.file.model_dump_json())
+        return pipe.store.blob_path(out.file)
+
+
+def _svg_live(pipe, page_index: int, width_px: int) -> Optional[Image.Image]:
+    """用 resvg 現畫 SVG 輸出檔的一頁（與⑦的 SVG 回讀驗證同一套字型清單與渲染前調整）。resvg 無法使用時回傳 None。"""
+    from ..exporters import svg as svgx
+    from ..verify import svg_target
+
+    resvg_py, _ = svg_target.engine()
+    if resvg_py is None or not pipe.store.has("s6/svg"):
+        return None
+    out = pipe.store.load("s6/svg", OutputFile)
+    pages, others = svgx.unpack(out, pipe.store)
+    data = pages.get(page_index)
+    if data is None:
+        return None
+    _, root = svgx.check(data, set(others) if others else None)
+    if root is None:
+        return None
+    p = svg_target._params(pipe.cfg)
+    _, lp = svgx.params_for(pipe.cfg)
+    book = svg_target.font_book(list(p["svg_font_dirs"]) or None)
+    text, _ = svg_target.render_copy(root, book, others, bool(p["svg_emulate_bold"]), float(lp.get("faux_bold_stroke_ratio", 0.03)))
+    return svg_target.render(resvg_py, text, width_px, book)
+
+
+def _render_result(pipe, fmt: OutputFormat, page_index: int, width_px: int, styled: StyledDoc, report: Optional[FidelityReport]) -> tuple[Optional[Image.Image], str]:
+    """某個輸出格式的成品畫成影像。回傳（影像, 用什麼畫的）。
+    pdf、ai_pdf：PDFium 直接畫輸出檔；svg：resvg 現畫（不行就用⑦驗證時的渲染）；pptx：⑦用 LibreOffice 轉出的 PDF；
+    其他格式、或那個格式沒有渲染結果時：成品文件的中性渲染。"""
+    image = None
+    if fmt in (OutputFormat.PDF, OutputFormat.AI_PDF) and pipe.store.has(f"s6/{fmt.value}"):
+        out = pipe.store.load(f"s6/{fmt.value}", OutputFile)
+        image = _pdf_page(pipe.store.blob_path(out.file), page_index, width_px)
+        if image is not None:
+            return image, fmt.value
+    if fmt == OutputFormat.SVG:
+        try:
+            image = _svg_live(pipe, page_index, width_px)
+        except Exception:  # resvg 現畫失敗：改用驗證時的渲染
+            image = None
+        if image is not None:
+            return image, "svg-resvg"
+        fr = next((r for r in (report.format_reports if report else []) if r.format == OutputFormat.SVG and r.render is not None), None)
+        if fr is not None and pipe.store.blob_path(fr.render).exists():
+            image = _pdf_page(pipe.store.blob_path(fr.render), page_index, width_px)
+            if image is not None:
+                return image, "svg-verify"
+    if fmt == OutputFormat.PPTX and report is not None and report.target_render is not None and pipe.store.blob_path(report.target_render).exists():
+        image = _pdf_page(pipe.store.blob_path(report.target_render), page_index, width_px)
+        if image is not None:
+            return image, "pptx-libreoffice"
+    return _pdf_page(_neutral_pdf(pipe, styled), page_index, width_px), "neutral"
+
+
+def _stamp(pipe, *names: str) -> str:
+    """快取戳記：相關產物的內容雜湊（工作重跑、產物內容改變時跟著改變，舊的預覽圖就不再使用）。"""
+    parts = [_RENDER_VERSION] + [f"{nm}={pipe.store.hash_of(nm) if pipe.store.has(nm) else '-'}" for nm in names]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _cached_png(pipe, job_id: str, key: str, stamp: str, make) -> tuple[bytes, dict[str, str]]:
+    """預覽圖的磁碟快取：<工作目錄>/previews/<key>-<stamp>.png（另存一個同名的 .json 記用什麼畫的）。
+    工作還在排隊或處理中時不寫快取（那時的產物可能只更新了一半）。同一個 key 的舊戳記檔案在寫入新檔時一併刪除。"""
+    folder = pipe.dir / "previews"
+    path = folder / f"{key}-{stamp}.png"
+    info = path.with_suffix(".json")
+    if path.exists():
+        meta = json.loads(info.read_text(encoding="utf-8")) if info.exists() else {}
+        return path.read_bytes(), meta
+    im, meta = make()
+    data = _png_bytes(im)
+    if JOBS.status(job_id)["status"] not in ("queued", "running"):
+        folder.mkdir(exist_ok=True)
+        for old in folder.glob(f"{key}-*"):
+            if old.stem != path.stem:
+                old.unlink(missing_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        atomic_write_text(info, json.dumps(meta))
+    return data, meta
+
+
 @app.get("/api/jobs/{job_id}/pages/{n}/image")
-def page_image(job_id: str, n: int, kind: Literal["original", "result", "overlay"] = "original", width: int = Query(1200, ge=100, le=4000)) -> Response:
-    """original：原圖（攤平後的工作影像）；result：輸出檔用驗證引擎渲染的樣子；
-    overlay：兩者半透明疊在一起，並用紅框標出低信心或有問題的元素。"""
+def page_image(
+    request: Request, job_id: str, n: int, kind: Literal["original", "result", "overlay"] = "original",
+    width: int = Query(1200, ge=100, le=4000), format: Optional[str] = Query(None, description="result、overlay 要畫哪個輸出格式；省略時用這份工作的第一個輸出格式"),
+) -> Response:
+    """original：原圖（攤平後的工作影像）；result：某個輸出格式的成品畫出來的樣子；
+    overlay：兩者半透明疊在一起，並用紅框標出低信心或有問題的元素。
+
+    format（只對 result、overlay 有意義）：pdf、ai_pdf 用 PDFium 直接畫輸出檔；svg 用 resvg 現畫（不行就用驗證時的渲染）；
+    pptx 用⑦以 LibreOffice 轉出的 PDF；其他格式或沒有渲染結果時，退回成品文件的中性渲染（ai_pdf 輸出器畫出來的 PDF）。
+    回應標頭 X-Mortise-Render 寫明用什麼畫的。format 不是認得的格式回 422；這份工作沒有輸出這個格式回 404。
+
+    有指定輸出尺寸時：result 是整張輸出頁面（含留白），寬為 width、高依輸出頁面的長寬比；original 仍是原圖；
+    overlay 以輸出頁面為底，原圖縮放後疊在原始內容的位置（placement）。
+    同一份工作、同一個格式、同一個寬度的圖會快取，工作重跑後自動失效（以產物的內容雜湊為準）。"""
     pipe = _job(job_id)
+    intent = _intent(pipe)
+    if pipe.store.has("s1/source_doc") and not 1 <= n <= len(pipe.store.load("s1/source_doc", SourceDoc).pages):
+        raise HTTPException(404, "沒有這一頁。")
+    fmt = None
+    if kind != "original":
+        if format is None:
+            fmt = intent.outputs[0] if intent.outputs else OutputFormat.PPTX
+        else:
+            try:
+                fmt = OutputFormat(format)
+            except ValueError:
+                raise HTTPException(422, "不認得的輸出格式。可用的格式見 /api/formats。")
+            if fmt not in intent.outputs:
+                raise HTTPException(404, f"這份工作沒有輸出 {fmt.value} 格式。")
     spec = _load(pipe, f"s2/page-{n:03d}", PageSpec)
-    original = Image.open(pipe.store.blob_path(spec.working_image)).convert("RGB")
-    h = round(width * original.size[1] / original.size[0])
-    original = original.resize((width, h), Image.LANCZOS)
-    if kind == "original":
-        return _png(original)
-    report = _load(pipe, "s7/fidelity_report", FidelityReport)
-    result = _result_image(pipe, report, n - 1, width)
-    if result is None:
-        raise HTTPException(409, "沒有輸出檔的渲染結果（驗證引擎未執行）。")
-    result = result.resize((width, h), Image.LANCZOS)
-    if kind == "result":
-        return _png(result)
-    over = Image.blend(original, result, 0.5)
-    styled = _load(pipe, "s5/styled_doc", StyledDoc)
-    sp = styled.pages[n - 1]
-    scale = width / sp.width_pt
-    flagged = _flagged(report, n - 1)
-    draw = ImageDraw.Draw(over)
-    for item in list(sp.text_boxes) + list(sp.tables) + list(sp.images):
-        if item.id in flagged:
-            b = item.box
-            draw.rectangle([b.x * scale, b.y * scale, (b.x + b.w) * scale, (b.y + b.h) * scale], outline=(220, 30, 30), width=3)
-    return _png(over)
+    if kind != "original":
+        styled = _load(pipe, "s5/styled_doc", StyledDoc)
+        if not 1 <= n <= len(styled.pages):
+            raise HTTPException(404, "沒有這一頁。")
+        report = _load(pipe, "s7/fidelity_report", FidelityReport)
+    stamp = _stamp(pipe, f"s2/page-{n:03d}", *(() if kind == "original" else ("s5/styled_doc", f"s6/{fmt.value}", "s7/fidelity_report")))
+    key = f"{kind}-{fmt.value if fmt else 'source'}-p{n}-w{width}"
+    etag = f'"{stamp}-{key}"'
+    headers = {"Cache-Control": "no-cache", "ETag": etag}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+
+    def original_image(w: int) -> Image.Image:
+        im = Image.open(pipe.store.blob_path(spec.working_image)).convert("RGB")
+        return im.resize((w, max(1, round(w * im.size[1] / im.size[0]))), Image.LANCZOS)
+
+    def make():
+        if kind == "original":
+            return original_image(width), {"render": "original"}
+        sp = styled.pages[n - 1]
+        result, engine = _render_result(pipe, fmt, n - 1, width, styled, report)
+        if result is None:
+            raise HTTPException(409, "沒有輸出檔的渲染結果。")
+        if sp.placement is None:
+            orig = original_image(width)
+            result = result.resize(orig.size, Image.LANCZOS)  # 與原圖同尺寸，疊圖時才對得齊
+        else:
+            result = result.resize((width, max(1, round(width * sp.height_pt / sp.width_pt))), Image.LANCZOS)
+        if kind == "result":
+            return result, {"render": engine}
+        scale = width / sp.width_pt
+        if sp.placement is None:
+            over = Image.blend(orig, result, 0.5)
+        else:  # 輸出頁面為底；原圖縮放到原始內容的位置再疊上去（留白處只有成品）
+            pl = sp.placement
+            box = (round(pl.x * scale), round(pl.y * scale), round((pl.x + pl.w) * scale), round((pl.y + pl.h) * scale))
+            region = result.crop(box)
+            src = Image.open(pipe.store.blob_path(spec.working_image)).convert("RGB").resize(region.size, Image.LANCZOS)
+            over = result.copy()
+            over.paste(Image.blend(src, region, 0.5), box[:2])
+        flagged = _flagged(report, n - 1)
+        draw = ImageDraw.Draw(over)
+        for item in list(sp.text_boxes) + list(sp.tables) + list(sp.images):
+            if item.id in flagged:
+                b = item.box
+                draw.rectangle([b.x * scale, b.y * scale, (b.x + b.w) * scale, (b.y + b.h) * scale], outline=(220, 30, 30), width=3)
+        return over, {"render": engine}
+
+    data, meta = _cached_png(pipe, job_id, key, stamp, make)
+    if meta.get("render"):
+        headers["X-Mortise-Render"] = meta["render"]
+    return Response(data, media_type="image/png", headers=headers)
 
 
 def _flagged(report: FidelityReport, page_index: int) -> dict[str, list[str]]:
@@ -406,10 +636,10 @@ def delete_job(job_id: str) -> Response:
     return Response(status_code=204)
 
 
-# ====================================================================== 開發用的簡易頁面（正式前端另做）
+# ====================================================================== 開發用的簡易頁面（正式前端在 web/）
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/dev", response_class=HTMLResponse)
 def dev_page() -> str:
     return """<!doctype html><meta charset="utf-8"><title>Mortise</title>
 <style>body{font:15px system-ui;margin:2rem;max-width:900px}img{max-width:100%;border:1px solid #ccc}</style>
@@ -424,3 +654,59 @@ const pages=await (await fetch(`/api/jobs/${j.job_id}/pages`)).json();
 r.innerHTML=pages.map(p=>`<h3>第 ${p.page} 頁</h3><img src="${p.images.overlay}">`).join('')+
 `<p><a href="/api/jobs/${j.job_id}/download/pptx">下載 PPTX</a> · <a href="/api/jobs/${j.job_id}/download/report">還原度報告</a></p>`}}}
 </script>"""
+
+
+# ====================================================================== 前端（web/dist）
+
+WEB_DIST = Path(os.environ.get("MORTISE_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist")))
+_LONG_CACHE = "public, max-age=31536000, immutable"  # Vite 建置出的 assets/ 檔名含內容雜湊，內容變了檔名就變
+
+
+_BUILD_HELP = """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>Mortise</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;margin:3rem auto;max-width:640px;padding:0 1rem;color:#222}code,pre{background:#f3f3f3;border-radius:4px}pre{padding:.8rem 1rem}code{padding:.1rem .3rem}</style>
+<h1>Mortise</h1>
+<p>前端還沒有建置（找不到 <code>web/dist/index.html</code>）。在專案根目錄執行：</p>
+<pre>cd web
+npm install
+npm run build</pre>
+<p>建置完重新整理這一頁即可（不必重新啟動伺服器）。開發時可以改跑 <code>npm run dev</code>（Vite 會把 <code>/api</code> 轉到 http://127.0.0.1:8000）。</p>
+<p>API 說明：<a href="/docs">/docs</a>　開發測試頁：<a href="/dev">/dev</a></p>
+</html>"""
+
+
+class _Frontend(StaticFiles):
+    """前端的靜態檔案加單頁應用的後備：
+    - /api 開頭的路徑一律 404（API 的路由在前面；走到這裡表示 API 沒有這個端點，絕不回前端頁面）。
+    - 實體檔案照常回傳；assets/ 底下的檔名含內容雜湊，給長快取；其他檔案（index.html、favicon 等）不快取或短快取。
+    - 不是實體檔案的路徑回 index.html（前端自己的路由）；但 assets/ 底下找不到的檔案回 404，免得瀏覽器把 HTML 當成程式碼載入。
+    - 還沒建置（沒有 index.html）時，首頁顯示建置說明。目錄是每次請求時才檢查，建置完不必重新啟動伺服器。"""
+
+    async def check_config(self) -> None:  # 目錄可能還不存在（還沒建置）：不在啟動時報錯
+        return None
+
+    async def get_response(self, path: str, scope) -> Response:
+        path = path.replace(os.sep, "/")
+        if path == "api" or path.startswith("api/"):
+            raise StarletteHTTPException(status_code=404)
+        index = Path(self.directory) / "index.html"
+        if not index.is_file():
+            if path in (".", "", "index.html"):
+                return HTMLResponse(_BUILD_HELP, headers={"Cache-Control": "no-cache"})
+            raise StarletteHTTPException(status_code=404)
+        if path not in (".", "", "index.html"):
+            try:
+                response = await super().get_response(path, scope)
+            except StarletteHTTPException as e:
+                if e.status_code != 404 or path.startswith("assets/"):
+                    raise
+            else:
+                if response.status_code < 400:
+                    response.headers["Cache-Control"] = _LONG_CACHE if path.startswith("assets/") else "public, max-age=3600"
+                return response
+        if scope["method"] not in ("GET", "HEAD"):
+            raise StarletteHTTPException(status_code=405)
+        return FileResponse(index, media_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
+# 一定要放在所有 API 路由之後：路由依登記順序比對，API 先比對，剩下的才交給前端
+app.mount("/", _Frontend(directory=str(WEB_DIST), check_dir=False), name="web")

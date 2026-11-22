@@ -240,3 +240,22 @@ ocr_arbitration = true               # ③信心值低的字在候選中挑選
 "A5 直" = [419.528, 595.276]
 "Letter 直" = [612.0, 792.0]
 "Letter 橫" = [792.0, 612.0]
+
+[output_sizes]                       # 輸出尺寸的預設清單（API 的 GET /api/page-sizes；⑤依使用者選的尺寸縮放）。與上面辨識用的 [page_sizes] 無關
+# 一律以直式（寬 ≤ 高）列出，橫式由前端對調寬高後再送；簡報尺寸例外，照原樣列出（橫式）。B 系列用 JIS B（台灣、日本影印紙常用的 B4、B5）
+sizes = [
+  { id = "A0", label = "A0", width_mm = 841.0, height_mm = 1189.0 },
+  { id = "A1", label = "A1", width_mm = 594.0, height_mm = 841.0 },
+  { id = "A2", label = "A2", width_mm = 420.0, height_mm = 594.0 },
+  { id = "A3", label = "A3", width_mm = 297.0, height_mm = 420.0 },
+  { id = "A4", label = "A4", width_mm = 210.0, height_mm = 297.0 },
+  { id = "A5", label = "A5", width_mm = 148.0, height_mm = 210.0 },
+  { id = "A6", label = "A6", width_mm = 105.0, height_mm = 148.0 },
+  { id = "B4", label = "B4", width_mm = 257.0, height_mm = 364.0 },
+  { id = "B5", label = "B5", width_mm = 182.0, height_mm = 257.0 },
+  { id = "Letter", label = "Letter", width_mm = 215.9, height_mm = 279.4 },
+  { id = "Legal", label = "Legal", width_mm = 215.9, height_mm = 355.6 },
+  { id = "Tabloid", label = "Tabloid", width_mm = 279.4, height_mm = 431.8 },
+  { id = "Slide 16:9", label = "Slide 16:9", width_mm = 338.67, height_mm = 190.5 },
+  { id = "Slide 4:3", label = "Slide 4:3", width_mm = 254.0, height_mm = 190.5 },
+]

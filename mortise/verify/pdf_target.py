@@ -7,6 +7,7 @@
 
   1. 外觀（similarity）
      PDFium 把這一頁畫成影像，與工作影像比相似度（沿用 s7_verify.similarity）。
+     有指定輸出尺寸時（StyledPage.placement），只比原始內容那一塊（s7_verify.content_region），留白不算。
 
   2. 文字（text_match_ratio、position_error_pt）
      用③的擷取函式（s3_recognize.read_text_lines，與讀原生 PDF 是同一支）把文字行讀回來，
@@ -18,7 +19,7 @@
      字級不一致、字型與預期內嵌的不同，各開一條問題。
 
   3. 與來源比對（只在 issues 與 notes 裡報告，不計入上面兩個數字）
-     同一批讀回來的字，再與③讀到的來源文字行比對。第 2 項的預期值出自輸出器自己的排版，
+     同一批讀回來的字，再與③讀到的來源文字行比對（有輸出尺寸時，來源座標先經 placement 換到輸出頁面）。第 2 項的預期值出自輸出器自己的排版，
      只能抓到「寫檔寫錯」（字寬表、文字矩陣、編碼）；排版本身偏了（行距、斷行、首行位置）要靠這一項。
      擷取產線（原生 PDF）的來源位置是精確的，超過容許差就開警告；影像產線的來源位置是量測值，只列數字。
 
@@ -155,13 +156,15 @@ def _line_angle(line: TextLine) -> float:
     return math.degrees(math.atan2(dy, dx)) if math.hypot(dx, dy) > 1e-12 else 0.0
 
 
-def _line_chars(line: TextLine, index: int, w: float) -> list[_Char]:
-    """讀回來的一行 → 每個字在頁面上的位置。行的座標是頁寬為 1 的相對單位，乘上頁寬（pt）還原。"""
+def _line_chars(line: TextLine, index: int, w: float, ox: float = 0.0, oy: float = 0.0) -> list[_Char]:
+    """讀回來的一行 → 每個字在頁面上的位置。行的座標是頁寬為 1 的相對單位，乘上頁寬（pt）還原。
+    來源文字行（原始頁面的座標）放到有指定輸出尺寸的頁面時，w 是原始內容在輸出頁面上的寬（placement 的寬），
+    ox、oy 是它的左上角（見 s7_verify.source_frame）。"""
     ang = _line_angle(line)
     ux, uy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
     starts = [cx for r in line.runs for cx in r.char_x]
     base = min(starts) if starts else 0.0
-    ox, oy = line.baseline[0].x * w, line.baseline[0].y * w
+    ox, oy = ox + line.baseline[0].x * w, oy + line.baseline[0].y * w
     out: list[_Char] = []
     for r in line.runs:
         size = float(r.font_size.value) * w
@@ -249,18 +252,18 @@ def _wants_from_placed(placed: list[ai_pdf.PlacedLine]) -> list[_Want]:
     return out
 
 
-def _wants_from_source(lines: list[TextLine], w: float) -> list[_Want]:
-    """③讀到的來源文字行 → 預期的位置（頁寬換成成品文件的 pt）。"""
+def _wants_from_source(lines: list[TextLine], w: float, ox: float = 0.0, oy: float = 0.0) -> list[_Want]:
+    """③讀到的來源文字行 → 預期的位置（頁寬換成成品文件的 pt；有輸出尺寸時 w、ox、oy 見 _line_chars）。"""
     out = []
     for i, line in enumerate(lines):
         if line.hidden or not _strip(line.text):
             continue
-        cs = _line_chars(line, i, w)
+        cs = _line_chars(line, i, w, ox, oy)
         if not cs:
             continue
         ang = _line_angle(line)
         ux, uy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
-        x0, y0 = line.baseline[0].x * w, line.baseline[0].y * w
+        x0, y0 = ox + line.baseline[0].x * w, oy + line.baseline[0].y * w
         out.append(_Want(key=line.id, text=line.text, x=x0, y=y0, angle=ang, size=line.font_size * w,
                          chars=[(c.ch, (c.x - x0) * ux + (c.y - y0) * uy, c.size) for c in cs]))
     return out
@@ -580,14 +583,16 @@ def compare_text(placed: list[ai_pdf.PlacedLine], got: list[TextLine], width_pt:
     return hits, [c for c in chars if not c.used]
 
 
-def compare_source(source: list[TextLine], got: list[TextLine], width_pt: float) -> list[_Hit]:
-    """讀回來的文字行與③讀到的來源文字行比對（位置以成品文件的頁寬換算成 pt）。"""
+def compare_source(source: list[TextLine], got: list[TextLine], width_pt: float, frame: Optional[tuple[float, float, float]] = None) -> list[_Hit]:
+    """讀回來的文字行與③讀到的來源文字行比對（位置以成品文件的頁寬換算成 pt）。
+    frame 是來源座標換到輸出頁面的（比例, x 位移, y 位移）（s7_verify.source_frame）；不給就是沒有縮放（比例 = 頁寬）。"""
     chars = [c for i, line in enumerate(got) for c in _line_chars(line, i, width_pt)]
-    return _match(_wants_from_source(source, width_pt), chars)
+    k, ox, oy = frame if frame is not None else (width_pt, 0.0, 0.0)
+    return _match(_wants_from_source(source, k, ox, oy), chars)
 
 
 def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc, cfg: Config, store: Store) -> FormatReport:
-    from ..stages.s7_verify import similarity  # 延後匯入：s7_verify 會回頭匯入本套件
+    from ..stages.s7_verify import content_region, similarity, verify_dpi  # 延後匯入：s7_verify 會回頭匯入本套件
 
     p = _params(cfg)
     ep = pdf_editable.params_for(cfg)
@@ -622,7 +627,7 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
                 continue
             reader = pdf.PageReader(pdoc, i)
             try:
-                image = reader.render(p["render_dpi"])
+                image = reader.render(verify_dpi(p["render_dpi"], sp, spec))
                 got, width = read_lines(reader, i, cfg)
                 objects = read_objects(reader) if p["pdf_check_objects"] else []
                 tree = read_struct_tree(reader) if tagged else []
@@ -636,7 +641,7 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
             sim: Optional[float] = None
             if spec is not None:
                 working = Image.open(store.blob_path(spec.working_image))
-                sim = similarity(working, image)
+                sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊（留白不算）
                 if sim < p["pdf_similarity_pass"]:
                     issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"輸出檔重新畫出來與原圖的相似度 {sim:.3f}，低於合格線 {p['pdf_similarity_pass']}。"))
             # 2. 文字
@@ -710,7 +715,9 @@ def _clip(text: str, n: int = 24) -> str:
 
 def _source_issues(el: ElementList, sp: StyledPage, got: list[TextLine], width: float, p: dict) -> list[Issue]:
     """與③讀到的來源文字行比對。擷取產線的來源位置是精確的，超過容許差就開警告；影像產線只列數字。"""
-    hits = compare_source(el.texts, got, width)
+    from ..stages.s7_verify import source_frame
+
+    hits = compare_source(el.texts, got, width, source_frame(sp))
     if not hits:
         return []
     found = [h for h in hits if h.found]
@@ -820,8 +827,10 @@ def line_fit(styled: StyledDoc, elements: list[ElementList], cfg: Optional[Confi
         el = next((e for e in elements if e.page_index == sp.page_index), None)
         if el is None or el.production_line.value != "extract":
             continue
-        w = sp.width_pt
-        src_chars = [c for i, line in enumerate(el.texts) if not line.hidden for c in _line_chars(line, i, w)]
+        from ..stages.s7_verify import source_frame
+
+        k, ox, oy = source_frame(sp)  # 來源文字行換到輸出頁面的座標（有輸出尺寸時經過縮放與置中）
+        src_chars = [c for i, line in enumerate(el.texts) if not line.hidden for c in _line_chars(line, i, k, ox, oy)]
         for hit in _match(_wants_from_placed(placed), src_chars):
             if not hit.found:
                 continue

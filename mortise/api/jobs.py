@@ -39,6 +39,7 @@ class Progress:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     run_count: int = 0
+    run_start: int = 0  # 這一次執行的第一則事件在 events 裡的位置（重跑時進度串流從這裡開始送）
 
     def fraction(self) -> float:
         """整體進度（0 到 1）：③以前逐頁計，之後逐階段計。"""
@@ -108,12 +109,18 @@ class JobManager:
         prog = self.progress.get(job_id)
         return prog.events[index:] if prog else []
 
+    def run_start(self, job_id: str) -> int:
+        """最近一次排入執行的第一則事件的位置（進度串流從這裡開始送）。"""
+        prog = self.progress.get(job_id)
+        return prog.run_start if prog else 0
+
     # ---------- 執行 ----------
     def submit(self, job_id: str) -> None:
         with self.lock:
             prog = self.progress.setdefault(job_id, Progress())
             prog.status = "queued"
             prog.error = None
+            prog.run_start = len(prog.events)
         self.pool.submit(self._run, job_id)
 
     def add_corrections(self, job_id: str, corrections: list[Correction]) -> None:

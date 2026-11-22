@@ -12,6 +12,7 @@
   s5.tables       表格：欄寬、列高、儲存格邊距與垂直對齊、底色、框線、數字格式推論（千分位、百分比、貨幣）
   s5.masters      母片：每一頁相同位置都出現的元素
   s5.formula      Excel 公式推論（只當候選，使用者確認才寫入）
+  s5.output_size  使用者指定輸出尺寸時：整頁等比例縮放到放得進目標頁面的最大比例並置中（placement 記原始內容的位置）
 尚未實作：顏色吸附、比例尺一致性檢查。
 """
 
@@ -30,9 +31,10 @@ from ..artifacts.common import Measured
 from ..artifacts.element_list import ImageKind, ShapeGeometry
 from ..config import Config
 from ..tools.fonts import has_cjk, verification_font
+from ..tools.units import to_pt
 
 NAME = "s5"
-VERSION = "5"
+VERSION = "6"
 
 _APPS = [
     ("powerpoint", "powerpoint"), ("impress", "libreoffice_impress"), ("keynote", "keynote"), ("google slides", "google_slides"),
@@ -255,7 +257,233 @@ def run(doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layo
     if masters:
         notes.append(f"有 {sum(len(m.member_ids) for m in masters)} 個元素在每一頁都出現在相同位置，已放到母片上。")
     styled = StyledDoc(target_mode=target_mode, source_app=source_app, pages=pages, styles=styles, theme_colors=theme, notes=notes, masters=masters)
+    # ---------- s5.output_size ----------
+    # 先縮放再套用使用者的修正：使用者看到、修正的是輸出尺寸上的值（例如字級），不能再被縮放一次
+    if doc.intent.target_size is not None:
+        ts = doc.intent.target_size
+        styled = fit_to_size(styled, to_pt(ts.width, ts.unit), to_pt(ts.height, ts.unit), c["box_width_slack_pt"])
     return _apply_corrections(styled, corrections, subs)
+
+
+# ---------- s5.output_size：輸出尺寸 ----------
+
+_SAME_SIZE_PT = 0.01  # 目標尺寸與原始尺寸相差不到這麼多（pt）就視為同一尺寸，不縮放
+
+
+class PageScale:
+    """一頁的等比例縮放：原始頁面座標（pt，原點左上）→ 輸出頁面座標。x' = ox + s·x，y' = oy + s·y；長度 × s。
+
+    唯一的例外是會換行的文字框的寬：s5.box 為了目標軟體多留的餘裕（settings.box_width_slack_pt）是固定的 pt 數，
+    各輸出器斷行時也是扣掉這個固定值，所以只縮放「文字本身的寬」，餘裕照原值加回去；
+    字級四捨五入到 0.01 pt 時若比照比例的值大一點點，文字本身的寬也跟著放大同樣的比例（否則貼齊框寬的最長一行會被折到下一行）。"""
+
+    def __init__(self, s: float, ox: float, oy: float, slack: float = 0.0):
+        self.s, self.ox, self.oy, self.slack = s, ox, oy, slack
+
+    def same_as(self, other: "PageScale") -> bool:
+        return abs(self.s - other.s) <= 1e-9 and abs(self.ox - other.ox) <= 1e-6 and abs(self.oy - other.oy) <= 1e-6
+
+    # ---- 基本量
+    def length(self, v: float) -> float:
+        return v * self.s
+
+    def opt(self, v: float | None) -> float | None:
+        return None if v is None else v * self.s
+
+    def font_size(self, v: float) -> float:
+        return round(v * self.s, 2)  # 字級：照比例的精確值，四捨五入到 0.01 pt，不吸附
+
+    def metric(self, v: float) -> float:
+        return round(v * self.s, 2)  # 段落與儲存格的設定值（段距、縮排、邊距、固定行距）
+
+    def box(self, b: Box) -> Box:
+        return b.model_copy(update={"x": self.ox + b.x * self.s, "y": self.oy + b.y * self.s, "w": b.w * self.s, "h": b.h * self.s})
+
+    def path(self, segments: list[list[float]]) -> list[list[float]]:
+        """路徑座標相對於框左上角：只要乘上比例（種類代碼不動）。"""
+        return [[sg[0]] + [v * self.s for v in sg[1:]] for sg in segments]
+
+    # ---- 文字
+    def run(self, r: StyledRun) -> StyledRun:
+        size = r.size_pt.model_copy(update={"value": self.font_size(r.size_pt.value), "error": self.opt(r.size_pt.error)})
+        return r.model_copy(update={"size_pt": size})
+
+    def paragraph(self, p: StyledParagraph) -> StyledParagraph:
+        spacing = p.line_spacing
+        if spacing is not None and spacing.value.mode == LineSpacingMode.EXACT:
+            spacing = spacing.model_copy(update={"value": spacing.value.model_copy(update={"value": self.metric(spacing.value.value)}), "error": self.opt(spacing.error)})
+        return p.model_copy(update={
+            "runs": [self.run(r) for r in p.runs], "line_spacing": spacing, "space_before_pt": self.metric(p.space_before_pt),
+            "space_after_pt": self.metric(p.space_after_pt), "first_line_indent_pt": self.metric(p.first_line_indent_pt),
+        })
+
+    def text_box(self, tb: StyledTextBox) -> StyledTextBox:
+        fb = None if tb.first_baseline_pt is None else round(tb.first_baseline_pt * self.s, 3)
+        box = self.box(tb.box)
+        if tb.wrap and tb.paragraphs:
+            align = tb.paragraphs[0].align
+            k = 0.0 if align in (Align.LEFT, Align.JUSTIFY) else (1.0 if align == Align.RIGHT else 0.5)  # 依對齊方式錨定（同 s5.box）
+            natural = max(tb.box.w - self.slack, 0.0)
+            sizes = [r.size_pt.value for p in tb.paragraphs for r in p.runs if r.size_pt.value > 0]
+            grow = max([1.0] + [self.font_size(v) / (v * self.s) for v in sizes])  # 字級進位造成的放大
+            width = natural * self.s * grow
+            # 原本的框 = 文字本身的框往對齊的反方向加寬 slack；縮放後保持同樣的關係
+            x = self.ox + (tb.box.x + k * self.slack) * self.s - k * (width - natural * self.s) - k * self.slack
+            box = box.model_copy(update={"x": x, "w": width + self.slack})
+        return tb.model_copy(update={"box": box, "paragraphs": [self.paragraph(p) for p in tb.paragraphs], "first_baseline_pt": fb})
+
+    # ---- 圖片、形狀、向量圖
+    def image(self, im: StyledImage) -> StyledImage:
+        return im.model_copy(update={"box": self.box(im.box)})
+
+    def shape(self, sh: StyledShape) -> StyledShape:
+        # 線段的 rotation 是方向旗標（0 左上到右下、1 左下到右上），不是角度：照原樣保留
+        return sh.model_copy(update={
+            "box": self.box(sh.box), "stroke_width_pt": self.opt(sh.stroke_width_pt), "corner_radius_pt": self.opt(sh.corner_radius_pt), "path": self.path(sh.path),
+        })
+
+    def vector_path(self, vp: StyledVectorPath) -> StyledVectorPath:
+        gradient = vp.gradient
+        if gradient is not None:  # linear [x0, y0, x1, y1]、radial [cx, cy, r]：都相對於框左上角，全部乘上比例
+            gradient = gradient.model_copy(update={"coords": [v * self.s for v in gradient.coords]})
+        prim = vp.primitive
+        if prim is not None:
+            prim = prim.model_copy(update={
+                "cx": prim.cx * self.s, "cy": prim.cy * self.s, "w": prim.w * self.s, "h": prim.h * self.s,
+                "corner_radius": prim.corner_radius * self.s, "points": [[v * self.s for v in pt] for pt in prim.points],
+            })
+        return vp.model_copy(update={"path": self.path(vp.path), "gradient": gradient, "primitive": prim, "stroke_width_pt": self.opt(vp.stroke_width_pt)})
+
+    def vector(self, v: StyledVector) -> StyledVector:
+        return v.model_copy(update={"box": self.box(v.box), "paths": [self.vector_path(vp) for vp in v.paths]})
+
+    # ---- 表格
+    def cell(self, c):
+        borders = [None if b is None else b.model_copy(update={"width_pt": b.width_pt * self.s}) for b in c.borders]
+        return c.model_copy(update={"paragraphs": [self.paragraph(p) for p in c.paragraphs], "borders": borders, "margins_pt": [self.metric(m) for m in c.margins_pt]})
+
+    def table(self, t):
+        return t.model_copy(update={
+            "box": self.box(t.box), "col_widths_pt": [w * self.s for w in t.col_widths_pt], "row_heights_pt": [h * self.s for h in t.row_heights_pt],
+            "cells": [self.cell(c) for c in t.cells],
+        })
+
+    # ---- 整頁
+    def page(self, p: StyledPage, width: float, height: float) -> StyledPage:
+        """整頁換到輸出尺寸。底色由各輸出器畫滿整頁（留白處也是底色）；底圖只屬於原始內容，
+        各輸出器卻都把 background_image 畫滿整頁，所以改成一張放在原始內容範圍（placement）、在最底層的圖片。"""
+        placement = Box(x=self.ox, y=self.oy, w=p.width_pt * self.s, h=p.height_pt * self.s)
+        images = [self.image(im) for im in p.images]
+        bg_image = p.background_image
+        if bg_image is not None:
+            zs = [x.z for x in [*p.text_boxes, *p.images, *p.shapes, *p.tables, *p.vectors]]
+            images.insert(0, StyledImage(id=f"p{p.page_index + 1:03d}-background", box=placement, z=min(zs, default=0) - 1, image=bg_image))
+            bg_image = None
+        return p.model_copy(update={
+            "width_pt": width, "height_pt": height, "background_image": bg_image, "placement": placement,
+            "text_boxes": [self.text_box(tb) for tb in p.text_boxes], "images": images, "shapes": [self.shape(s) for s in p.shapes],
+            "tables": [self.table(t) for t in p.tables], "vectors": [self.vector(v) for v in p.vectors],
+        })
+
+    def master(self, m):
+        return m.model_copy(update={"text_boxes": [self.text_box(tb) for tb in m.text_boxes], "images": [self.image(im) for im in m.images], "shapes": [self.shape(s) for s in m.shapes]})
+
+
+def page_scale(width: float, height: float, target_w: float, target_h: float, slack: float = 0.0) -> PageScale | None:
+    """放得進目標頁面的最大等比例縮放，並置中。目標與原始尺寸相同時回傳 None（不縮放）。"""
+    if abs(width - target_w) <= _SAME_SIZE_PT and abs(height - target_h) <= _SAME_SIZE_PT:
+        return None
+    s = min(target_w / width, target_h / height)
+    return PageScale(s, (target_w - width * s) / 2, (target_h - height * s) / 2, slack)
+
+
+def _mm(pt: float) -> str:
+    return f"{pt * 25.4 / 72:.1f}"
+
+
+def fit_to_size(doc: StyledDoc, target_w: float, target_h: float, slack: float = 0.0) -> StyledDoc:
+    """s5.output_size：把每一頁等比例縮放到放得進 target_w × target_h（pt）的最大比例並置中。
+    所有位置、大小、字級、段落設定、表格、圖片、形狀、向量圖、母片一起縮放；placement 記原始內容在輸出頁面上的位置。
+    樣式表依縮放後的字級重建（各頁比例不同時，同一個原始樣式會變成不同字級）。"""
+    if target_w <= 0 or target_h <= 0:
+        return doc
+    scales: dict[int, PageScale | None] = {}
+    pages = []
+    notes = list(doc.notes)
+    described: list[str] = []
+    for p in doc.pages:
+        sc = page_scale(p.width_pt, p.height_pt, target_w, target_h, slack)
+        scales[p.page_index] = sc
+        if sc is None:
+            pages.append(p.model_copy(update={"width_pt": target_w, "height_pt": target_h, "placement": None}))
+            described.append(f"原始尺寸 {_mm(p.width_pt)} × {_mm(p.height_pt)} mm 已是輸出尺寸，不縮放")
+            continue
+        page = sc.page(p, target_w, target_h)
+        pages.append(page)
+        pl = page.placement
+        gap_x, gap_y = pl.x, pl.y
+        if gap_x > 0.005 and gap_y > 0.005:
+            margin = f"左右各留白 {_mm(gap_x)} mm、上下各留白 {_mm(gap_y)} mm"
+        elif gap_x > 0.005:
+            margin = f"左右各留白 {_mm(gap_x)} mm"
+        elif gap_y > 0.005:
+            margin = f"上下各留白 {_mm(gap_y)} mm"
+        else:
+            margin = "長寬比相同，沒有留白"
+        bg = "；原本的整頁底圖只放在原始內容的範圍，留白處用頁面底色" if p.background_image is not None else ("；留白處用頁面底色" if p.background_color is not None else "；留白處是白色")
+        described.append(
+            f"原始尺寸 {_mm(p.width_pt)} × {_mm(p.height_pt)} mm，輸出尺寸 {_mm(target_w)} × {_mm(target_h)} mm，"
+            f"整頁等比例縮放為 {sc.s * 100:.1f}%（文字、圖片、表格、形狀一起縮放，字級照比例不取整）並置中，{margin}{bg}"
+        )
+    if len(set(described)) == 1:
+        notes.append("輸出尺寸：" + described[0] + "。")
+    else:
+        notes += [f"輸出尺寸（第 {p.page_index + 1} 頁）：{d}。" for p, d in zip(doc.pages, described)]
+    masters = []
+    for m in doc.masters:
+        own = [scales.get(i) for i in m.page_indexes]
+        first = own[0] if own else None
+        if all((a is None and first is None) or (a is not None and first is not None and a.same_as(first)) for a in own):
+            masters.append(m if first is None else first.master(m))
+        else:  # 各頁縮放比例不同：同一個母片放不進每一頁，改回各頁各畫一次
+            notes.append(f"母片 {m.id} 所在的各頁縮放比例不同，改成在各頁各畫一次（改一處不會連動其他頁）。")
+    styles, sig_to_id = _style_table(pages)
+    pages = [_tag_styles(p, sig_to_id) for p in pages]
+    return doc.model_copy(update={"pages": pages, "masters": masters, "styles": styles, "notes": notes})
+
+
+def _style_table(pages: list[StyledPage]) -> tuple[list[Style], dict[tuple, str]]:
+    """依（縮放後的）各頁重建樣式表，算法與 run() 裡的 s5.styles 相同；樣式名稱的角色沿用原本的歸類。"""
+    counter: Counter = Counter()
+    role_of: dict[tuple, Role] = {}
+
+    def add(runs, role) -> None:
+        for r in runs:
+            sig = (r.font.family.value, r.size_pt.value, r.bold, r.italic, r.color.hex)
+            counter[sig] += len(r.text)
+            role_of.setdefault(sig, role)
+
+    for p in pages:
+        for tb in p.text_boxes:
+            for sp in tb.paragraphs:
+                add(sp.runs, sp.role)
+        for t in p.tables:
+            for cell in t.cells:
+                for sp in cell.paragraphs:
+                    add(sp.runs, Role.BODY)
+    styles: list[Style] = []
+    sig_to_id: dict[tuple, str] = {}
+    used: Counter = Counter()
+    for n, (sig, count) in enumerate(counter.most_common(), start=1):
+        family, size, bold, italic, hexcolor = sig
+        role = role_of.get(sig, Role.UNKNOWN)
+        base = _ROLE_NAMES.get(role, "文字")
+        used[base] += 1
+        sid = f"S{n}"
+        sig_to_id[sig] = sid
+        styles.append(Style(id=sid, name=base if used[base] == 1 else f"{base} {used[base]}", font_family=family, size_pt=size, bold=bold, italic=italic,
+                            color=Color(r=int(hexcolor[0:2], 16), g=int(hexcolor[2:4], 16), b=int(hexcolor[4:6], 16)), role=role, usage_count=count))
+    return styles, sig_to_id
 
 
 # ---------- s5.masters ----------

@@ -9,7 +9,7 @@
        所以字型對不上、或置中的行沒有真的置中，這裡都看得出來。
      - 另外把每行的起點與③辨識到的原始文字行相比，寫在 notes（這是相對於原圖的誤差，包含排版本身的誤差）。
   3. 渲染比對：用 resvg（resvg-py，MIT；resvg 本體 Apache-2.0 或 MIT）把 SVG 畫成影像，與工作影像比相似度
-     （算法沿用 stages/s7_verify.similarity）。resvg 不是瀏覽器，也不是 Illustrator、Inkscape、Figma，engine 欄會寫明。
+     （算法沿用 stages/s7_verify.similarity；有指定輸出尺寸時只比 placement 那一塊，留白不算）。resvg 不是瀏覽器，也不是 Illustrator、Inkscape、Figma，engine 欄會寫明。
      resvg-py 裝不上或執行失敗時，退回只做前兩項，並在 notes 寫明。
 
 字型：resvg 找不到字型時不報錯、直接換後備字型，所以這裡自己建立伺服器字型的清單（家族名稱、字重、斜體），
@@ -44,7 +44,7 @@ from ..config import Config
 from ..exporters import ai_pdf
 from ..exporters import svg as svgx
 from ..pipeline.store import Store
-from ..stages.s7_verify import similarity
+from ..stages.s7_verify import content_region, similarity, source_frame, verify_dpi
 
 DEFAULTS: dict[str, Any] = {
     "svg_similarity_pass": 0.95,  # 相似度低於此值就在 issues 提醒
@@ -399,7 +399,7 @@ def _source_offsets(page_index: int, read: dict[tuple, list[svgx.ReadLine]], wan
     if page_index >= len(elements) or page_index >= len(layout.pages):
         return []
     page = styled.pages[page_index]
-    w = page.width_pt
+    scale, ox, oy = source_frame(page)  # 來源文字行（原始頁面的相對座標）→ 輸出頁面 pt；有輸出尺寸時經過縮放與置中
     src = {t.id: t for t in elements[page_index].texts}
     pl = layout.pages[page_index]
     pars = {p.id: p for p in pl.paragraphs}
@@ -418,7 +418,7 @@ def _source_offsets(page_index: int, read: dict[tuple, list[svgx.ReadLine]], wan
             continue
         for e, g, ln in zip(expect, got, want):
             anchor = _read_anchor(g, ln.align, book)
-            (x0, y0), (x1, y1) = (e.baseline[0].x * w, e.baseline[0].y * w), (e.baseline[1].x * w, e.baseline[1].y * w)
+            (x0, y0), (x1, y1) = (ox + e.baseline[0].x * scale, oy + e.baseline[0].y * scale), (ox + e.baseline[1].x * scale, oy + e.baseline[1].y * scale)
             k = 0.5 if ln.align == Align.CENTER else 1.0 if ln.align == Align.RIGHT else 0.0
             if anchor is None:
                 anchor, k = (g.x, g.y), 0.0
@@ -523,11 +523,11 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
             try:
                 text, did = render_copy(root, book, others, bool(p["svg_emulate_bold"]), float(lp.get("faux_bold_stroke_ratio", 0.03)))
                 adjustments.update(did)
-                image = render(resvg_py, text, max(1, round(page.width_pt * p["render_dpi"] / 72.0)), book)
+                image = render(resvg_py, text, max(1, round(page.width_pt * verify_dpi(p["render_dpi"], page, spec) / 72.0)), book)
                 renders.append((image, page.width_pt, page.height_pt))
                 if spec is not None:
                     working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-                    sim = similarity(working, image)
+                    sim = similarity(working, content_region(image, page))  # 有輸出尺寸時只比原始內容那一塊（留白不算）
                     if sim < p["svg_similarity_pass"]:
                         issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"SVG 渲染後與原圖的相似度 {sim:.3f}，低於合格線 {p['svg_similarity_pass']}。"))
             except Exception as e:  # 渲染失敗：這一頁退回只做結構檢查

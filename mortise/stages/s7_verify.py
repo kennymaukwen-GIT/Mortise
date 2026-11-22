@@ -10,6 +10,12 @@
   s7.fields    每個元素每個欄位標示 精確擷取／量測吸附／AI 判斷／生成／使用者／無法還原
   s7.propose   開修正單：斷行不一致 → 調整文字框寬度；位置偏移 → 平移。這是目標軟體的渲染差異，送給⑥該格式的輸出器，不改成品文件
 
+有指定輸出尺寸時（⑤把頁面等比例縮放並置中，StyledPage.placement 記原始內容在輸出頁面上的位置）：
+  - 與原圖（工作影像）比相似度時，只比 placement 那一塊（content_region），留白不算；渲染解析度依縮放比例調整（verify_dpi），
+    讓那一塊的像素數與不縮放時相同。
+  - 「成品文件對輸出檔」的比對（讀回的文字與成品文件排版的位置）不受影響：兩邊都是輸出頁面的座標。
+  - 「輸出檔對來源」的比對（與③來源文字行的位置差）先用 placement 把來源座標換到輸出頁面（source_frame）。
+
 整體分數（overall_score）是各頁分數的平均。每一頁的分數依下面的順序取第一個算得出來的：
   1. 有 PowerPoint 的目標驗證：0.5 × 目標渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、位置在容許差內」的比例。
   2. 沒有 PowerPoint 的目標驗證、但有其他格式的回讀驗證（例如可編輯 PDF、SVG）：
@@ -40,7 +46,7 @@ from ..tools import pdfium as pdf
 from . import s2_page, s3_recognize
 
 NAME = "s7"
-VERSION = "3"
+VERSION = "4"
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -58,6 +64,39 @@ def similarity(a: Image.Image, b: Image.Image, width: int = 480) -> float:
     x = np.asarray(a.convert("L").resize((width, h), Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     y = np.asarray(b.convert("L").resize((width, h), Image.LANCZOS).filter(ImageFilter.GaussianBlur(1.0)), dtype=np.float32)
     return float(1.0 - np.abs(x - y).mean() / 255.0)
+
+
+# ---------- 輸出尺寸（placement）----------
+
+
+def content_region(image: Image.Image, page) -> Image.Image:
+    """有指定輸出尺寸時，輸出頁面上只有 placement 範圍是原始內容（其餘是留白）：把整頁的渲染結果裁到那個範圍，
+    才能與原圖（工作影像）比相似度。用浮點座標裁切（不取整到像素），沒有 placement 就原樣回傳。"""
+    pl = getattr(page, "placement", None)
+    if pl is None or page.width_pt <= 0:
+        return image
+    k = image.size[0] / page.width_pt
+    size = (max(1, round(pl.w * k)), max(1, round(pl.h * k)))
+    return image.transform(size, Image.EXTENT, (pl.x * k, pl.y * k, (pl.x + pl.w) * k, (pl.y + pl.h) * k), Image.BILINEAR)
+
+
+def verify_dpi(dpi: float, page, spec: PageSpec | None) -> float:
+    """比對用的渲染解析度。有 placement 時依縮放比例調整，讓原始內容那一塊的像素數與不縮放時相同
+    （縮小到小紙張時不會因為像素太少而失真，放大到大海報時也不必畫出巨大的影像）；調整幅度限制在 4 倍以內。"""
+    pl = getattr(page, "placement", None)
+    if pl is None or spec is None or pl.w <= 0:
+        return dpi
+    s = pl.w / max(spec.page_width_pt.value, 1e-6)
+    return dpi * min(4.0, max(0.25, 1.0 / s))
+
+
+def source_frame(page) -> tuple[float, float, float]:
+    """來源座標（頁寬為 1 的相對單位）換到輸出頁面 pt 的（比例, x 位移, y 位移）：x' = ox + k·x、y' = oy + k·y。
+    沒有 placement 時就是乘上頁寬。「輸出檔對來源」的比對（例如來源文字行的位置）一律用它換算。"""
+    pl = getattr(page, "placement", None)
+    if pl is None:
+        return page.width_pt, 0.0, 0.0
+    return pl.w, pl.x, pl.y
 
 
 def run(
@@ -244,13 +283,14 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
             if spec.page_index >= len(pdoc):
                 new_pages.append(report)
                 continue
+            sp = styled.pages[spec.page_index]
             reader = pdf.PageReader(pdoc, spec.page_index)
             try:
-                image = reader.render(c["render_dpi"])
+                image = reader.render(verify_dpi(c["render_dpi"], sp, spec))
             finally:
                 reader.close()
             working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-            sim = similarity(working, image)
+            sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊
             issues = list(report.issues)
             if sim < c.get("neutral_similarity_pass", 0.95):
                 issues.append(Issue(severity=Severity.WARNING, code="neutral_low_similarity", message=f"中性渲染與原圖的相似度 {sim:.3f} 偏低：辨識、結構或設定可能有誤。"))
@@ -277,18 +317,19 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                 if spec.page_index >= len(pdoc):
                     out_pages.append(report.model_copy(update={"issues": report.issues + [Issue(severity=Severity.ERROR, code="page_missing", message="輸出檔渲染後少了這一頁。")]}))
                     continue
+                sp = styled.pages[spec.page_index]
                 reader = pdf.PageReader(pdoc, spec.page_index)
                 try:
                     boxes = reader.boxes()
                     matrix, dw, dh = s2_page.pdf_matrix(boxes.get("crop", boxes["media"]), reader.rotation())
-                    image = reader.render(c["render_dpi"])
+                    image = reader.render(verify_dpi(c["render_dpi"], sp, spec))
                     r_lines = [t for t in s3_recognize.read_text_lines(reader, spec.page_index, matrix, dw, rc) if not t.hidden]
                 finally:
                     reader.close()
                 working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
-                sim = similarity(working, image)
-                sp = styled.pages[spec.page_index]
+                sim = similarity(working, content_region(image, sp))  # 有輸出尺寸時只比原始內容那一塊
                 w = sp.width_pt
+                k, ox, oy = source_frame(sp)  # 來源文字行（原始頁面的相對座標）→ 輸出頁面 pt
                 pl = layout.pages[spec.page_index]
                 src_lines = {t.id: t for t in el.texts}
                 pars = {p.id: p for p in pl.paragraphs}
@@ -326,8 +367,8 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                     pos = None
                     dx = dy = 0.0
                     if got:
-                        dx = (expect[0].baseline[0].x - got[0].baseline[0].x) * w
-                        dy = (expect[0].baseline[0].y - got[0].baseline[0].y) * w
+                        dx = (ox + expect[0].baseline[0].x * k) - got[0].baseline[0].x * w
+                        dy = (oy + expect[0].baseline[0].y * k) - got[0].baseline[0].y * w
                         pos = math.hypot(dx, dy)
                     new_elements.append(e.model_copy(update={"text_match": text_ok, "linebreak_match": breaks_ok, "position_error_pt": pos}))
                     if not got:
