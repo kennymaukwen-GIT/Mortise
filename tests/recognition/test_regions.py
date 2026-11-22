@@ -679,8 +679,13 @@ def _fixture(name: str, dpi: float = 100):
             found.append((g, regs[bi]))
         else:
             missed.append(g[:2])
-    extra = [(r.kind, r.bbox) for i, r in enumerate(regs) if i not in matched]
+    extra = [(r.kind, r.bbox) for i, r in enumerate(regs) if i not in matched and not _is_overlay(r)]
     return found, missed, extra, regs
+
+
+def _is_overlay(r) -> bool:
+    """從照片裡拆出來的平塗圖形（照片本身有一個黃橢圓、一個藍矩形；fixture 的答案只記整張圖片）。"""
+    return r.kind == "shape" and r.features.get("overlay", 0.0) == 1.0
 
 
 @pytest.mark.parametrize("name,n_expected", [("slide_dark", 6), ("poster", 4), ("doc_a4", 1), ("slide_basic", 2)])
@@ -694,6 +699,19 @@ def test_fixtures(name, n_expected):
         assert not extra or all(k == "shape" for k, _ in extra)
     else:
         assert kinds_ok == len(found) and not extra
+    # slide_dark 與 poster 的照片（make_fixtures._photo）上畫了平塗的黃橢圓與藍矩形：要拆成疊在照片上的形狀
+    over = sorted((r.shape.geometry, r.shape.fill) for r in regs if _is_overlay(r))
+    if name in ("slide_dark", "poster"):
+        assert [g for g, _ in over] == ["ellipse", "rect"]
+        for (_, got), want in zip(over, [(235, 200, 70), (40, 60, 90)]):
+            assert np.abs(np.subtract(got, want)).max() <= 3  # 縮小畫圖時邊緣混色，顏色差一兩個色階
+        photo = next(r for g, r in found if g[0] == "photo")
+        for r in regs:
+            if _is_overlay(r):
+                pb = photo.bbox
+                assert pb[0] <= r.bbox[0] and pb[1] <= r.bbox[1] and r.bbox[2] <= pb[2] and r.bbox[3] <= pb[3] and r.z > photo.z
+    else:
+        assert not over
     for g, r in found:
         if g[0] == "shape" and r.shape is not None:
             assert r.shape.geometry == g[1]

@@ -49,6 +49,11 @@
        c_i = c0 + i·p 求間距 p（標點不參與）；字級 = p ÷ 該字型的平均前進寬度（全形字為 1 em）。
        與高度證據比對：不一致超過 tracking_tol 就是「調字距嫌疑」，差值記成字距原始量測。
        間距變異超過 pitch_cv_max 判為「比例寬度嫌疑」，不用捷徑。
+    e2. 字距拉開（與字型無關，_letter_spacing）：拉丁詞以連通元件逐字切開（字數要對得上），逐字墨跡寬 ÷ 參考字型
+       墨跡寬 → 字級粗估；相鄰兩字的墨跡間隙減去「字級粗估 × 參考字型同一對字的間隙（含字距調整）」→ 多出來的間隙。
+       多出來的間隙大多一致、中位數至少 ls_min_track_em 個字級時判為字距拉開：之後量上下緣、寬度證據
+       （逐字墨跡寬）、模糊校準、重繪比對都改成逐字，字型與字級只看字形本身；最後以最佳字型與字級，
+       字距 = Σ（詞的墨跡寬 − 字級 × 字型的詞寬）÷ 字間數（_word_spacing_px），所以照這個字級與字距重排時詞寬與原圖相同。
     f. 量度分數 = 垂直吻合 × 寬高吻合 × 傾斜吻合 × 粗細吻合（筆畫粗細比與字型探針的同一估計法相比）；
        斜體字型的傾斜以「同一個量法量它自己的重繪」為準（字型檔的 italicAngle 與墨跡傾斜常不同）。
     g. 模糊校準與自我校正：以量度第一名重繪，搜尋讓重疊率最高的額外高斯模糊；再把它以同樣的模糊畫出、
@@ -85,6 +90,9 @@
 - 直排文字（line.vertical）未支援，當成橫排量並標示不可靠。
 - 沿曲線排列、藝術字、漸層填色只偵測不到或只標示，不還原參數。
 - 水平縮放與調字距的區分只在能逐字切出墨跡（連通元件數等於字數，或全形字格）時才做。
+- 拉丁字的字距拉開也只在逐字切得開時才偵測：字黏在一起（手寫、粗體小字、模糊）的詞不參與；
+  字距很小（不到 0.06 個字級）的不判。輸入的文字若仍在字母間帶空白（「S K I L L S」），每個字母各是一個詞，
+  量不出字距（拿掉空白是 ocr.py 的工作）。
 - 粗體只以候選字族內 Regular 與 Bold 的差距判斷；軟體硬加的假粗體與真粗體分不出來。
 - 截圖對齊整數像素的小字（hinting）未加試「對齊像素」畫法。
 
@@ -157,6 +165,12 @@ DEFAULT_PARAMS: dict = {
     "justify_tol": 0.03,  # 整段寬推得的字級比逐詞大超過此比例，標「左右對齊嫌疑」
     "tracking_tol": 0.04,  # 寬度（或間距）字級與高度字級相差超過此比例，標「調字距嫌疑」
     "xscale_tol": 0.5,  # 逐字墨跡寬的倍率與寬高比倍率差距小於「偏差的此比例」時判為水平縮放
+    # ---------------- 字距拉開（拉丁字，標題常見）
+    "ls_detect": True,  # 是否逐字切開拉丁詞、偵測字距拉開（偵測到時字型與字級只用字形本身的證據，差值記成字距）
+    "ls_min_pairs": 3,  # 至少要有幾對相鄰字母切得開（各自是獨立的墨跡）才判斷
+    "ls_min_track_em": 0.06,  # 逐對「多出來的間隙」的中位數至少此值（字級的倍數）才算拉開：正常排字（含字距調整）約 0 ± 0.03，再加上字界量測誤差
+    "ls_uniform_em": 0.08,  # 多出來的間隙與其中位數相差此值（字級的倍數）以內算「一致」：參考字型與實際字型的字形留白差約 0.03、字界誤差約 0.04
+    "ls_uniform_frac": 0.75,  # 至少這個比例的字對要「一致」才判為字距拉開（等寬字型的 i、l 兩側留白大，不會一致）
     # ---------------- 中文捷徑
     "min_cjk_chars": 3,  # 間距捷徑至少要幾個全形字（2 個字也會算，但誤差很大）
     "pitch_cv_max": 0.06,  # 間距變異（穩健標準差 ÷ 間距）超過此值標「比例寬度嫌疑」
@@ -972,12 +986,17 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
             notes.append("比例寬度嫌疑：相鄰全形字的間距忽大忽小，不用間距捷徑")
             pitch["proportional"] = True
 
+    # ---- 字距拉開（與字型無關）：拉丁詞逐字切開，字與字的間隙比參考字型一致地大。偵測到時，
+    #      量上下緣、寬度證據、模糊校準、重繪比對都改成逐字（g_units），字型與字級只看字形本身，間隙的差值記成字距
+    ls = _letter_spacing(mk, units, text, ref, P)
+    g_units = ls["glyphs"] if ls else units
+
     # ---- 第一輪：參考字型映射 → 每個字的上下緣 → 所有候選的量度分數
     map_face = ref if (ref is not None and ref.covers(run_text)) else (faces[0] if faces else None)
     if map_face is None:
         return _fallback_run(units, text, mk, geo, img, P, ["字型庫中沒有涵蓋這些字的字型"])
-    vert = _char_vertical(wcov, _char_columns(units, text, map_face))
-    evals = [_eval_face(fc, units, text, run_text, i0, idxs, vert, mk, pitch, slant, sig_slant, italic_meas, P) for fc in faces]
+    vert = _char_vertical(wcov, _char_columns(g_units, text, map_face))
+    evals = [_eval_face(fc, g_units, text, run_text, i0, idxs, vert, mk, pitch, slant, sig_slant, italic_meas, P) for fc in faces]
     evals = [e for e in evals if e is not None]
     if not evals:
         return _fallback_run(units, text, mk, geo, img, P, ["無法由遮罩量出字的上下緣"])
@@ -985,19 +1004,19 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
     # ---- 第二輪：以第一名字型重新映射欄範圍
     top = evals[0].face
     if top is not map_face:
-        vert2 = _char_vertical(wcov, _char_columns(units, text, top))
+        vert2 = _char_vertical(wcov, _char_columns(g_units, text, top))
         if len(vert2) >= max(1, len(vert) - 1):
             vert = vert2
             top_faces = [e.face for e in evals[: int(P["rescore_top"])]]
-            evals = [_eval_face(fc, units, text, run_text, i0, idxs, vert, mk, pitch, slant, sig_slant, italic_meas, P) for fc in top_faces]
+            evals = [_eval_face(fc, g_units, text, run_text, i0, idxs, vert, mk, pitch, slant, sig_slant, italic_meas, P) for fc in top_faces]
             evals = [e for e in evals if e is not None]
             evals.sort(key=lambda e: -e.metric)
 
     # ---- 模糊校準：用量度第一名的重繪結果，找出讓重疊率最高的額外模糊（之後所有候選都做同等模糊）
     sl0 = slant if evals[0].synthetic_slant else 0.0
-    mk.blur_extra = _calibrate_blur(evals[0], units, text, mk, sl0, P)
+    mk.blur_extra = _calibrate_blur(evals[0], g_units, text, mk, sl0, P)
     # ---- 模糊偏差自我校正：把第一名字型以同樣的模糊畫出來、用同樣的方法量，量到的字級與畫的字級之比就是偏差
-    bias = _blur_bias(evals[0], units, text, run_text, i0, idxs, mk, sl0, slant, P) if mk.blur_extra > 0 else None
+    bias = _blur_bias(evals[0], g_units, text, run_text, i0, idxs, mk, sl0, slant, P) if mk.blur_extra > 0 else None
     if bias is not None:
         rh, rw = bias
         for e in evals:
@@ -1014,7 +1033,8 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
     # ---- 例外偵測：左右對齊、調字距、水平縮放
     lead = evals[: min(5, len(evals))]
     justified = False
-    spaced_units = len([u for u in units if not u.cjk]) >= 2 and any(text[j].isspace() for j in range(i0, i1))
+    # 字距拉開時，詞間空白本來就比字型的空白寬（空白也加了字距），不是左右對齊
+    spaced_units = ls is None and len([u for u in units if not u.cjk]) >= 2 and any(text[j].isspace() for j in range(i0, i1))
     if spaced_units:
         rat = [e.s_span / e.s_w - 1 for e in lead[:3] if np.isfinite(e.s_span) and np.isfinite(e.s_w)]
         if rat and np.median(rat) > P["justify_tol"]:
@@ -1024,7 +1044,7 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
     x_scale = None
     char_spacing = None
     rho = [e.evidence.get("rho") for e in lead if e.evidence.get("rho") is not None]
-    if len(rho) >= 1:
+    if ls is None and len(rho) >= 1:
         lr = np.log(np.array(rho))
         if (np.all(lr > P["tracking_tol"]) or np.all(lr < -P["tracking_tol"])) and n_chars >= 3:
             tracking = True
@@ -1046,7 +1066,7 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
         for e in evals:
             _combine(e, P, use_width=True)
     # ---- 重繪用的單位：調字距時，全形字逐字放在量到的間距格點上（否則整段縮放會對不齊）
-    r_units = units
+    r_units = g_units
     if tracking and pitch and not pitch.get("proportional"):
         r_units = []
         for u in units:
@@ -1113,6 +1133,12 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
                 char_spacing = Estimate(cs / f, (best.sig_h * W_em / n_gap) / f, 0.5)
         if x_scale is not None:
             char_spacing = None
+    if ls is not None:
+        ws = _word_spacing_px(units, ls["words"], text, best.face, size, sig, sigma)
+        # 以最佳字型重算：等寬字型這類字形兩側本來就寬的字，重算後差值很小，就不記字距
+        if ws is not None and ws[0] >= 0.5 * P["ls_min_track_em"] * size:
+            char_spacing = Estimate(ws[0] / f, ws[1] / f, 0.7)
+            notes.append(f"字距拉開：逐字切開後，字與字之間比字型本身多出約 {ws[0] / size:.2f} 個字級（{ws[0] / f:.1f} 像素）的間隙；字型與字級只用字形本身判斷，差值記成字距")
     rel = sig / size if size > 0 else 1.0
     conf = float(np.clip(math.exp(-rel / P["conf_rel_scale"]), 0.02, 0.98) * conf_pen)
     # ---- 候選清單（不定案）
@@ -1158,7 +1184,7 @@ def _solve_run(img, geo: _Geom, mk: _Mask, wcov: np.ndarray, units: list[_Unit],
         else:
             line_notes.append("行框內有長橫線（不在底線或刪除線的位置，可能是表格線或分隔線）")
     # ---- 每個字的起點（mask x）
-    char_x_m = _char_starts(units, text, best)
+    char_x_m = _char_starts(g_units, text, best)
     asc_px = best.face.ascender * size
     desc_px = best.face.descender * size
     ev = {k: Estimate(v[0] / f, v[1] / f, v[2]) for k, v in best.evidence.get("sizes", {}).items()}
@@ -1455,6 +1481,113 @@ def _best_iou(R: np.ndarray, C: np.ndarray, mk: _Mask) -> float:
             if den > 0:
                 best = max(best, float(np.minimum(Rw, C).sum() / den))
     return best
+
+
+def _glyph_spans(mk: _Mask, colmax: np.ndarray, u: _Unit, n: int) -> Optional[list[tuple[float, float]]]:
+    """一個拉丁單位內逐字的墨跡左右緣（mask x，覆蓋率 0.5 的次像素交點）。
+
+    連通元件依 x 範圍合併（i 的點、é 的附加符號併入主體）；數目不等於字數（字相黏、一個字斷成兩塊）就回傳 None。
+    """
+    bin_ = mk.binary.astype(np.uint8)
+    j0, j1 = int(max(0, math.floor(u.a) - 1)), int(min(bin_.shape[1], math.ceil(u.b) + 1))
+    if j1 - j0 < 2:
+        return None
+    k, _lab, st, _ = cv2.connectedComponentsWithStats(np.ascontiguousarray(bin_[:, j0:j1]), connectivity=8)
+    spans = sorted([(int(st[i][0]) + j0, int(st[i][0] + st[i][2]) + j0) for i in range(1, k) if st[i][4] > 2])
+    merged: list[list[int]] = []
+    for a, b in spans:
+        if merged and min(b, merged[-1][1]) - max(a, merged[-1][0]) > 0.5 * min(b - a, merged[-1][1] - merged[-1][0]):
+            merged[-1][0], merged[-1][1] = min(merged[-1][0], a), max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    if len(merged) != n:
+        return None
+    out = []
+    for m, (a, b) in enumerate(merged):
+        lo = merged[m - 1][1] if m > 0 else max(0, a - 2)
+        hi = merged[m + 1][0] if m + 1 < len(merged) else min(len(colmax), b + 2)
+        seg = colmax[lo:hi]
+        l, r = _first_cross(seg), _last_cross(seg)
+        if l is None or r is None or r <= l:
+            l, r = float(a - lo), float(b - lo)
+        out.append((lo + l, lo + r))
+    return out
+
+
+def _letter_spacing(mk: _Mask, units: list[_Unit], text: str, ref: Optional[FontFace], P: dict) -> Optional[dict]:
+    """字距拉開（調字距）的偵測，與候選字型無關。
+
+    做法：每個拉丁詞逐字切出墨跡（_glyph_spans），和參考字型同一串字（HarfBuzz 排字，含字距調整）的逐字墨跡比較：
+    - 逐字墨跡寬 ÷ 參考字型墨跡寬 → 字級粗估 s（只看字形本身，不受字距影響）；
+    - 相鄰兩字的墨跡間隙 − s × 參考字型中同一對字的間隙 → 這一對「多出來的間隙」。
+    多出來的間隙大多一致（ls_uniform_*），中位數又至少 ls_min_track_em × s 時，判為字距拉開。
+    回傳 {"t": 多出來的間隙中位數（mask 像素）, "s": 字級粗估, "n": 字對數, "glyphs": 逐字單位（字切不開的詞維持原樣）}；
+    沒有拉開或無法判斷時回傳 None。
+    """
+    if ref is None or not P.get("ls_detect", True):
+        return None
+    colmax = mk.cov.max(axis=0) if mk.cov.size else np.zeros(1)
+    per_unit: dict[int, list[tuple[float, float]]] = {}
+    w_meas = w_em = 0.0
+    pairs = []  # (量到的間隙, 參考字型的間隙 em)
+    for k, u in enumerate(units):
+        n = u.i1 - u.i0
+        if u.cjk or n < 2 or not u.exact:
+            continue
+        sub = text[u.i0 : u.i1]
+        if not ref.covers(sub):
+            continue
+        boxes = ref.layout(sub).ink
+        if any(b is None for b in boxes):
+            continue
+        spans = _glyph_spans(mk, colmax, u, n)
+        if spans is None:
+            continue
+        per_unit[k] = spans
+        for (a, b), box in zip(spans, boxes):
+            w_meas += b - a
+            w_em += box[1] - box[0]
+        for m in range(n - 1):
+            pairs.append((spans[m + 1][0] - spans[m][1], boxes[m + 1][0] - boxes[m][1]))
+    if len(pairs) < P["ls_min_pairs"] or w_em <= 0:
+        return None
+    s = w_meas / w_em
+    extra = np.array([g - s * ge for g, ge in pairs])
+    t = float(np.median(extra))
+    if t < P["ls_min_track_em"] * s:
+        return None
+    if float(np.mean(np.abs(extra - t) <= P["ls_uniform_em"] * s)) < P["ls_uniform_frac"]:
+        return None
+    glyphs: list[_Unit] = []
+    for k, u in enumerate(units):
+        if k not in per_unit:
+            glyphs.append(u)
+            continue
+        for m, (a, b) in enumerate(per_unit[k]):
+            glyphs.append(_Unit(u.i0 + m, u.i0 + m + 1, False, a, b, True, 0.5 * (a + b)))
+    return {"t": t, "s": s, "n": len(pairs), "glyphs": glyphs, "words": sorted(per_unit)}
+
+
+def _word_spacing_px(units: list[_Unit], words: list[int], text: str, face: FontFace, size: float, sig_size: float, sigma: float) -> Optional[tuple[float, float]]:
+    """額外字距（mask 像素）＝ Σ（詞的墨跡寬 − 字級 × 該字型同一個詞的墨跡寬）÷ 字間數；誤差含邊緣誤差與字級誤差。
+
+    以詞的整體寬度計算，所以用這個字級與字距重排時，每個詞的寬度與原圖相同（這正是輸出器需要的）。
+    """
+    num = w_em_tot = 0.0
+    n_gap = n_word = 0
+    for k in words:
+        u = units[k]
+        ib = face.layout(text[u.i0 : u.i1]).ink_bounds()
+        if ib is None or ib[1] <= ib[0]:
+            continue
+        num += (u.b - u.a) - size * (ib[1] - ib[0])
+        w_em_tot += ib[1] - ib[0]
+        n_gap += u.i1 - u.i0 - 1
+        n_word += 1
+    if n_gap <= 0:
+        return None
+    sig = math.sqrt(2.0 * n_word * sigma**2 + (sig_size * w_em_tot) ** 2) / n_gap
+    return num / n_gap, sig
 
 
 def _glyph_width_ratio(mk: _Mask, units, text, e: _FaceEval, pitch, P) -> Optional[float]:

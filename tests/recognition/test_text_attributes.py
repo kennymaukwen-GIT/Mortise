@@ -496,3 +496,81 @@ def test_same_input_same_result_regardless_of_history():
         assert again.runs[0].font_size_px.value == first.runs[0].font_size_px.value
         assert [f.family for f in again.runs[0].fonts[:3]] == [f.family for f in first.runs[0].fonts[:3]]
         assert again.runs[0].fonts[0].score == first.runs[0].fonts[0].score
+
+
+# ====================================================================== 字距拉開的標題
+#
+# 標題常把字距拉開（CSS letter-spacing、Word 的字元間距）。text_attributes._letter_spacing 把拉丁詞逐字切開，
+# 和參考字型的逐字間隙比較；偵測到時字型與字級只用字形本身判斷，詞寬減去「字級 × 字型的詞寬」的差值除以字間數記成字距。
+
+
+def synth_tracked(family, style, text, size, track_em, fg=(30, 60, 80), bg=(250, 250, 248)):
+    """CSS letter-spacing 的畫法（4 倍解析度畫再面積平均縮小）：第 i 個字放在「含字距調整的排字位置 + i × 字距」。
+    回傳 (影像, OcrLine)；OcrLine 的文字沒有多餘空白（就是 ocr 拿掉字母間空白之後交出來的樣子）。"""
+    face = LIB.find(family, style)
+    assert face is not None, (family, style)
+    ss = 4
+    font = ImageFont.truetype(face.path, size=size * ss, index=face.index, layout_engine=ImageFont.Layout.RAQM)
+    tr = track_em * size * ss
+    W = int((font.getlength(text) + len(text) * tr) / ss + 2 * size)
+    H = int(2.6 * size + 12)
+    im = Image.new("RGB", (W * ss, H * ss), bg)
+    d = ImageDraw.Draw(im)
+    for i, ch in enumerate(text):
+        d.text((size * ss + font.getlength(text[:i]) + i * tr, int(1.75 * size + 4) * ss), ch, font=font, fill=fg, anchor="ls")
+    a = cv2.resize(np.asarray(im), (W, H), interpolation=cv2.INTER_AREA)
+    ys, xs = np.nonzero(np.abs(a.astype(int) - np.array(bg)).sum(axis=2) > 60)
+    m = 0.1 * size
+    q = np.array([[xs.min() - m, ys.min() - m], [xs.max() + 1 + m, ys.min() - m], [xs.max() + 1 + m, ys.max() + 1 + m], [xs.min() - m, ys.max() + 1 + m]], float)
+    return np.ascontiguousarray(a), OcrLine(quad=q, text=text, score=1.0)
+
+
+TRACKED = [  # (字族, 樣式, 文字, 字級 px, 字距 em)
+    ("Liberation Sans", "Bold", "SKILLS", 26.0, 0.13), ("Inter", "Bold", "PROFILE", 20.0, 0.15),
+    ("Inter", "Bold", "EXPERIENCE", 34.0, 0.12), ("Liberation Sans", "Bold", "ABOUT ME", 30.0, 0.20),
+    ("Inter", "Regular", "WORK EXPERIENCE", 24.0, 0.25), ("DejaVu Sans", "Regular", "SOFTWARE", 22.0, 0.18),
+    ("Liberation Serif", "Bold", "LANGUAGES", 28.0, 0.15), ("Liberation Sans", "Regular", "EDUCATION", 40.0, 0.10),
+    ("Inter", "Regular", "references", 30.0, 0.20),
+]
+
+
+@pytest.fixture(scope="module")
+def tracked_rows():
+    rows = []
+    for fam, sty, text, size, tr in TRACKED:
+        img, line = synth_tracked(fam, sty, text, size, tr)
+        r = measure_line(img, line, LIB).runs[0]
+        rows.append((fam, sty, text, size, tr * size, r))
+    return rows
+
+
+def test_letter_spaced_heading_char_spacing(tracked_rows):
+    """量得出字距（char_spacing_px）。實測（乾淨影像，9 行）：字距誤差最大約 0.03 個字級（0.8 px），
+    字級誤差最大約 3 %，第一名字族 9 行中 8 行正確（Inter Regular 那行選到同字族的 Medium）。
+    門檻：字距誤差 ≤ 0.04 個字級、字級誤差 ≤ 4 %、第一名字族至少 7 行正確。"""
+    fam_ok = 0
+    for fam, _sty, text, size, track_px, r in tracked_rows:
+        print(f"\n   {text:16s} 字距 {track_px:5.2f} → {r.char_spacing_px.value if r.char_spacing_px else None}  字級 {size} → {r.font_size_px.value:.2f}  {r.fonts[0].family} {r.fonts[0].style}", end="")
+        assert any("字距拉開" in n for n in r.notes), (text, r.notes)
+        assert r.char_spacing_px is not None, text
+        assert abs(r.char_spacing_px.value - track_px) <= 0.04 * size, (text, r.char_spacing_px, track_px)
+        assert r.char_spacing_px.error > 0
+        assert abs(r.font_size_px.value - size) <= 0.04 * size, (text, r.font_size_px, size)
+        fam_ok += r.fonts[0].family == fam
+    assert fam_ok >= 7, fam_ok
+
+
+def test_letter_spacing_not_flagged_on_normal_spacing():
+    """同樣的字不拉開字距（含等寬字型，字形兩側本來就寬）：不能標字距拉開，也不記字距。"""
+    for fam, sty, text in (("Liberation Sans", "Bold", "SKILLS"), ("Inter", "Regular", "WORK EXPERIENCE"),
+                           ("Liberation Mono", "Regular", "EXPERIENCE"), ("Liberation Serif", "Bold", "LANGUAGES")):
+        img, line = synth_tracked(fam, sty, text, 28.0, 0.0)
+        r = measure_line(img, line, LIB).runs[0]
+        assert not any("字距拉開" in n for n in r.notes), (fam, text, r.notes)
+        assert r.char_spacing_px is None, (fam, text, r.char_spacing_px)
+
+
+def test_letter_spacing_detection_can_be_disabled():
+    img, line = synth_tracked("Liberation Sans", "Bold", "SKILLS", 26.0, 0.13)
+    r = measure_line(img, line, LIB, {"ls_detect": False}).runs[0]
+    assert not any("字距拉開" in n for n in r.notes)

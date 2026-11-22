@@ -1,6 +1,7 @@
 // Application state: one reducer, plain data, no side effects (those live in useController).
 import type { JobEvent, JobStatus, PageInfo } from "../api/types";
 import type { MessageKey } from "../i18n/dict";
+import type { JobError } from "../lib/errors";
 import type { LocalDoc } from "../lib/localDoc";
 import type { Orientation } from "../lib/units";
 
@@ -26,10 +27,16 @@ export interface Progress {
   /** 1-based page currently processed, when the stage works page by page. */
   page: number | null;
   pages: number | null;
+  /** Highest stage reached in this run (the step indicator never goes back while pages are processed one by one). */
+  maxStage: number | null;
   /** 0..1 while the file is being uploaded, otherwise null. */
   upload: number | null;
   /** True when re-running after a correction. */
   rerun: boolean;
+  /** The run has ended; the result is being fetched. */
+  finishing: boolean;
+  /** A correction re-run the user chose not to watch: the previous result stays on screen until it ends. */
+  background: boolean;
 }
 
 export type FrameMessage = { key: MessageKey; vars?: Record<string, string | number> } | { text: string };
@@ -45,7 +52,7 @@ export interface State {
   jobFormat: string | null;
   /** True when the current job asked for a known original size (so we do not show the detected size). */
   jobHadOriginSize: boolean;
-  jobError: string | null;
+  jobError: JobError | null;
   progress: Progress;
   pages: PageInfo[] | null;
   score: number | null;
@@ -68,7 +75,7 @@ export const initialSettings: Settings = {
   targetH: "",
 };
 
-const noProgress: Progress = { fraction: 0, stage: null, page: null, pages: null, upload: null, rerun: false };
+const noProgress: Progress = { fraction: 0, stage: null, page: null, pages: null, maxStage: null, upload: null, rerun: false, finishing: false, background: false };
 
 export const initialState: State = {
   phase: "empty",
@@ -105,12 +112,15 @@ export type Action =
   | { type: "JOB_CREATED"; status: JobStatus }
   | { type: "JOB_EVENT"; event: JobEvent }
   | { type: "JOB_DONE"; pages: PageInfo[]; score: number | null }
-  | { type: "JOB_FAILED"; message: string }
+  | { type: "JOB_FAILED"; error: JobError }
   | { type: "CANCELLED" }
   | { type: "RERUN_START" }
+  | { type: "RERUN_HIDE" }
+  | { type: "JOB_GONE" }
+  | { type: "JOB_RECHECK" }
   | { type: "CONVERT_AGAIN" }
   | { type: "OPEN_JOB_START"; jobId: string; filename: string; format: string }
-  | { type: "JOB_META"; hadOriginSize: boolean }
+  | { type: "JOB_META"; hadOriginSize: boolean; settings?: Partial<Settings> }
   | { type: "RESET" };
 
 function clampPage(index: number, count: number): number {
@@ -128,6 +138,11 @@ export function isBusy(s: State): boolean {
   return s.phase === "uploading" || s.phase === "converting" || s.phase === "opening";
 }
 
+/** Uploading or converting in the foreground: a new file must not replace the job silently. */
+export function isWorking(s: State): boolean {
+  return s.phase === "uploading" || s.phase === "converting";
+}
+
 export function reducer(s: State, a: Action): State {
   switch (a.type) {
     case "OPEN_START":
@@ -142,7 +157,8 @@ export function reducer(s: State, a: Action): State {
       };
     case "OPEN_FAIL":
       // Keep whatever was shown before; the error appears in the frame.
-      return { ...s, phase: s.doc ? (s.jobId && s.pages ? "done" : "loaded") : s.pages ? "done" : "empty", frameError: a.error };
+      if (s.phase !== "opening") return { ...s, frameError: a.error };
+      return { ...s, phase: s.jobId && s.pages ? "done" : s.doc ? "loaded" : "empty", frameError: a.error };
     case "FRAME_ERROR":
       return { ...s, frameError: a.error };
     case "DISMISS_ERROR":
@@ -178,23 +194,27 @@ export function reducer(s: State, a: Action): State {
         phase: "converting",
         jobId: a.status.job_id,
         jobFilename: a.status.filename ?? s.jobFilename,
-        progress: { ...s.progress, upload: null, fraction: a.status.progress ?? 0, pages: a.status.pages ?? s.doc?.pageCount ?? null },
+        progress: { ...s.progress, upload: null, fraction: a.status.progress ?? 0, pages: a.status.pages || s.doc?.pageCount || null },
       };
     case "JOB_EVENT": {
       if (s.phase !== "converting") return s;
       const e = a.event;
-      // A job-level "done"/"failed" without `final` belongs to an earlier run (replayed history): start over.
+      // The job-level "done"/"failed" just before the final message: the run is over, the result is being loaded.
+      // (The server only streams the current run, so this is never an earlier run.)
       if (e.stage == null && (e.status === "done" || e.status === "failed")) {
-        return { ...s, progress: { ...s.progress, fraction: 0, stage: null, page: null } };
+        return { ...s, progress: { ...s.progress, fraction: e.status === "done" ? 1 : s.progress.fraction, finishing: e.status === "done" } };
       }
       const page = e.page == null ? null : e.page + 1;
+      const stage = e.stage ?? s.progress.stage;
       return {
         ...s,
         progress: {
           ...s.progress,
-          fraction: typeof e.progress === "number" ? e.progress : s.progress.fraction,
-          stage: e.stage ?? s.progress.stage,
+          fraction: typeof e.progress === "number" ? Math.max(e.progress, s.progress.fraction) : s.progress.fraction,
+          stage,
+          maxStage: stage == null ? s.progress.maxStage : Math.max(stage, s.progress.maxStage ?? 0),
           page: e.stage != null ? page : s.progress.page,
+          pages: s.progress.pages || (page != null && page > 1 ? page : s.progress.pages),
         },
       };
     }
@@ -204,7 +224,7 @@ export function reducer(s: State, a: Action): State {
         phase: "done",
         pages: a.pages,
         score: a.score,
-        progress: { ...s.progress, fraction: 1, upload: null },
+        progress: { ...s.progress, fraction: 1, upload: null, finishing: false, background: false },
         pageIndex: clampPage(s.pageIndex, a.pages.length),
         view: s.progress.rerun ? s.view : "result",
         editMode: s.progress.rerun ? s.editMode : false,
@@ -212,11 +232,32 @@ export function reducer(s: State, a: Action): State {
         jobError: null,
       };
     case "JOB_FAILED":
-      return { ...s, phase: "failed", jobError: a.message, progress: { ...s.progress, upload: null } };
+      return { ...s, phase: "failed", jobError: a.error, editMode: false, progress: { ...s.progress, upload: null, finishing: false, background: false } };
     case "CANCELLED":
-      return { ...s, phase: s.doc ? "loaded" : "empty", jobId: null, jobError: null, progress: noProgress, pages: null, score: null };
+      return { ...s, phase: s.doc ? "loaded" : "empty", jobId: null, jobError: null, progress: noProgress, pages: null, score: null, editMode: false, view: "original" };
     case "RERUN_START":
       return { ...s, phase: "converting", progress: { ...noProgress, rerun: true, pages: s.pages?.length ?? null } };
+    case "RERUN_HIDE":
+      // Back to the previous result; the re-run continues on the server and the view refreshes when it ends.
+      return s.phase === "converting" && s.progress.rerun && s.pages ? { ...s, phase: "done", progress: { ...s.progress, background: true } } : s;
+    case "JOB_RECHECK":
+      // Ask the server about the same job again (after a network failure), keeping the file and settings.
+      return { ...s, phase: "converting", jobError: null, progress: { ...noProgress, rerun: s.progress.rerun, pages: s.progress.pages } };
+    case "JOB_GONE":
+      // The job disappeared from the server (deleted elsewhere or expired) while it was on screen.
+      return {
+        ...s,
+        phase: s.doc ? "loaded" : "empty",
+        jobId: null,
+        jobFilename: s.file ? s.jobFilename : null,
+        jobError: null,
+        pages: null,
+        score: null,
+        editMode: false,
+        view: "original",
+        progress: noProgress,
+        frameError: { key: "err.expired" },
+      };
     case "CONVERT_AGAIN":
       return { ...s, phase: s.doc ? "loaded" : s.phase, editMode: false, view: "original", jobError: null };
     case "OPEN_JOB_START":
@@ -230,7 +271,7 @@ export function reducer(s: State, a: Action): State {
         jobHadOriginSize: true,
       };
     case "JOB_META":
-      return { ...s, jobHadOriginSize: a.hadOriginSize };
+      return { ...s, jobHadOriginSize: a.hadOriginSize, settings: a.settings ? { ...s.settings, ...a.settings } : s.settings };
     case "RESET":
       return { ...initialState, settings: { ...s.settings, originW: "", originH: "", orientation: null } };
     default:

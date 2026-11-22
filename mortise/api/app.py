@@ -38,12 +38,14 @@ import asyncio
 import hashlib
 import io
 import json
+import math
 import os
 import tempfile
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +54,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
 from ..artifacts import BlobRef, FidelityReport, Intent, Layout, OutputFile, OutputFormat, PageSpec, PhysicalSize, SourceDoc, StyledDoc, UsageMode
 from ..config import Config
@@ -82,6 +85,39 @@ _origins = [o.strip() for o in os.environ.get("MORTISE_CORS", "").split(",") if 
 if _origins:
     app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["*"], allow_headers=["*"])
 
+
+class _PrivacyHeaders:
+    """每個回應加上 X-Content-Type-Options: nosniff 與 Referrer-Policy: no-referrer。
+    /api/jobs/ 底下的回應都是使用者的文件或由它衍生的資料：一律 Cache-Control: private（共用快取、CDN 不可存）；
+    沒有另外指定時用 no-store。預覽圖自己帶 private, no-cache 加 ETag（瀏覽器可以重新驗證）。
+    用純 ASGI 寫，不包住回應本體，進度串流（SSE）照常逐則送出。"""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.inner(scope, receive, send)
+        private = scope.get("path", "").startswith("/api/jobs")
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = [(k, v) for k, v in message.get("headers", []) if not (private and k.lower() == b"cache-control" and b"private" not in v.lower())]
+                names = {k.lower() for k, _ in headers}
+                if private and b"cache-control" not in names:
+                    headers.append((b"cache-control", b"private, no-store"))
+                if b"x-content-type-options" not in names:
+                    headers.append((b"x-content-type-options", b"nosniff"))
+                if b"referrer-policy" not in names:
+                    headers.append((b"referrer-policy", b"no-referrer"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.inner(scope, receive, send_with_headers)
+
+
+app.add_middleware(_PrivacyHeaders)
+
 FORMAT_LABELS = {
     OutputFormat.PPTX: "PowerPoint（.pptx）",
     OutputFormat.GOOGLE_SLIDES: "Google 簡報（匯入用的 .pptx）",
@@ -109,7 +145,7 @@ FORMAT_LABELS_EN = {
     OutputFormat.TEMPLATE: "Layout template (.pptx)",
 }
 ACCEPTED_TYPES = ["application/pdf", "image/png", "image/jpeg"]  # 與 stages/s1_input.py 的檔案類型判斷一致
-_TARGET_MIN_PT, _TARGET_MAX_PT = 36.0, 14400.0  # 輸出尺寸的範圍：0.5 吋到 200 吋（PDF 規格建議的頁面上限）
+_TARGET_MIN_PT, _TARGET_MAX_PT = 36.0, 14400.0  # 原始尺寸與輸出尺寸的範圍：0.5 吋到 200 吋（PDF 規格建議的頁面上限）
 
 # 修正欄位 → 送給哪個階段
 FIELD_STAGE = {"size": 2, "corners": 2, "role": 4, "formula": 5, "align": 5, "font_family": 5, "font_size_pt": 5, "color": 5, "text": 5}
@@ -126,6 +162,27 @@ def _load(pipe, name: str, cls):
     if not pipe.store.has(name):
         raise HTTPException(409, "這份工作還沒處理到這一步。")
     return pipe.store.load(name, cls)
+
+
+_PARSED: "dict[tuple[str, str, str], Any]" = {}
+_PARSED_LOCK = threading.Lock()
+_PARSED_MAX = 8
+
+
+def _load_parsed(pipe, name: str, cls):
+    """解析過的大型產物（成品文件、還原度報告）留在記憶體裡重用，以內容雜湊為鍵（重跑後雜湊改變，自然不會拿到舊的）。
+    只給讀取用：拿到的物件不可修改。最多留 _PARSED_MAX 份，先放進來的先丟。"""
+    key = (str(pipe.dir), name, pipe.store.hash_of(name))
+    with _PARSED_LOCK:
+        hit = _PARSED.get(key)
+    if hit is not None:
+        return hit
+    obj = pipe.store.load(name, cls)
+    with _PARSED_LOCK:
+        _PARSED[key] = obj
+        while len(_PARSED) > _PARSED_MAX:
+            _PARSED.pop(next(iter(_PARSED)))
+    return obj
 
 
 # ====================================================================== 基本資訊
@@ -173,14 +230,8 @@ async def create_job(
 ) -> dict[str, Any]:
     """建立工作。輸出尺寸（target_width、target_height）兩個都有值才算指定：⑤把每一頁等比例縮放到放得進這個尺寸的最大比例並置中；
     只填一個回 422（不默默忽略，免得使用者以為指定了尺寸）。直式或橫式由前端決定好寬高再送。"""
-    if (target_width is None) != (target_height is None):
-        raise HTTPException(422, "輸出尺寸的寬與高要一起填（或都不填，維持原始尺寸）。")
-    target = None
-    if target_width is not None and target_height is not None:
-        tw, th = to_pt(target_width, target_unit), to_pt(target_height, target_unit)
-        if not (_TARGET_MIN_PT <= tw <= _TARGET_MAX_PT and _TARGET_MIN_PT <= th <= _TARGET_MAX_PT):
-            raise HTTPException(422, f"輸出尺寸要在 {_TARGET_MIN_PT / 72 * 25.4:.1f} 到 {_TARGET_MAX_PT / 72 * 25.4:.0f} mm 之間。")
-        target = PhysicalSize(width=target_width, height=target_height, unit=target_unit)
+    target = _checked_size(target_width, target_height, target_unit, "輸出尺寸")
+    size = _checked_size(width, height, unit, "原始尺寸")
     try:
         wanted = [OutputFormat(x.strip()) for x in outputs.split(",") if x.strip()]
     except ValueError:
@@ -189,7 +240,6 @@ async def create_job(
     missing = [f.value for f in wanted if f not in ready]
     if missing:
         raise HTTPException(422, f"這些輸出格式還沒有開放：{', '.join(missing)}")
-    size = PhysicalSize(width=width, height=height, unit=unit) if width and height else None
     limit = CFG.section("input")["max_file_mb"] * 1024 * 1024
     suffix = Path(file.filename or "upload").suffix[:10]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -207,6 +257,22 @@ async def create_job(
     finally:
         os.unlink(tmp.name)
     return JOBS.status(job_id)
+
+
+
+def _checked_size(w: Optional[float], h: Optional[float], unit: str, what: str) -> Optional[PhysicalSize]:
+    """原始尺寸與輸出尺寸共用的檢查：寬與高要一起填（或都不填）、必須是有限的正數，換算後要在 0.5 到 200 吋之間。
+    超出範圍回 422：太小的原始尺寸會讓流水線除以零，太大的會讓驗證時的渲染要求巨大的記憶體。"""
+    if w is None and h is None:
+        return None
+    if w is None or h is None:
+        raise HTTPException(422, f"{what}的寬與高要一起填（或都不填）。")
+    if not (math.isfinite(w) and math.isfinite(h)) or w <= 0 or h <= 0:
+        raise HTTPException(422, f"{what}的寬與高要是大於 0 的數字。")
+    wp, hp = to_pt(w, unit), to_pt(h, unit)
+    if not (_TARGET_MIN_PT <= wp <= _TARGET_MAX_PT and _TARGET_MIN_PT <= hp <= _TARGET_MAX_PT):
+        raise HTTPException(422, f"{what}要在 {_TARGET_MIN_PT / 72 * 25.4:.1f} 到 {_TARGET_MAX_PT / 72 * 25.4:.0f} mm 之間。")
+    return PhysicalSize(width=w, height=h, unit=unit)
 
 
 # ====================================================================== 狀態與進度
@@ -455,24 +521,33 @@ def page_image(
                 raise HTTPException(422, "不認得的輸出格式。可用的格式見 /api/formats。")
             if fmt not in intent.outputs:
                 raise HTTPException(404, f"這份工作沒有輸出 {fmt.value} 格式。")
-    spec = _load(pipe, f"s2/page-{n:03d}", PageSpec)
-    if kind != "original":
-        styled = _load(pipe, "s5/styled_doc", StyledDoc)
-        if not 1 <= n <= len(styled.pages):
-            raise HTTPException(404, "沒有這一頁。")
-        report = _load(pipe, "s7/fidelity_report", FidelityReport)
+    needed = [f"s2/page-{n:03d}"] + ([] if kind == "original" else ["s5/styled_doc", "s7/fidelity_report"])
+    if not all(pipe.store.has(nm) for nm in needed):
+        raise HTTPException(409, "這份工作還沒處理到這一步。")
+    # 先用產物的雜湊算戳記與 ETag、查磁碟快取；命中時不必解析成品文件與報告（大文件每次解析要幾十毫秒）
     stamp = _stamp(pipe, f"s2/page-{n:03d}", *(() if kind == "original" else ("s5/styled_doc", f"s6/{fmt.value}", "s7/fidelity_report")))
     key = f"{kind}-{fmt.value if fmt else 'source'}-p{n}-w{width}"
     etag = f'"{stamp}-{key}"'
-    headers = {"Cache-Control": "no-cache", "ETag": etag}
+    headers = {"Cache-Control": "private, no-cache", "ETag": etag}
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers=headers)
+    spec = styled = report = None
+
+    def load() -> None:
+        nonlocal spec, styled, report
+        spec = pipe.store.load(f"s2/page-{n:03d}", PageSpec)
+        if kind != "original":
+            styled = _load_parsed(pipe, "s5/styled_doc", StyledDoc)
+            if not 1 <= n <= len(styled.pages):
+                raise HTTPException(404, "沒有這一頁。")
+            report = _load_parsed(pipe, "s7/fidelity_report", FidelityReport)
 
     def original_image(w: int) -> Image.Image:
         im = Image.open(pipe.store.blob_path(spec.working_image)).convert("RGB")
         return im.resize((w, max(1, round(w * im.size[1] / im.size[0]))), Image.LANCZOS)
 
     def make():
+        load()
         if kind == "original":
             return original_image(width), {"render": "original"}
         sp = styled.pages[n - 1]
@@ -528,10 +603,12 @@ def _flagged(report: FidelityReport, page_index: int) -> dict[str, list[str]]:
 def page_elements(job_id: str, n: int) -> dict[str, Any]:
     """前端修正畫面用：每個元素的位置（pt，原點左上）、內容、樣式、信心值與問題。"""
     pipe = _job(job_id)
-    styled = _load(pipe, "s5/styled_doc", StyledDoc)
+    if not pipe.store.has("s5/styled_doc"):
+        raise HTTPException(409, "這份工作還沒處理到這一步。")
+    styled = _load_parsed(pipe, "s5/styled_doc", StyledDoc)
     if not 1 <= n <= len(styled.pages):
         raise HTTPException(404, "沒有這一頁。")
-    report = pipe.store.load("s7/fidelity_report", FidelityReport) if pipe.store.has("s7/fidelity_report") else None
+    report = _load_parsed(pipe, "s7/fidelity_report", FidelityReport) if pipe.store.has("s7/fidelity_report") else None
     reports = {e.element_id: e for e in report.pages[n - 1].elements} if report else {}
     flagged = _flagged(report, n - 1) if report else {}
     sp = styled.pages[n - 1]
@@ -620,13 +697,20 @@ def download(job_id: str, fmt: str) -> Response:
     if fmt == "report":
         report = _load(pipe, "s7/fidelity_report", FidelityReport)
         name = Path(pipe.state.get("filename", "report")).stem + ".report.json"
-        return Response(report.model_dump_json(indent=1, exclude={"target_render"}), media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+        return Response(report.model_dump_json(indent=1, exclude={"target_render"}), media_type="application/json", headers={"Content-Disposition": _attachment(name)})
     try:
         of = OutputFormat(fmt)
     except ValueError:
         raise HTTPException(404, "不認得的格式。")
     out = _load(pipe, f"s6/{of.value}", OutputFile)
     return FileResponse(pipe.store.blob_path(out.file), media_type=out.file.media_type, filename=out.filename)
+
+
+def _attachment(name: str) -> str:
+    """下載的 Content-Disposition：檔名可能有中文或引號，HTTP 標頭只能放 latin-1，所以用 RFC 5987 的 filename* 帶 UTF-8 檔名，
+    另附一個只有 ASCII 的後備檔名給舊瀏覽器。"""
+    fallback = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in name) or "download"
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name, safe='')}"
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
@@ -660,6 +744,12 @@ r.innerHTML=pages.map(p=>`<h3>第 ${p.page} 頁</h3><img src="${p.images.overlay
 
 WEB_DIST = Path(os.environ.get("MORTISE_WEB_DIST", str(Path(__file__).resolve().parents[2] / "web" / "dist")))
 _LONG_CACHE = "public, max-age=31536000, immutable"  # Vite 建置出的 assets/ 檔名含內容雜湊，內容變了檔名就變
+# 前端頁面的內容安全政策：只載入自己的檔案（字型自帶、不連外部服務）；pdf.js 需要 blob: 的 worker 與 WebAssembly；
+# 圖片有預覽用的 blob:；不允許被別的網站用 iframe 嵌入。
+_CSP = (
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; "
+    "font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+)
 
 
 _BUILD_HELP = """<!doctype html><html lang="zh-Hant"><meta charset="utf-8"><title>Mortise</title>
@@ -687,6 +777,9 @@ class _Frontend(StaticFiles):
     async def get_response(self, path: str, scope) -> Response:
         path = path.replace(os.sep, "/")
         if path == "api" or path.startswith("api/"):
+            allowed = _api_methods("/" + path)
+            if allowed:  # 有這個 API 端點，只是方法不對：回 405（不要被前端的掛載點吃成 404）
+                raise StarletteHTTPException(status_code=405, headers={"Allow": ", ".join(sorted(allowed))})
             raise StarletteHTTPException(status_code=404)
         index = Path(self.directory) / "index.html"
         if not index.is_file():
@@ -702,10 +795,23 @@ class _Frontend(StaticFiles):
             else:
                 if response.status_code < 400:
                     response.headers["Cache-Control"] = _LONG_CACHE if path.startswith("assets/") else "public, max-age=3600"
+                    if path.endswith(".html"):
+                        response.headers["Content-Security-Policy"] = _CSP
                 return response
         if scope["method"] not in ("GET", "HEAD"):
             raise StarletteHTTPException(status_code=405)
-        return FileResponse(index, media_type="text/html", headers={"Cache-Control": "no-cache"})
+        return FileResponse(index, media_type="text/html", headers={"Cache-Control": "no-cache", "Content-Security-Policy": _CSP})
+
+
+def _api_methods(path: str) -> set[str]:
+    """這個路徑符合哪些 API 端點的哪些方法（路徑符合、方法不符時，Starlette 的比對結果是 PARTIAL）。"""
+    scope = {"type": "http", "path": path, "root_path": "", "method": "__none__"}
+    allowed: set[str] = set()
+    for route in app.router.routes:
+        methods = getattr(route, "methods", None)
+        if methods and route.matches(scope)[0] == Match.PARTIAL:
+            allowed |= set(methods)
+    return allowed
 
 
 # 一定要放在所有 API 路由之後：路由依登記順序比對，API 先比對，剩下的才交給前端

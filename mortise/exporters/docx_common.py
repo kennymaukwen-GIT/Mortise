@@ -28,6 +28,18 @@ python-docx（MIT）只負責封裝（部件、關聯、圖片部件）；文字
   | 數值、數字格式、公式（給 Excel） | 不輸出，只輸出儲存格文字                            | 有損     |
   | 文字中的控制字元               | 清除（XML 不允許）                                   | 有損     |
   | Word 的排版開關                | 文件預設段落：孤行控制關、中英自動間距關、對齊格線關；相容模式 15 | 不適用 |
+  | 推論的字型名稱                 | 寫入名稱改用多數裝置都有、或字寬相容的字型（見下）    | 字寬相容的對照無損；依類別退回有損（都記錄） |
+  | 字型的類別與替代資訊           | word/fontTable.xml 每個字型的 family、pitch、panose1、charset、altName | 不適用 |
+
+寫入的字型名稱（設定 [export] docx_font_names，預設 "portable"）：
+  使用者的裝置上常常沒有⑤推論出的字型（例如 Inter、Loma、FreeSans）。找不到字型時，各軟體只能靠字型表的資訊
+  猜替代字型；資訊不足時多半退回 Times 類的襯線字，字寬一變，版面就跑掉。所以寫入檔案的名稱照下面的順序決定：
+    1. docx_font_map 有列的（例如 Liberation Sans → Arial、Carlito → Calibri）：寫右邊的名稱，兩者字寬相容（無損）。
+    2. 已經是 docx_portable_fonts 列的常見字型：照原名寫。
+    3. 其他：判斷類別（無襯線、襯線、等寬；中文分黑體、明體、楷體），寫 docx_fallback_fonts 裡該類別的常見字型（有損）。
+  等寬字型只有在整個文字框都是等寬字時才保留（程式碼之類）；夾在一般內文裡的等寬字多半是辨識誤判，改用同框內文的字型。
+  成品文件裡的推論字型不改（不回寫上游），原本推論的字型名稱寫在 OutputFile.degradations。
+  docx_font_names = "inferred" 時照推論的名稱寫（舊做法），只補字型表的資訊。
 """
 
 from __future__ import annotations
@@ -136,7 +148,7 @@ def norm_text(s: str) -> str:
 
 @dataclass
 class Ctx:
-    """一次輸出的共用狀態：預設字型、降級紀錄、寫入的字型、比例、繪圖物件編號。"""
+    """一次輸出的共用狀態：預設字型、降級紀錄、寫入的字型、比例、繪圖物件編號、字型名稱的對照。"""
 
     doc_latin: str
     doc_ea: str
@@ -145,6 +157,7 @@ class Ctx:
     scale: float = 1.0
     _seen: set = field(default_factory=set)
     _next_id: int = 1
+    policy: Optional["FontPolicy"] = None
 
     def degrade(self, element_id: str, concept: str, action: str, lossy: bool) -> None:
         key = (element_id, concept)
@@ -158,6 +171,191 @@ class Ctx:
         self._next_id += 1
         return i
 
+    def font_name(self, font, element_id: str = "document", context_latin: Optional[str] = None, record: bool = True) -> str:
+        """一個文字段（FontChoice）寫進檔案的字型名稱。context_latin 是同框內文的寫入名稱（夾在內文裡的等寬字改用它）。
+        record 為假時只查名稱、不記降級（統計字數用）。"""
+        if self.policy is None:
+            return font.family.value
+        return self.policy.written(font.family.value, font.verification_family, font.east_asian, self, element_id, context_latin, record)
+
+    def name_of(self, family: str, east_asian: bool = False, record: bool = True) -> str:
+        """只有名稱（例如樣式表的 font_family）時的寫入名稱。"""
+        if self.policy is None:
+            return family
+        return self.policy.written(family, family, east_asian, self, record=record)
+
+
+# ---------- 寫入的字型名稱：換一台裝置也找得到 ----------
+
+# 字型表資訊（ECMA-376 第 1 部 17.8.3）：（family, pitch, panose1, charset, altName）。
+#   family：swiss 無襯線、roman 有襯線、modern 等寬、script 手寫（楷體）；pitch：variable 比例、fixed 等寬；
+#   panose1：字型的 PANOSE 分類（十個位元組）；charset：00 西文、88 繁體中文（Big5）；
+#   altName：同一個字型的其他名稱（逗號分隔），這裡也列量度相容的替代字型，讓找不到原字型的軟體有名稱可找。
+# 各軟體是否真的照這些資訊挑替代字型：需查證（Word、Pages、iOS 預覽都沒有在這台機器上實測過）。
+FONT_TABLE_INFO: dict[str, tuple[str, str, str, str, str]] = {
+    "Arial": ("swiss", "variable", "020B0604020202020204", "00", "Helvetica,Liberation Sans,Arimo"),
+    "Helvetica": ("swiss", "variable", "020B0604020202020204", "00", "Arial,Liberation Sans"),
+    "Calibri": ("swiss", "variable", "020F0502020204030204", "00", "Carlito"),
+    "Verdana": ("swiss", "variable", "020B0604030504040204", "00", "Arial"),
+    "Tahoma": ("swiss", "variable", "020B0604030504040204", "00", "Arial"),
+    "Trebuchet MS": ("swiss", "variable", "020B0603020202020204", "00", "Arial"),
+    "Segoe UI": ("swiss", "variable", "020B0502040204020203", "00", "Arial"),
+    "Times New Roman": ("roman", "variable", "02020603050405020304", "00", "Times,Liberation Serif,Tinos"),
+    "Cambria": ("roman", "variable", "02040503050406030204", "00", "Caladea"),
+    "Georgia": ("roman", "variable", "02040502050405020303", "00", "Times New Roman"),
+    "Courier New": ("modern", "fixed", "02070309020205020404", "00", "Courier,Liberation Mono,Cousine"),
+    "Microsoft JhengHei": ("swiss", "variable", "020B0604030504040204", "88", "微軟正黑體,PingFang TC,Noto Sans CJK TC"),
+    "PMingLiU": ("roman", "variable", "02020500000000000000", "88", "新細明體,LiSong Pro,Noto Serif CJK TC"),
+    "DFKai-SB": ("script", "fixed", "03000509000000000000", "88", "標楷體,BiauKai,Kaiti TC"),
+}
+
+FONT_DEFAULTS: dict = {
+    "docx_font_names": "portable",
+    "docx_font_map": {
+        "Liberation Sans": "Arial", "Arimo": "Arial", "Helvetica": "Arial", "Liberation Sans Narrow": "Arial",
+        "Liberation Serif": "Times New Roman", "Tinos": "Times New Roman", "Times": "Times New Roman",
+        "Liberation Mono": "Courier New", "Cousine": "Courier New", "Courier": "Courier New",
+        "Carlito": "Calibri", "Caladea": "Cambria",
+        "Noto Sans TC": "Microsoft JhengHei", "Noto Sans CJK TC": "Microsoft JhengHei", "Source Han Sans TC": "Microsoft JhengHei",
+        "WenQuanYi Zen Hei": "Microsoft JhengHei", "微軟正黑體": "Microsoft JhengHei",
+        "Noto Serif TC": "PMingLiU", "Noto Serif CJK TC": "PMingLiU", "Source Han Serif TC": "PMingLiU", "新細明體": "PMingLiU",
+        "MingLiU": "PMingLiU", "細明體": "PMingLiU", "LXGW WenKai TC": "DFKai-SB", "標楷體": "DFKai-SB",
+    },
+    "docx_portable_fonts": ["Arial", "Times New Roman", "Courier New", "Calibri", "Cambria", "Georgia", "Verdana", "Tahoma",
+                            "Trebuchet MS", "Microsoft JhengHei", "PMingLiU", "DFKai-SB"],
+    "docx_fallback_fonts": {"sans": "Arial", "serif": "Times New Roman", "mono": "Courier New",
+                            "cjk_sans": "Microsoft JhengHei", "cjk_serif": "PMingLiU", "cjk_kai": "DFKai-SB"},
+    "docx_embed_fonts": False,
+}
+
+_CATEGORY_LABEL = {"sans": "無襯線", "serif": "有襯線", "mono": "等寬", "cjk_sans": "中文黑體", "cjk_serif": "中文明體", "cjk_kai": "中文楷體"}
+_MONO_WORDS = ("mono", "code", "courier", "consol", "menlo", "monaco", "typewriter", "等寬")
+_SERIF_WORDS = ("serif", "times", "roman", "garamond", "georgia", "baskerville", "bodoni", "caslon", "cambria", "caladea",
+                "palatino", "book antiqua", "century", "minion", "charter", "didot")
+_CJK_SERIF_WORDS = ("ming", "song", "mincho", "serif", "明", "宋")
+_CJK_KAI_WORDS = ("kai", "楷")
+_FONT_FILE_CACHE: dict[str, Optional[dict]] = {}
+
+
+def font_file_info(family: str) -> Optional[dict]:
+    """伺服器上這個字族的字型檔資訊（mortise.tools.fontfind 找檔、fontTools 讀）：是否等寬、PANOSE、類別、可否內嵌（fsType）、檔案路徑。
+    找到的不是這個字族（沒有安裝，退回別的字型）就回傳 None。"""
+    if family in _FONT_FILE_CACHE:
+        return _FONT_FILE_CACHE[family]
+    info = None
+    try:
+        import subprocess
+
+        from fontTools.ttLib import TTFont
+
+        from ..tools import fontfind
+
+        found = fontfind.find_file(family)
+        if found is not None:
+            path, index = found
+            f = TTFont(path, fontNumber=index, lazy=True)
+            os2 = f["OS/2"]
+            p = os2.panose
+            pan = [p.bFamilyType, p.bSerifStyle, p.bWeight, p.bProportion, p.bContrast, p.bStrokeVariation, p.bArmStyle, p.bLetterForm, p.bMidline, p.bXHeight]
+            info = {"path": path, "fixed": bool(f["post"].isFixedPitch) or pan[3] == 9, "panose": "".join(f"{v:02X}" for v in pan),
+                    "family_class": os2.sFamilyClass >> 8, "fs_type": os2.fsType}
+    except Exception:
+        info = None
+    _FONT_FILE_CACHE[family] = info
+    return info
+
+
+def font_category(family: str, verification: Optional[str], east_asian: bool) -> str:
+    """字型的類別：sans、serif、mono；中文為 cjk_sans、cjk_serif、cjk_kai。
+    先看伺服器上的字型檔（等寬旗標、PANOSE 的襯線樣式、sFamilyClass），看不出來再看名稱。"""
+    low = (family or "").lower()
+    if east_asian:
+        if any(w in low for w in _CJK_KAI_WORDS):
+            return "cjk_kai"
+        if any(w in low for w in _CJK_SERIF_WORDS) and "sans" not in low:
+            return "cjk_serif"
+        return "cjk_sans"
+    info = None
+    for name in dict.fromkeys(n for n in (verification, family) if n):
+        info = font_file_info(name)
+        if info is not None:
+            break
+    if info is not None:
+        if info["fixed"]:
+            return "mono"
+        fam_type, serif_style = int(info["panose"][0:2], 16), int(info["panose"][2:4], 16)
+        if fam_type == 2 and 11 <= serif_style <= 15:
+            return "sans"
+        if fam_type == 2 and 2 <= serif_style <= 10:
+            return "serif"
+        if info["family_class"] == 8:
+            return "sans"
+        if info["family_class"] in (1, 2, 3, 4, 5, 7):
+            return "serif"
+    if any(w in low for w in _MONO_WORDS):
+        return "mono"
+    if any(w in low for w in _SERIF_WORDS) and "sans" not in low:
+        return "serif"
+    return "sans"
+
+
+def font_settings(cfg) -> dict:
+    """[export] 裡 docx_ 開頭的字型設定（沒寫的用預設值）。"""
+    out = dict(FONT_DEFAULTS)
+    if cfg is not None:
+        sec = cfg.section("export")
+        out.update({k: sec[k] for k in FONT_DEFAULTS if k in sec})
+    return out
+
+
+class FontPolicy:
+    """推論的字型名稱 → 寫進檔案的名稱（見模組說明）。同一個名稱只判斷一次，降級只記一次。"""
+
+    def __init__(self, settings: dict):
+        self.mode = settings["docx_font_names"]
+        self.font_map = dict(settings["docx_font_map"])
+        self.portable = set(settings["docx_portable_fonts"])
+        self.fallback = dict(settings["docx_fallback_fonts"])
+        self._cache: dict[tuple, tuple[str, str]] = {}
+        self.mono_names: set[str] = set()  # 寫入名稱中屬於等寬字型的
+
+    def category(self, family: str, verification: Optional[str], east_asian: bool) -> str:
+        return font_category(family, verification, east_asian)
+
+    def is_mono(self, family: str, verification: Optional[str] = None) -> bool:
+        return self.category(family, verification, False) == "mono"
+
+    def _decide(self, family: str, verification: Optional[str], east_asian: bool) -> tuple[str, str]:
+        key = (family, verification, east_asian)
+        if key not in self._cache:
+            if self.mode != "portable":
+                self._cache[key] = (family, "")
+            elif family in self.font_map:
+                self._cache[key] = (self.font_map[family], "map")
+            elif family in self.portable:
+                self._cache[key] = (family, "")
+            else:
+                cat = self.category(family, verification, east_asian)
+                self._cache[key] = (self.fallback.get(cat) or self.fallback.get("sans", "Arial"), cat)
+        return self._cache[key]
+
+    def written(self, family: str, verification: Optional[str], east_asian: bool, ctx: "Ctx", element_id: str = "document",
+                context_latin: Optional[str] = None, record: bool = True) -> str:
+        if (self.mode == "portable" and not east_asian and context_latin and context_latin not in self.mono_names
+                and self.is_mono(family, verification)):
+            if record:
+                ctx.degrade(element_id, f"等寬字型「{family}」", f"夾在一般內文裡（多半是辨識誤判），改用同框內文的字型「{context_latin}」", True)
+            return context_latin
+        name, why = self._decide(family, verification, east_asian)
+        if why == "mono" or (not east_asian and self.mode == "portable" and self.is_mono(family, verification)):
+            self.mono_names.add(name)
+        if record and why == "map" and name != family:
+            ctx.degrade("document", f"字型「{family}」", f"與「{name}」字寬相容，寫成多數裝置都有的「{name}」", False)
+        elif record and why and why != "map":
+            ctx.degrade("document", f"字型「{family}」", f"推論的字型「{family}」不是多數裝置都有的字型，依類別（{_CATEGORY_LABEL.get(why, why)}）"
+                        f"寫成「{name}」；成品文件仍記原本推論的「{family}」", True)
+        return name
+
 
 def _all_paragraphs(doc: StyledDoc) -> Iterable[StyledParagraph]:
     for page in doc.pages:
@@ -168,23 +366,63 @@ def _all_paragraphs(doc: StyledDoc) -> Iterable[StyledParagraph]:
                 yield from c.paragraphs
 
 
-def make_ctx(doc: StyledDoc) -> Ctx:
-    """全文件的預設字型：拉丁與東亞各取字數最多的推論字型。"""
+def _box_paragraph_groups(doc: StyledDoc) -> Iterable[list[StyledParagraph]]:
+    for page in doc.pages:
+        for tb in page.text_boxes:
+            yield tb.paragraphs
+        for t in page.tables:
+            for c in t.cells:
+                yield c.paragraphs
+
+
+def make_ctx(doc: StyledDoc, cfg=None) -> Ctx:
+    """全文件的預設字型：拉丁與東亞各取字數最多的寫入字型（等寬字型只在沒有別的字型時才當預設）。"""
+    ctx = Ctx(doc_latin="", doc_ea="", policy=FontPolicy(font_settings(cfg)))
     latin: Counter = Counter()
     ea: Counter = Counter()
-    for sp in _all_paragraphs(doc):
-        for r in sp.runs:
-            (ea if r.font.east_asian else latin)[r.font.family.value] += max(1, len(r.text))
-    doc_latin = latin.most_common(1)[0][0] if latin else (ea.most_common(1)[0][0] if ea else "Liberation Sans")
-    doc_ea = ea.most_common(1)[0][0] if ea else doc_latin
-    return Ctx(doc_latin=doc_latin, doc_ea=doc_ea)
+    mono: Counter = Counter()
+    for paras in _box_paragraph_groups(doc):
+        box_latin, _ = context_fonts(paras, ctx)
+        for sp in paras:
+            for r in sp.runs:
+                name = ctx.font_name(r.font, context_latin=box_latin, record=False)
+                n = max(1, len(r.text))
+                if r.font.east_asian:
+                    ea[name] += n
+                elif name in ctx.policy.mono_names:
+                    mono[name] += n
+                else:
+                    latin[name] += n
+    latin = latin or mono
+    ctx.doc_latin = latin.most_common(1)[0][0] if latin else (ea.most_common(1)[0][0] if ea else ctx.name_of("Liberation Sans", record=False))
+    ctx.doc_ea = ea.most_common(1)[0][0] if ea else ctx.doc_latin
+    return ctx
 
 
 def context_fonts(paragraphs: list[StyledParagraph], ctx: Ctx) -> tuple[str, str]:
-    """一群段落（同一文字框或儲存格）的拉丁與東亞字型：給「只有拉丁字」的段落填東亞欄位用。"""
-    latin = next((r.font.family.value for sp in paragraphs for r in sp.runs if not r.font.east_asian), ctx.doc_latin)
-    ea = next((r.font.family.value for sp in paragraphs for r in sp.runs if r.font.east_asian), ctx.doc_ea)
-    return latin, ea
+    """一群段落（同一文字框或儲存格）的拉丁與東亞寫入字型：字數最多的那個（拉丁優先取非等寬字型）。
+    給「只有拉丁字」的段落填東亞欄位用，也是夾在內文裡的等寬字改用的字型。
+    docx_font_names = "inferred" 時照舊做法：取第一個出現的推論字型。"""
+    if ctx.policy is None or ctx.policy.mode != "portable":
+        lat = next((r.font.family.value for sp in paragraphs for r in sp.runs if not r.font.east_asian), ctx.doc_latin)
+        e = next((r.font.family.value for sp in paragraphs for r in sp.runs if r.font.east_asian), ctx.doc_ea)
+        return lat, e
+    latin: Counter = Counter()
+    mono: Counter = Counter()
+    ea: Counter = Counter()
+    for sp in paragraphs:
+        for r in sp.runs:
+            n = max(1, len(r.text))
+            name = ctx.font_name(r.font, record=False)
+            if r.font.east_asian:
+                ea[name] += n
+            elif ctx.policy.is_mono(r.font.family.value, r.font.verification_family):
+                mono[name] += n
+            else:
+                latin[name] += n
+    lat_c = latin or mono
+    return (lat_c.most_common(1)[0][0] if lat_c else (ctx.doc_latin or "Arial"),
+            ea.most_common(1)[0][0] if ea else (ctx.doc_ea or ctx.doc_latin or "Arial"))
 
 
 # ---------- 段落與字元格式 ----------
@@ -201,6 +439,7 @@ class RunFmt:
     bold: bool
     italic: bool
     color: str  # 六位十六進位
+    spacing: int = 0  # 字距（twip，負值為緊縮）：版面固定模式抵消寫入字型與量測字型的字寬差
 
 
 @dataclass(frozen=True)
@@ -221,12 +460,13 @@ class WordStyle:
     outline: Optional[int] = None  # 大綱階層 0 起算
 
 
-def run_format(sr: StyledRun, latin: str, ea: str, scale: float = 1.0) -> RunFmt:
+def run_format(sr: StyledRun, latin: str, ea: str, scale: float = 1.0, ctx: Optional[Ctx] = None, element_id: str = "document") -> RunFmt:
     """字型欄位：東亞文字段的 eastAsia 寫它自己的字型、ascii／hAnsi 寫鄰近的拉丁字型；
     拉丁文字段的 ascii／hAnsi 寫它自己的字型、eastAsia 寫鄰近的東亞字型。
     實測：東亞段尾的半形空白若用中文字型畫，空白寬約 0.5 em，置中的標題因此偏移 5 pt 以上；
-    交給拉丁字型（Word 本來就依字元範圍選欄位）後誤差消失。使用者在任何位置打中文或英文都不會落回預設字型。"""
-    fam = sr.font.family.value
+    交給拉丁字型（Word 本來就依字元範圍選欄位）後誤差消失。使用者在任何位置打中文或英文都不會落回預設字型。
+    給了 ctx 時，字型名稱是寫入名稱（見模組說明「寫入的字型名稱」），latin、ea 也要是寫入名稱。"""
+    fam = ctx.font_name(sr.font, element_id, context_latin=latin) if ctx is not None else sr.font.family.value
     return RunFmt(
         ascii=(latin or fam) if sr.font.east_asian else fam,
         east_asia=fam if sr.font.east_asian else (ea or fam),
@@ -271,6 +511,8 @@ def rpr_element(fmt: RunFmt, base: Optional[RunFmt], tag: str = "w:rPr", hint_ea
         sub(rpr, "w:iCs", None if fmt.italic else {"w:val": "0"})
     if base is None or fmt.color != base.color:
         sub(rpr, "w:color", {"w:val": fmt.color})
+    if fmt.spacing and (base is None or fmt.spacing != base.spacing):
+        sub(rpr, "w:spacing", {"w:val": fmt.spacing})
     if base is None or fmt.size_half != base.size_half:
         sub(rpr, "w:sz", {"w:val": fmt.size_half})
         sub(rpr, "w:szCs", {"w:val": fmt.size_half})
@@ -288,8 +530,13 @@ def ppr_element(
     mark_rpr: Optional[etree._Element] = None,
     left_tw: int = 0,
     hanging_tw: int = 0,
+    right_tw: int = 0,
+    tabs: Optional[list[tuple[str, int]]] = None,
+    border_bottom: Optional[tuple[int, int, str]] = None,
 ) -> etree._Element:
-    """段落屬性；base 不為空時只寫差異。子元素照綱要順序（pStyle … jc、outlineLvl、rPr）。"""
+    """段落屬性；base 不為空時只寫差異。子元素照綱要順序（pStyle … pBdr、tabs、spacing、ind、jc、outlineLvl、rPr）。
+    tabs：定位點 [(種類 left／right／center, 位置 twip)]，位置從文字區（邊界或儲存格）的左緣算起；
+    border_bottom：段落下框線（寬度八分之一點, 與文字的距離 pt, 顏色）。"""
     ppr = el("w:pPr")
     if style_id:
         sub(ppr, "w:pStyle", {"w:val": style_id})
@@ -301,6 +548,13 @@ def ppr_element(
         n = sub(ppr, "w:numPr")
         sub(n, "w:ilvl", {"w:val": numpr[1]})
         sub(n, "w:numId", {"w:val": numpr[0]})
+    if border_bottom is not None:
+        bdr = sub(ppr, "w:pBdr")
+        sub(bdr, "w:bottom", {"w:val": "single", "w:sz": border_bottom[0], "w:space": border_bottom[1], "w:color": border_bottom[2]})
+    if tabs:
+        t = sub(ppr, "w:tabs")
+        for kind, pos in tabs:
+            sub(t, "w:tab", {"w:val": kind, "w:pos": pos})
     sp_attrs: dict = {}
     if base is None or pf.before != base.before:
         sp_attrs["w:before"] = pf.before
@@ -320,6 +574,8 @@ def ppr_element(
             ind = {"w:left": left_tw, "w:firstLine": pf.first_line}
         else:
             ind = {"w:left": left_tw - pf.first_line, "w:hanging": -pf.first_line}
+    if right_tw:
+        ind["w:right"] = right_tw
     if ind:
         sub(ppr, "w:ind", ind)
     if base is None or pf.align != base.align:
@@ -360,10 +616,21 @@ def build_paragraph(
     align_override: Optional[str] = None,
     left_tw: int = 0,
     hanging_tw: int = 0,
+    right_tw: int = 0,
+    gap_scale: float = 1.0,
+    tail: Optional[list[tuple[str, int, StyledParagraph, str]]] = None,
+    border_bottom: Optional[tuple[int, int, str]] = None,
+    run_spacing: Optional[list[int]] = None,
 ) -> etree._Element:
     """一個成品段落 → 一個 w:p。diff 為真時只寫與樣式不同的屬性（可重排模式）；
-    否則全部明寫（版面固定模式：不依賴樣式繼承，任何軟體開都一樣）。"""
+    否則全部明寫（版面固定模式：不依賴樣式繼承，任何軟體開都一樣）。
+    gap_scale：段前、段後距離乘上這個比例（可重排模式為了放進一頁而等比壓縮空隙時用）。
+    tail：接在同一行後面的其他段落 [(定位點種類, 位置 twip, 段落, 元素編號)]，用定位字元隔開
+    （例如經歷標題右邊的日期：原圖是同一行的兩個框，接成一段才不會在別的字型下互相重疊）。
+    run_spacing：每個文字段的字距（twip，與 sp.runs 對齊），見 condense_spacing。"""
     pf = para_format(sp, ctx.scale)
+    if gap_scale != 1.0:
+        pf = replace(pf, before=int(round(pf.before * gap_scale)), after=int(round(pf.after * gap_scale)))
     if extra_before_tw:
         pf = replace(pf, before=pf.before + extra_before_tw)
     if align_override:
@@ -372,32 +639,44 @@ def build_paragraph(
     base_rf = style.run if (diff and style) else None
     p = el("w:p")
     runs_out: list[tuple[RunFmt, str, bool]] = []
-    remaining = strip_chars
-    for sr in sp.runs:
-        text, removed = clean_text(sr.text)
-        if removed:
-            ctx.degrade(element_id, "文字中的控制字元", f"清除 {removed} 個 XML 不允許的字元", True)
-        if remaining:
-            cut = min(remaining, len(text))
-            text, remaining = text[cut:], remaining - cut
-            if not text:
-                continue
-        fmt = run_format(sr, latin, ea, ctx.scale)
-        exact_half = sr.size_pt.value * ctx.scale * 2
-        if abs(exact_half - fmt.size_half) > 0.02:
-            ctx.degrade(element_id, "字級", f"Word 字級以半點為單位，{sr.size_pt.value:g} pt 量化為 {fmt.size_half / 2:g} pt", True)
-        if sr.color.a < 0.999:
-            ctx.degrade(element_id, "文字透明度", "Word 的文字顏色沒有透明度，以不透明顏色輸出", True)
-        ctx.fonts.update({fmt.ascii, fmt.east_asia})
-        hint = sr.font.east_asian and bool(_AMBIGUOUS.search(text))
-        runs_out.append((fmt, text, hint))
+
+    def collect(par: StyledParagraph, eid: str, remaining: int, spacing: Optional[list[int]] = None) -> None:
+        for k, sr in enumerate(par.runs):
+            text, removed = clean_text(sr.text)
+            if removed:
+                ctx.degrade(eid, "文字中的控制字元", f"清除 {removed} 個 XML 不允許的字元", True)
+            if remaining:
+                cut = min(remaining, len(text))
+                text, remaining = text[cut:], remaining - cut
+                if not text:
+                    continue
+            fmt = run_format(sr, latin, ea, ctx.scale, ctx, eid)
+            if spacing and k < len(spacing) and spacing[k]:
+                fmt = replace(fmt, spacing=spacing[k])
+            exact_half = sr.size_pt.value * ctx.scale * 2
+            if abs(exact_half - fmt.size_half) > 0.02:
+                ctx.degrade(eid, "字級", f"Word 字級以半點為單位，{sr.size_pt.value:g} pt 量化為 {fmt.size_half / 2:g} pt", True)
+            if sr.color.a < 0.999:
+                ctx.degrade(eid, "文字透明度", "Word 的文字顏色沒有透明度，以不透明顏色輸出", True)
+            ctx.fonts.update({fmt.ascii, fmt.east_asia})
+            hint = sr.font.east_asian and bool(_AMBIGUOUS.search(text))
+            runs_out.append((fmt, text, hint))
+
+    collect(sp, element_id, strip_chars, run_spacing)
+    n_main = len(runs_out)
+    tabs = []
+    for kind, pos, tsp, tid in tail or []:
+        tabs.append((kind, pos))
+        runs_out.append((runs_out[-1][0] if runs_out else RunFmt(latin, ea, 22, False, False, "000000"), "\t", False))
+        collect(tsp, tid, 0)
     mark = None
     if runs_out:
-        mark = rpr_element(runs_out[-1][0], base_rf)
+        mark = rpr_element(runs_out[n_main - 1 if n_main else -1][0], base_rf)
     else:
         mark_fmt = RunFmt(latin, ea, half_pt(sp.runs[0].size_pt.value * ctx.scale) if sp.runs else 22, False, False, "000000")
         mark = rpr_element(mark_fmt, base_rf)
-    p.append(ppr_element(pf, base_pf, style.word_id if style else None, style.outline if style else None, keep_next, page_break_before, numpr, mark, left_tw, hanging_tw))
+    p.append(ppr_element(pf, base_pf, style.word_id if style else None, style.outline if style else None, keep_next, page_break_before, numpr, mark,
+                         left_tw, hanging_tw, right_tw, sorted(tabs, key=lambda t: t[1]) or None, border_bottom))
     for fmt, text, hint in runs_out:
         r = sub(p, "w:r")
         rpr = rpr_element(fmt, base_rf, hint_ea=hint)
@@ -449,6 +728,52 @@ def setup_package(docx_doc, ctx: Ctx, default_size_pt: float) -> None:
             cs.set(q("w:val"), "15")
 
 
+_FAMILY_OF_CATEGORY = {"sans": "swiss", "serif": "roman", "mono": "modern", "cjk_sans": "swiss", "cjk_serif": "roman", "cjk_kai": "script"}
+
+
+def font_table_entry(name: str, ctx: Ctx) -> etree._Element:
+    """字型使用表的一筆（子元素照綱要順序：altName、panose1、charset、family、pitch）。
+    常見字型用 FONT_TABLE_INFO 的固定值；其他字型由伺服器上的字型檔判斷類別、讀 PANOSE，altName 寫同類的常見字型。"""
+    f = el("w:font", {"w:name": name})
+    info = FONT_TABLE_INFO.get(name)
+    if info is None:
+        cjk = bool(re.search(r"[⺀-鿿豈-﫿]", name)) or any(k in name.lower() for k in ("cjk", " tc", " sc", "hei", "ming", "song", "kai", "gothic"))
+        cat = font_category(name, name, cjk)
+        fi = font_file_info(name)
+        panose = fi["panose"] if fi and fi["panose"][:2] not in ("00",) else ""
+        fallback = (ctx.policy.fallback if ctx.policy else FONT_DEFAULTS["docx_fallback_fonts"]).get(cat, "Arial")
+        info = (_FAMILY_OF_CATEGORY[cat], "fixed" if cat == "mono" else "variable", panose, "88" if cat.startswith("cjk") else "00",
+                fallback if fallback != name else "")
+    family, pitch, panose, charset, alt = info
+    if alt:
+        sub(f, "w:altName", {"w:val": alt})
+    if panose:
+        sub(f, "w:panose1", {"w:val": panose})
+    sub(f, "w:charset", {"w:val": charset})
+    sub(f, "w:family", {"w:val": family})
+    sub(f, "w:pitch", {"w:val": pitch})
+    return f
+
+
+def finish_package(docx_doc, ctx: Ctx) -> None:
+    """存檔前的收尾：
+    - word/fontTable.xml 改寫成「檔內實際用到的字型」，每個都有類別與替代資訊（python-docx 範本的字型表只列了
+      Times New Roman、Symbol 這類用不到的字型，family 全是 auto；找不到字型的軟體因此只能退回預設的襯線字）。
+    - 拿掉範本附的縮圖（docProps/thumbnail.jpeg 是空白範本的縮圖，和內容無關；檔案管理員可能拿它當預覽）。"""
+    pkg = docx_doc.part.package
+    for part in pkg.iter_parts():
+        if str(part.partname) == "/word/fontTable.xml":
+            root = etree.fromstring(part.blob)
+            for ch in list(root):
+                root.remove(ch)
+            for name in sorted(ctx.fonts):
+                root.append(font_table_entry(name, ctx))
+            part._blob = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    for rid, rel in list(pkg.rels.items()):
+        if rel.reltype.endswith("/metadata/thumbnail"):
+            del pkg.rels[rid]
+
+
 def _style_el(styles_root, style_id: str) -> Optional[etree._Element]:
     for s in styles_root.findall(q("w:style")):
         if s.get(q("w:styleId")) == style_id:
@@ -491,10 +816,19 @@ def build_styles(docx_doc, doc: StyledDoc, ctx: Ctx, builtin_headings: bool = Tr
         primary_of_level.setdefault(min(lvl, 8), s.id)
     for s in doc.styles:
         paras = usage[s.id]
-        latin = Counter(r.font.family.value for sp in paras for r in sp.runs if not r.font.east_asian)
-        ea = Counter(r.font.family.value for sp in paras for r in sp.runs if r.font.east_asian)
-        latin_f = latin.most_common(1)[0][0] if latin else s.font_family
-        ea_f = ea.most_common(1)[0][0] if ea else (s.font_family if not latin else ctx.doc_ea)
+        if paras:
+            latin_f, ea_f = context_fonts(paras, ctx)
+            has_latin = any(not r.font.east_asian for sp in paras for r in sp.runs)
+            has_ea = any(r.font.east_asian for sp in paras for r in sp.runs)
+            for sp in paras:  # 記錄降級（寫入名稱與推論名稱不同時）
+                for r in sp.runs:
+                    ctx.font_name(r.font, context_latin=latin_f)
+            if not has_ea:
+                ea_f = ctx.doc_ea
+            if not has_latin:
+                latin_f = ctx.name_of(s.font_family)
+        else:
+            latin_f = ea_f = ctx.name_of(s.font_family)
         pf_counts = Counter(para_format(sp, ctx.scale) for sp in paras)
         pf = pf_counts.most_common(1)[0][0] if pf_counts else ParaFmt()
         run = RunFmt(latin_f, ea_f, half_pt(s.size_pt * ctx.scale), s.bold, s.italic, s.color.hex)
@@ -980,6 +1314,125 @@ def table_texts(tbl: StyledTable) -> list[str]:
     return ["".join(r.text for r in sp.runs) for c in tbl.cells for sp in c.paragraphs]
 
 
+# ---------- 字寬（單行文字框留足寬度用） ----------
+
+_ADVANCE_CACHE: dict[str, Optional[tuple]] = {}
+
+
+def _advances(family: str, bold: bool) -> Optional[tuple]:
+    key = f"{family}|{bold}"
+    if key not in _ADVANCE_CACHE:
+        val = None
+        try:
+            import subprocess
+
+            from fontTools.ttLib import TTFont
+
+            from ..tools import fontfind
+
+            m = fontfind.match(family, bold)
+            if m is not None:
+                f = TTFont(m.path, fontNumber=m.index, lazy=True)
+                val = (f.getBestCmap(), f["hmtx"], f["head"].unitsPerEm)
+        except Exception:
+            val = None
+        _ADVANCE_CACHE[key] = val
+    return _ADVANCE_CACHE[key]
+
+
+def text_width_pt(text: str, family: str, size_pt: float, bold: bool = False) -> Optional[float]:
+    """用伺服器上的字型檔（mortise.tools.fontfind 找到的）量一串字的前進寬度（pt）。缺字以 0.6 em 計（中日韓字 1 em）；找不到字型回傳 None。"""
+    adv = _advances(family, bold)
+    if adv is None:
+        return None
+    cmap, hmtx, upm = adv
+    w = 0.0
+    for ch in text:
+        g = cmap.get(ord(ch))
+        if g is not None:
+            w += hmtx[g][0] / upm
+        else:
+            w += 1.0 if ord(ch) >= 0x2E80 else 0.6
+    return w * size_pt
+
+
+def worst_case_width_pt(paragraph: StyledParagraph, written: list[str], wide_fallbacks: Iterable[str] = ("DejaVu Sans",)) -> float:
+    """一段單行字在「寫入的字型」與「找不到字型時常見的寬字型」之下，最寬會有多寬（pt）。有強制換行（\n）時取最寬的一行。
+    寫入的字型在伺服器上由 fc-match 對到字寬相容的字型（例如 Arial → Liberation Sans）；
+    寬字型代表使用者裝置上沒有這個字型、被換成別的字型的情況（DejaVu Sans 與 Verdana 同屬最寬的一類無襯線字）。"""
+    best = 0.0
+    for fam in list(dict.fromkeys(list(written) + list(wide_fallbacks))):
+        lines = [0.0]
+        for r in paragraph.runs:
+            for k, piece in enumerate(r.text.split("\n")):
+                if k:
+                    lines.append(0.0)
+                w = text_width_pt(piece, fam, r.size_pt.value, r.bold)
+                lines[-1] += w if w is not None else 0.62 * r.size_pt.value * len(piece)
+        best = max(best, max(lines))
+    return best
+
+
+def hard_breaks(sp: StyledParagraph, width_pt: float) -> Optional[StyledParagraph]:
+    """靠右或置中的多行段落（例如右上角的地址、電話）：原圖的每一行通常是各自獨立的一行字，⑤合成一段後就沒有斷行位置。
+    用量測時的字型（驗證字型）在原框寬裡逐字排一次，排出來的行數與原圖行數（source_line_count）相同，
+    就把斷行處的空白換成強制換行（\n → w:br）：換了字型也照原圖斷行，不會把下一行的字拉上來或把長字（電子郵件）從中間折斷。
+    行數對不上（推不出原圖的斷行）就回傳 None，照原樣輸出。"""
+    if sp.source_line_count < 2 or sp.align not in (Align.RIGHT, Align.CENTER) or not sp.runs:
+        return None
+    pieces = []  # （文字段序號, 起點, 終點, 寬度, 是否為空白）
+    for k, r in enumerate(sp.runs):
+        for m in re.finditer(r"\s+|\S+", r.text):
+            w = text_width_pt(m.group(0), r.font.verification_family, r.size_pt.value, r.bold)
+            if w is None:
+                return None
+            pieces.append((k, m.start(), m.end(), w, m.group(0).isspace()))
+    lines, cur, breaks = 1, 0.0, []
+    for i, (k, a, b, w, space) in enumerate(pieces):
+        if space:
+            cur += w
+            continue
+        if cur > 0 and cur + w > width_pt + 0.5:
+            j = i - 1
+            if j < 0 or not pieces[j][4]:
+                return None  # 斷在兩個非空白之間（同一個字跨文字段）：推不出來
+            breaks.append(pieces[j])
+            lines += 1
+            cur = w
+        else:
+            cur += w
+    if lines != sp.source_line_count:
+        return None
+    runs = [r.text for r in sp.runs]
+    for k, a, b, w, _ in reversed(breaks):
+        runs[k] = runs[k][:a] + "\n" + runs[k][b:]
+    return sp.model_copy(update={"runs": [r.model_copy(update={"text": t}) for r, t in zip(sp.runs, runs)]})
+
+
+def condense_spacing(sp: StyledParagraph, ctx: Ctx, latin: str, max_ratio: float) -> list[int]:
+    """版面固定模式：寫入的字型比⑤量測時用的字型寬（例如 Inter Display 寫成 Arial，寬約 3%）時，
+    每個字緊縮一點字距，讓整段的寬度回到量測時的寬度，換行位置才會和原圖一樣，框不會因為多一行而往下長、蓋到下一個框。
+    兩個寬度都用伺服器上的字型檔量（寫入的字型由 fc-match 對到字寬相容的字型，例如 Arial → Liberation Sans）。
+    只緊縮、不放寬；每字最多緊縮字級的 max_ratio；中日韓文字不處理。回傳每個文字段的字距（twip，0 表示不改）。"""
+    out = []
+    for r in sp.runs:
+        if r.font.east_asian or not r.text.strip():
+            out.append(0)
+            continue
+        written = ctx.font_name(r.font, context_latin=latin, record=False)
+        if written == r.font.verification_family:
+            out.append(0)
+            continue
+        w_out = text_width_pt(r.text, written, r.size_pt.value, r.bold)
+        w_ref = text_width_pt(r.text, r.font.verification_family, r.size_pt.value, r.bold)
+        if w_out is None or w_ref is None or w_out <= w_ref:
+            out.append(0)
+            continue
+        per_char = min((w_out - w_ref) / len(r.text), max_ratio * r.size_pt.value) * ctx.scale
+        out.append(-int(round(per_char * 20)))
+    return out
+
+
 # ---------- 字型量度（基線補償用） ----------
 
 _ASCENT_CACHE: dict[str, Optional[float]] = {}
@@ -987,7 +1440,7 @@ _ASCENT_CACHE: dict[str, Optional[float]] = {}
 
 def font_first_baseline_em(family: str) -> Optional[float]:
     """文字引擎（LibreOffice）放第一行基線的位置，以 em 為單位：hhea 上緣加行距間隙。
-    用伺服器上實際的字型檔（fc-match 找檔、fontTools 讀量度）；找不到就回傳 None。"""
+    用伺服器上實際的字型檔（mortise.tools.fontfind 找檔、fontTools 讀量度）；找不到就回傳 None。"""
     if family in _ASCENT_CACHE:
         return _ASCENT_CACHE[family]
     val = None
@@ -996,9 +1449,11 @@ def font_first_baseline_em(family: str) -> Optional[float]:
 
         from fontTools.ttLib import TTFont
 
-        path = subprocess.run(["fc-match", "-f", "%{file}", family], capture_output=True, text=True, timeout=10).stdout.strip()
-        if path:
-            f = TTFont(path, fontNumber=0, lazy=True)
+        from ..tools import fontfind
+
+        m = fontfind.match(family)
+        if m is not None:
+            f = TTFont(m.path, fontNumber=m.index, lazy=True)
             hhea, upm = f["hhea"], f["head"].unitsPerEm
             val = (hhea.ascent + max(0, hhea.lineGap)) / upm
     except Exception:

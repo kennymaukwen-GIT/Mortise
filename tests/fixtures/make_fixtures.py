@@ -3,6 +3,7 @@
     python tests/fixtures/make_fixtures.py            全部重新產生
     python tests/fixtures/make_fixtures.py vectors    只產生向量圖的三個（vector_*.pdf；不需要 LibreOffice，輸出的位元組固定）
     python tests/fixtures/make_fixtures.py flattened  只產生被扁平化內容的兩個（flattened_*.pdf；不需要 LibreOffice，輸出的位元組固定）
+    python tests/fixtures/make_fixtures.py cv         只產生假資料的兩欄履歷（cv_two_column.pdf；不需要 LibreOffice，輸出的位元組固定）
 """
 
 from __future__ import annotations
@@ -767,9 +768,128 @@ def flattened_embedded() -> None:
     c.save()
 
 
+def cv_two_column() -> None:
+    """假資料的兩欄履歷（人名、經歷都是虛構的）：左邊灰底側欄（技能、軟體、語言）、右邊主欄（簡介、經歷、學歷），
+    最上方姓名在左、聯絡方式靠右，經歷標題右邊有靠右的日期，內容一路排到接近紙張底部。
+    用來測 Word 輸出在別的裝置上不跑版（tests/exporters/test_docx_two_column.py）。不需要 LibreOffice，輸出的位元組固定。"""
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("cv_two_column.pdf", (w, h))
+    ink, accent, grey = HexColor("#222222"), HexColor("#2F5D73"), HexColor("#555555")
+
+    def text(x, top, s, size, font="LS", color=ink, align="left", space=0.0):
+        c.setFillColor(color)
+        t = c.beginText()
+        t.setFont(font, size)
+        t.setCharSpace(space)
+        width = stringWidth(s, font, size) + space * (len(s) - 1)
+        t.setTextOrigin(x - width if align == "right" else x, h - top)
+        t.textOut(s)
+        c.drawText(t)
+
+    def rule(x0, x1, top, color=accent, width=0.8):
+        c.setStrokeColor(color)
+        c.setLineWidth(width)
+        c.line(x0, h - top, x1, h - top)
+
+    def wrap(s, font, size, width):
+        lines, cur = [], ""
+        for word in s.split():
+            trial = (cur + " " + word).strip()
+            if stringWidth(trial, font, size) <= width or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+        return lines + [cur]
+
+    # 側欄底色（左緣貼齊紙邊、往下到紙張底部）與頁首分隔線
+    c.setFillColor(HexColor("#F3F2EE"))
+    c.rect(0, 0, 177, h - 122, stroke=0, fill=1)
+    rule(0, w, 121, HexColor("#DDDDDD"), 0.6)
+    # 頁首：姓名在左、聯絡方式靠右
+    text(34, 58, "RILEY QUINN", 26, "LSB")
+    text(34, 80, "Riley Q.", 12, color=accent)
+    text(34, 99, "Data analysis · Urban research · Web & SEO", 9.5, color=grey)
+    for top, s in ((68, "riley.quinn@example.com"), (81, "+1 555 0100"), (94, "Springfield, Exampleland")):
+        text(562, top, s, 9, color=accent if "@" in s else grey, align="right")
+    # 側欄
+    y = 150
+    for head, groups in (("SKILLS", [("Research & analysis", ["Site surveys", "Market research", "Database building"]),
+                                      ("Digital", ["Website design", "SEO and GEO", "AI-assisted coding"])]),
+                         ("SOFTWARE", [(None, ["Notion", "QGIS", "AutoCAD", "Rhino", "Office suite"])]),
+                         ("LANGUAGES", [(None, ["English (native)", "Spanish (B2)"])])):
+        text(33, y, head, 8.5, "LSB", accent, space=1.6)
+        rule(33, 160, y + 7)
+        y += 26
+        for sub, items in groups:
+            if sub:
+                text(33, y, sub, 8.5, "LSB")
+                y += 14
+            for it in items:
+                text(33, y, it, 8.5, color=grey)
+                y += 14
+            y += 6
+        y += 14
+    # 主欄
+    x0, x1 = 198.0, 580.0
+
+    def heading(top, s):
+        text(x0, top, s, 8.5, "LSB", accent, space=1.6)
+        rule(x0, x1, top + 7)
+
+    def bullets(top, items, size=9.0):
+        for it in items:
+            for k, line in enumerate(wrap(it, "LS", size, x1 - x0 - 14)):
+                if k == 0:
+                    text(x0 + 3, top, "•", size, color=grey)
+                text(x0 + 12, top, line, size, color=grey)
+                top += 12.5
+            top += 2
+        return top
+
+    heading(150, "PROFILE")
+    top = 176
+    for line in wrap("Final-year urban planning student with field research experience and two small client websites built "
+                     "from scratch, including search and generative engine optimisation for a local bakery.", "LS", 9, x1 - x0):
+        text(x0, top, line, 9, color=grey)
+        top += 12.5
+    heading(top + 12, "EXPERIENCE")
+    top += 38
+    jobs = [("NORTHWIND LTD — junior data analyst, Springfield", "2025 – present",
+             ["Cleaned and joined three years of footfall counts so the team could compare weekday and weekend demand by street.",
+              "Built a small dashboard that shows vacancy rates per block and updates every Monday from a shared sheet.",
+              "Wrote a short guide on naming fields consistently, now used by four new colleagues.",
+              "Presented the findings to the client in a twenty-minute review."]),
+            ("Riverside Studio — freelance web projects", "Jan 2024 · 3 months",
+             ["Designed and built a website for a neighbourhood bakery, including an online pre-order form.",
+              "Rewrote page titles and descriptions around the words real customers search for; visits doubled in two months."]),
+            ("Volunteer mapping project", "2023",
+             ["Surveyed street trees with a phone app and checked every record against aerial photos before upload.",
+              "Trained six volunteers to use the same checklist so the data stayed consistent."])]
+    for title, date, items in jobs:
+        text(x0, top, title, 9.5, "LSB")
+        text(x1, top, date, 8.5, color=grey, align="right")
+        top = bullets(top + 16, items) + 8
+    heading(top + 6, "EDUCATION")
+    top += 32
+    text(x0, top, "BSc Urban Planning — Example University", 9.5, "LSB")
+    text(x1, top, "2021 – 2025", 8.5, color=grey, align="right")
+    bullets(top + 16, ["Dissertation on how walking distance to a station changes shop rents along a high street.",
+                       "Exchange term at a partner university abroad (urban design studio)."])
+    c.showPage()
+    c.save()
+
+
 if __name__ == "__main__":
     import sys
 
+    if sys.argv[1:] == ["cv"]:
+        cv_two_column()
+        print(["cv_two_column.pdf"])
+        sys.exit(0)
     if sys.argv[1:] == ["flattened"]:
         flattened_outlined()
         flattened_embedded()
@@ -786,4 +906,5 @@ if __name__ == "__main__":
     if sys.argv[1:] != ["vectors"]:
         flattened_outlined()
         flattened_embedded()
+        cv_two_column()
     print(sorted(p.name for p in HERE.glob("*.pdf")))

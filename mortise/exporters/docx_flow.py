@@ -45,6 +45,7 @@ from typing import Optional
 
 from docx import Document
 from docx.shared import Emu
+from lxml import etree
 
 from ..artifacts import Align, Box, OutputFile, OutputFormat, StyledDoc, StyledPage, StyledParagraph
 from ..artifacts.common import Role
@@ -63,8 +64,11 @@ from .docx_common import (
     drawing_anchor,
     drawing_run,
     el,
+    eighth_pt,
     emu,
     empty_paragraph,
+    finish_package,
+    hard_breaks,
     image_descriptor,
     make_ctx,
     picture_pic,
@@ -98,6 +102,18 @@ DEFAULT_PARAMS = {
     "float_side_images": True,  # 上緣在目前文字流底部之上的圖片改成浮動圖片（錨在最近的段落），不往下堆疊
     "float_offflow_boxes": True,  # 同理，這類文字框（側欄、壓在圖上的說明）改成浮動文字方塊
     "nowrap_slack_ratio": 0.15,  # 浮動文字方塊不換行時加寬的比例（同版面固定模式）
+    # 並排的版面（側欄＋主欄、標題列的左右兩塊、標題右邊的日期）：寫成看不見框線的表格（見「並排的版面」一節）
+    "side_by_side_tables": True,  # false 則用舊做法（錨在段落上的浮動文字方塊；在別的裝置上容易錯位）
+    "max_table_depth": 2,  # 表格最多套幾層（第二層例如經歷標題與右邊的日期）
+    "band_overlap_pt": 3.0,  # 上下兩個元素重疊不超過這麼多（pt）……
+    "band_overlap_ratio": 0.25,  # ……也不超過較矮者高度的這個比例，仍當成上下分開（文字框的外框常常略有重疊）
+    "tab_min_offset_ratio": 0.3,  # 單行小框的左緣在另一個框寬度的這個比例之後，才接到那一行的行尾（定位點）
+    "overlay_min_ratio": 0.3,  # 與另一個元素的交集超過自身面積的這個比例，才算「蓋在上面」而用浮動物件
+    "fit_page_gaps": True,  # 原圖內容貼到紙邊、放不進 Word 頁面的文字區時，等比壓縮元素之間與段落前後的空隙
+    "min_gap_scale": 0.6,  # 空隙最多壓縮到原來的這個比例
+    "rules_as_borders": True,  # 段落正下方的水平線改成段落下框線（例如履歷標題下的線）
+    "rule_max_gap_pt": 10.0,  # 線與段落字的下緣距離不超過這麼多（pt）才算「段落正下方」
+    "bottom_room": True,  # 每頁從新頁開始時，下邊界只留到頁尾為止（不貼著內容），讓目標軟體多出來的行高有地方放
 }
 
 HF_ROLES = {Role.HEADER, Role.FOOTER, Role.PAGE_NUMBER}
@@ -208,8 +224,6 @@ def _page_blocks(page: StyledPage, ctx: Ctx) -> list[Block]:
     for i in rest:
         if by_id[i][0] != "text" or _main_paras(by_id[i][1]):
             ctx.degrade(i, "閱讀順序", "不在閱讀順序中，依位置排在該頁最後", False)
-    for s in page.shapes:
-        ctx.degrade(s.id, f"形狀 {s.geometry}", "可重排模式不輸出形狀", True)
     blocks: list[Block] = []
     for i in order + rest:
         if i in shapes:
@@ -283,8 +297,8 @@ def _write_numbering(docx_doc, groups: list[tuple[Marker, list[Block]]], ctx: Ct
         sub(ppr, "w:ind", {"w:left": hanging, "w:hanging": hanging})
         rpr = sub(lvl, "w:rPr")
         if marker_runs:
-            fam = marker_runs[0].font.family.value
             latin, ea = context_fonts(members[0].box_paras, ctx)
+            fam = ctx.font_name(marker_runs[0].font, members[0].elem_id, context_latin=latin)
             rfonts(rpr, fam, fam if marker_runs[0].font.east_asian else ea)
             ctx.fonts.update({fam, ea})
         if first_num is not None:
@@ -532,12 +546,590 @@ def _float_anchor(b: Block, anchors: list, flow_bottom: float):
     return None
 
 
+# ---------- 並排的版面：看不見框線的表格 ----------
+#
+# 為什麼不用浮動文字方塊：錨在段落上的浮動方塊，位置是「相對錨點段落」算的；錨點段落在別台裝置上因為字型不同
+# 而上下移動、或檢視器（例如 iOS 的預覽）不照 Word 的規則放浮動物件時，方塊就錯位、互相重疊，主文字流也不會讓開。
+# 表格是主文字流的一部分：格子裡的字變多，整列一起長高、後面的內容一起往下推，不會重疊。
+#
+# 切法（遞迴的 XY 切分）：
+#   1. 先橫切：上下之間有完整空隙（容許 band_overlap_pt 以內的輕微重疊）的地方切開，得到由上而下的「帶」。
+#   2. 每一帶再直切：左右之間有完整空隙的地方切開；切得開（兩欄以上）就是並排 → 一列表格，每欄一格，
+#      格子裡的元素遞迴同樣處理（最多 max_table_depth 層，例如經歷標題與右邊的日期是第二層）。
+#   3. 都切不開的一群元素是互相重疊的：
+#      a. 單行的小文字框落在另一個文字框某一行的右半邊（例如「2026 – present」在「FUN CAR — …」那一行的右邊）
+#         → 接到那一段的行尾，用定位字元與定位點對齊（同一行、不會重疊）。
+#      b. 真的蓋在別的元素上面（與它的交集超過自身面積的 overlay_min_ratio，例如壓在圖上的字）
+#         → 浮動物件，錨在被蓋住的那個元素的第一段，不文繞圖。只有這種情況用浮動物件。
+#      c. 其他（輕微交錯、但不是蓋在上面）→ 由上而下依序排。
+# 欄寬照原圖：格與格的界線放在兩欄空隙的中點；某一欄背後有自己的填色矩形（側欄）時，界線改在矩形的邊緣，
+# 矩形的顏色寫成儲存格底色，表格也延伸到矩形的範圍（可以超出頁面邊界，例如貼齊紙邊的側欄）。
+# 列高寫「至少」（不是固定值，字變多時會長高）；允許跨頁拆列（不寫 cantSplit：一列比一頁還高時，Word 會把放不下的部分裁掉）。
+
+
+@dataclass
+class _Item:
+    """版面切分的單位：一個文字框（主文字流的段落）、圖片或表格。座標是輸出座標（pt，已乘比例）。"""
+
+    kind: str
+    id: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    obj: object
+    blocks: list
+    rank: int
+
+    @property
+    def area(self) -> float:
+        return max(0.0, self.x1 - self.x0) * max(0.0, self.y1 - self.y0)
+
+    def single_line(self) -> bool:
+        return self.kind == "text" and len(self.blocks) == 1 and (not self.obj.wrap or self.blocks[0].item.source_line_count <= 1)
+
+
+@dataclass
+class _Row:
+    cols: list
+    children: list
+    bounds: list
+    fills: list
+    fill_ids: list
+    top: float
+    bottom: float
+
+
+def _cut(items: list[_Item], axis: str, params: dict, glue: Optional[list[tuple[float, float]]] = None) -> list[list[_Item]]:
+    """沿一個方向找完整的空隙切開。橫切時每個元素上下各縮一點（輕微重疊不算重疊）。
+    glue：橫切時不可以切開的範圍（例如側欄的填色矩形：它的上下範圍裡切開，底色就斷成兩截）。"""
+    spans = []
+    for it in items:
+        if axis == "y":
+            t = min(params["band_overlap_pt"], params["band_overlap_ratio"] * (it.y1 - it.y0))
+            spans.append((it.y0 + t, it.y1 - t, it))
+        else:
+            spans.append((it.x0 + 0.5, it.x1 - 0.5, it))
+    spans += [(a, b, None) for a, b in (glue or [])]
+    spans.sort(key=lambda s: (s[0], s[2].rank if s[2] is not None else -1))
+    groups: list[list[_Item]] = []
+    end = float("-inf")
+    for a, b, it in spans:
+        if groups and a < end:
+            end = max(end, b)
+        else:
+            groups.append([])
+            end = b
+        if it is not None:
+            groups[-1].append(it)
+    return [g for g in groups if g]
+
+
+def _para_spans(it: _Item) -> list[tuple[float, float]]:
+    """文字框裡每一段的上下緣估計（輸出座標）：行數 × 行高 + 段後距離，再等比對到框高。"""
+    hs = []
+    for b in it.blocks:
+        sp = b.item
+        size = max((r.size_pt.value for r in sp.runs), default=10.0)
+        ls = sp.line_spacing.value if sp.line_spacing else None
+        lh = ls.value if (ls is not None and ls.mode.value == "exact") else (ls.value if ls is not None else 1.0) * 1.2 * size
+        hs.append((max(1, sp.source_line_count) * lh, sp.space_after_pt))
+    total = sum(a + b for a, b in hs) or 1.0
+    f = (it.y1 - it.y0) / total
+    out, y = [], it.y0
+    for a, b in hs:
+        out.append((y, y + a * f))
+        y += (a + b) * f
+    return out
+
+
+def _attach(group: list[_Item], params: dict) -> tuple[list[_Item], dict]:
+    """互相重疊的一群：找出「接在別人身上」的元素（同一行的小框、或蓋在上面的元素）。
+    回傳（底層元素, {被接的元素編號: [(接上來的元素, 方式 tab／float, 段落序號)]}）。"""
+    attached: dict[str, list] = {}
+    base = []
+    for b in sorted(group, key=lambda i: (i.y0, i.x0)):
+        best, best_area = None, 0.0
+        for a in group:
+            if a is b or a.area <= b.area:
+                continue
+            ix = min(a.x1, b.x1) - max(a.x0, b.x0)
+            iy = min(a.y1, b.y1) - max(a.y0, b.y0)
+            if ix > 0 and iy > 0 and ix * iy > best_area:
+                best, best_area = a, ix * iy
+        if best is None:
+            base.append(b)
+            continue
+        cy = (b.y0 + b.y1) / 2
+        if b.single_line() and best.kind == "text" and b.x0 >= best.x0 + params["tab_min_offset_ratio"] * (best.x1 - best.x0):
+            spans = _para_spans(best)
+            k = min(range(len(spans)), key=lambda i: 0.0 if spans[i][0] <= cy <= spans[i][1] else min(abs(cy - spans[i][0]), abs(cy - spans[i][1])))
+            target = best.blocks[k].item
+            last_line_top = spans[k][1] - (spans[k][1] - spans[k][0]) / max(1, target.source_line_count)
+            if spans[k][0] - 2.0 <= cy <= spans[k][1] + 2.0 and cy >= last_line_top - 2.0:
+                attached.setdefault(best.id, []).append((b, "tab", k))
+                continue
+        if best_area >= params["overlay_min_ratio"] * max(b.area, 1e-6):
+            attached.setdefault(best.id, []).append((b, "float", 0))
+            continue
+        base.append(b)
+    return base, attached
+
+
+def _layout(items: list[_Item], depth: int, params: dict, attached: dict, shapes: Optional[list] = None) -> list:
+    """遞迴的 XY 切分。節點：("item", 元素)、("row", _Row)、("stack", [元素])。attached 收集接在別人身上的元素。
+    shapes 是可以當底色的填色矩形：裡面有一部分（不是全部）元素的矩形，橫切時不可以切開。"""
+    out: list = []
+    glue = []
+    for x0, y0, x1, y1, _ in shapes or []:
+        inside = [it for it in items if x0 - 2 <= (it.x0 + it.x1) / 2 <= x1 + 2 and y0 - 2 <= (it.y0 + it.y1) / 2 <= y1 + 2]
+        if inside and len(inside) < len(items):
+            glue.append((y0, y1))
+    for band in _cut(items, "y", params, glue):
+        if len(band) == 1:
+            out.append(("item", band[0]))
+            continue
+        cols = _cut(band, "x", params)
+        if len(cols) > 1 and depth < params["max_table_depth"]:
+            out.append(("row", _Row(cols=[sorted(c, key=lambda i: (i.y0, i.rank)) for c in cols], children=[], bounds=[], fills=[],
+                                    fill_ids=[], top=min(i.y0 for i in band), bottom=max(i.y1 for i in band))))
+            continue
+        base, att = _attach(band, params)
+        if att and len(base) < len(band):
+            attached.update(att)
+            out.extend(_layout(base, depth, params, attached, shapes))
+        else:
+            out.append(("stack", sorted(band, key=lambda i: (i.y0, i.rank))))
+    for kind, node in out:
+        if kind == "row":
+            node.children = [_layout(c, depth + 1, params, attached, shapes) for c in node.cols]
+    return out
+
+
+def _flush_right(it: _Item, tl: float, tr: float) -> bool:
+    """單行、靠左、右緣貼齊文字區右緣、而且在右半邊的文字框（例如經歷標題右邊的日期）。"""
+    return (it.kind == "text" and not it.obj.wrap and len(it.blocks) == 1 and it.blocks[0].item.align in (Align.LEFT, Align.JUSTIFY)
+            and it.x1 >= tr - 2.0 and it.x0 > tl + 0.3 * (tr - tl))
+
+
+def _fill_shapes(page: StyledPage, s: float) -> list:
+    """可以當儲存格底色的形狀：有填色、不旋轉的矩形，而且不是整頁的底色。"""
+    W, H = page.width_pt * s, page.height_pt * s
+    out = []
+    for sh in page.shapes:
+        if sh.geometry not in ("rect", "rounded_rect") or sh.fill is None or sh.fill.a < 0.5 or abs(sh.box.rotation) > 0.05:
+            continue
+        x0, y0, x1, y1 = sh.box.x * s, sh.box.y * s, (sh.box.x + sh.box.w) * s, (sh.box.y + sh.box.h) * s
+        if (x1 - x0) >= 0.95 * W and (y1 - y0) >= 0.95 * H:
+            continue
+        out.append((x0, y0, x1, y1, sh))
+    return out
+
+
+def _plan_row(row: _Row, cont: tuple[float, float], shapes: list, W: float) -> None:
+    """一列的欄界線與底色。cont 是容器的文字區（左、右）。"""
+    ext = [(min(i.x0 for i in c), max(i.x1 for i in c), min(i.y0 for i in c), max(i.y1 for i in c)) for c in row.cols]
+    fills: list = []
+    for k, (cx0, cx1, cy0, cy1) in enumerate(ext):
+        lo = ext[k - 1][1] if k > 0 else float("-inf")
+        hi = ext[k + 1][0] if k + 1 < len(ext) else float("inf")
+        cand = [sh for sh in shapes if sh[0] <= cx0 + 2 and sh[2] >= cx1 - 2 and sh[1] <= cy0 + 2 and sh[3] >= cy1 - 2 and sh[0] >= lo - 1 and sh[2] <= hi + 1]
+        fills.append(min(cand, key=lambda sh: (sh[2] - sh[0]) * (sh[3] - sh[1])) if cand else None)
+    bounds = [min(cont[0], ext[0][0], fills[0][0] if fills[0] else float("inf"))]
+    for k in range(1, len(ext)):
+        gap0, gap1 = ext[k - 1][1], ext[k][0]
+        if fills[k - 1] is not None and gap0 - 1 <= fills[k - 1][2] <= gap1 + 1:
+            bounds.append(fills[k - 1][2])
+        elif fills[k] is not None and gap0 - 1 <= fills[k][0] <= gap1 + 1:
+            bounds.append(fills[k][0])
+        else:
+            bounds.append((gap0 + gap1) / 2)
+    bounds.append(max(cont[1], ext[-1][1], fills[-1][2] if fills[-1] else float("-inf")))
+    bounds[0], bounds[-1] = max(0.0, bounds[0]), min(W, bounds[-1])
+    row.bounds = bounds
+    row.fills = [f[4].fill if f else None for f in fills]
+    row.fill_ids = [f[4].id if f else None for f in fills]
+    ys = [f[1] for f in fills if f] + [row.top]
+    row.top = min(ys)
+    row.bottom = max([f[3] for f in fills if f] + [row.bottom])
+
+
+def _inner_gaps(it: _Item) -> float:
+    if it.kind != "text":
+        return 0.0
+    return sum(b.item.space_before_pt + (b.item.space_after_pt if k < len(it.blocks) - 1 else 0.0) for k, b in enumerate(it.blocks))
+
+
+def _measure(nodes: list, start: float) -> tuple[float, float]:
+    """一串節點由 start 往下排的（內容高度, 空隙高度）：空隙可以等比壓縮，內容不行。列取最高的那一格。"""
+    content = gaps = 0.0
+    y = start
+    for kind, node in nodes:
+        if kind == "row":
+            best = (0.0, 0.0)
+            for kids in node.children:
+                c, g = _measure(kids, node.top)
+                if c + g > sum(best):
+                    best = (c, g)
+            top = node.top
+            content += best[0]
+            gaps += max(0.0, top - y) + best[1]
+            y = max(node.bottom, top + sum(best))
+            continue
+        its = [node] if kind == "item" else node
+        for it in its:
+            g = _inner_gaps(it)
+            gaps += max(0.0, it.y0 - y) + g
+            content += max(0.0, it.y1 - it.y0 - g)
+            y = max(y, it.y1)
+    return content, gaps
+
+
+class _FlowLayout:
+    """把版面樹寫成本文的段落與表格（看不見框線）。"""
+
+    def __init__(self, docx_doc, ctx: Ctx, styles: dict, store: Store, params: dict, expect: list, s: float, page: StyledPage,
+                 attached: dict, shapes: list, W: float, gap_scale: float):
+        self.docx_doc, self.ctx, self.styles, self.store, self.params = docx_doc, ctx, styles, store, params
+        self.expect, self.s, self.page, self.attached, self.shapes, self.W = expect, s, page, attached, shapes, W
+        self.f = gap_scale
+        self.used_fills: set[str] = set()
+        self.below: dict[str, float] = {}  # 元素編號 → 它下面那條改成段落框線的線的下緣（之後的空隙從這裡算）
+        self.rules = []  # 水平線（可以改成段落下框線）：（x0, x1, y, 線寬, 顏色, 形狀）
+        for sh in page.shapes:
+            if sh.geometry == "line" and sh.stroke is not None and abs(sh.box.h) * s < 1.0 and sh.box.w * s > 20.0 and sh.stroke.a >= 0.5:
+                self.rules.append((sh.box.x * s, (sh.box.x + sh.box.w) * s, sh.box.y * s, (sh.stroke_width_pt or 0.75) * s, sh.stroke.hex, sh))
+
+    def _rule_under(self, it: _Item, k: int, span: tuple[float, float], next_top: float, tl: float, tr: float):
+        """段落正下方（離字的下緣不超過 rule_max_gap_pt、在下一段之前）、橫跨段落大部分寬度的水平線 → 段落下框線。
+        回傳（框線寬八分之一點, 與字的距離 pt, 顏色, 線的下緣, 形狀編號）或 None。"""
+        best = None
+        for x0, x1, y, lw, color, sh in self.rules:
+            if sh.id in self.used_fills:
+                continue
+            d = y - span[1]
+            if not (-1.0 <= d <= self.params["rule_max_gap_pt"] and y < next_top):
+                continue
+            ov = min(x1, tr) - max(x0, max(tl, it.x0))
+            if ov < 0.5 * (x1 - x0):
+                continue
+            if best is None or d < best[1]:
+                best = (min(96, max(2, eighth_pt(lw))), max(0.0, d), color, y + lw, sh.id)
+        return best
+
+    # --- 單一元素 ---
+
+    def _text(self, it: _Item, tl: float, tr: float, gap: float, in_cell: bool, brk: Optional[str]) -> list:
+        latin, ea = context_fonts(it.blocks[0].box_paras, self.ctx)
+        tails: dict[int, list] = {}
+        floats = []
+        for b, how, k in self.attached.get(it.id, []):
+            if how == "tab":
+                tails.setdefault(k, []).append(b)
+            else:
+                floats.append(b)
+        aligns = {b.item.align for b in it.blocks}
+        left = max(0.0, it.x0 - tl)
+        right = 0.0
+        align_override = None
+        if in_cell:
+            right = max(0.0, tr - it.x1)
+            slack = self.params["nowrap_slack_ratio"] * (it.x1 - it.x0)
+            if _flush_right(it, tl, tr):
+                aligns, align_override = {Align.RIGHT}, "right"  # 單行、貼齊右緣（例如右邊的日期）：靠右對齊，左邊留給較寬的字型
+            if not it.obj.wrap:
+                if aligns <= {Align.LEFT, Align.JUSTIFY}:
+                    right = 0.0  # 單行靠左：右邊留給較寬的字型
+                elif aligns == {Align.RIGHT}:
+                    left = 0.0
+                elif aligns == {Align.CENTER}:
+                    d = min(left, right)
+                    left, right = left - d, right - d
+            elif aligns == {Align.RIGHT}:
+                left = max(0.0, left - slack)  # 靠右的多行字：左邊多留一點，較寬的字型才不會把長字（例如電子郵件）從中間折斷
+            elif aligns == {Align.CENTER}:
+                d = min(left, right, slack / 2)
+                left, right = left - d, right - d
+        out = []
+        spans = _para_spans(it)
+        for k, b in enumerate(it.blocks):
+            sp = b.item
+            border = None
+            if self.params["rules_as_borders"] and self.rules:
+                nxt = spans[k + 1][0] if k + 1 < len(spans) else float("inf")
+                rule = self._rule_under(it, k, spans[k], nxt, tl, tr)
+                if rule is not None:
+                    sz, d, color, bottom, sid = rule
+                    border = (sz, int(round(min(31.0, d))), color)
+                    self.used_fills.add(sid)
+                    self.ctx.degrade(sid, "形狀 line", "段落正下方的水平線：改成段落的下框線（跟著段落移動）", False)
+                    # 框線與上方的距離已經佔掉段後空間的一部分：段後距離扣掉它，下面的內容才不會多往下移
+                    sp = sp.model_copy(update={"space_after_pt": max(0.0, sp.space_after_pt - d - sz / 8.0)})
+                    if k == len(it.blocks) - 1:
+                        self.below[it.id] = bottom
+            if aligns <= {Align.RIGHT, Align.CENTER} and (hb := hard_breaks(sp, (it.x1 - it.x0) / self.s)) is not None:
+                sp = hb
+                self.ctx.degrade(it.id, "斷行", "靠右或置中的多行字：照原圖的斷行位置寫成強制換行（換了字型也不會改變斷行）", False)
+            tail = []
+            r_tw = twip(right) if right > 1.0 else 0
+            for t in sorted(tails.get(k, []), key=lambda t: t.x0):
+                tsp = t.blocks[0].item
+                if tsp.align == Align.RIGHT or t.x1 >= it.x1 - 1.0:
+                    tail.append(("right", twip(min(t.x1, tr) - tl), tsp, t.id))
+                else:
+                    tail.append(("left", twip(t.x0 - tl), tsp, t.id))
+                r_tw = twip(max(0.0, tr - max(it.x1, t.x1))) if in_cell else 0
+                self.expect.append("".join(r.text for r in tsp.runs))
+                self.ctx.degrade(t.id, "文字框位置", "與另一個文字框的某一行同高（例如標題右邊的日期）：接在那一行的行尾，用定位點對齊", False)
+            p = build_paragraph(sp, self.ctx, b.elem_id, latin, ea, self.styles.get(b.item.style_id or ""), diff=True,
+                                extra_before_tw=twip(gap * self.f) if (k == 0 and gap > self.params["min_gap_pt"]) else 0,
+                                page_break_before=(brk == "page" and k == 0), numpr=b.numpr, strip_chars=b.strip,
+                                left_tw=twip(left) if left > 1.0 else 0, hanging_tw=b.hanging_tw, right_tw=r_tw,
+                                gap_scale=self.f, tail=tail or None, align_override=align_override, border_bottom=border)
+            self.expect.append("".join(r.text for r in b.item.runs)[b.strip:])
+            out.append(p)
+        for fl in floats:
+            self._float(fl, it, out[0], tl)
+        return out
+
+    def _float(self, b: _Item, a: _Item, anchor_p, tl: float) -> None:
+        """真的蓋在別的元素上面：浮動物件，錨在被蓋住的元素的第一段，不文繞圖。"""
+        pid = self.ctx.new_id()
+        w, h = b.x1 - b.x0, b.y1 - b.y0
+        if b.kind == "text":
+            latin, ea = context_fonts(b.blocks[0].box_paras, self.ctx)
+            paras = [build_paragraph(x.item, self.ctx, x.elem_id, latin, ea, self.styles.get(x.item.style_id or ""), diff=True,
+                                     numpr=x.numpr, strip_chars=x.strip, hanging_tw=x.hanging_tw) for x in b.blocks]
+            self.expect.extend("".join(r.text for r in x.item.runs)[x.strip:] for x in b.blocks)
+            if not b.obj.wrap:
+                w += w * self.params["nowrap_slack_ratio"]
+            child, uri, wps = textbox_wsp(paras, w, h, 0.0, b.obj.wrap, autofit=True), URI_WPS, True
+        elif b.kind == "image":
+            rid, _ = self.docx_doc.part.get_or_add_image(image_descriptor(self.store, b.obj.image))
+            child, uri, wps = picture_pic(rid, w, h, 0.0, pid, b.id), URI_PIC, False
+        else:
+            return
+        anc = drawing_anchor(child, uri, x=b.x0 - tl, y=b.y0 - a.y0, w=w, h=h, rot=0.0, rel_height=251659264 + pid, behind=False,
+                             pr_id=pid, name=b.id, h_rel="column", v_rel="paragraph", wrap="none", layout_in_cell=True)
+        anchor_p.append(drawing_run(anc, wps))
+        self.ctx.degrade(b.id, "文字框位置" if b.kind == "text" else "圖片位置",
+                         "蓋在另一個元素上面（交集超過自身面積的一定比例）：輸出成錨在被蓋住元素第一段的浮動物件，不文繞圖", False)
+
+    def _image(self, it: _Item, tl: float, tr: float, gap: float, brk: Optional[str]) -> list:
+        w, h = it.x1 - it.x0, it.y1 - it.y0
+        avail = tr - tl
+        if w > avail + 0.5:
+            self.ctx.degrade(it.id, "圖片大小", f"超過可用寬度，依原比例縮小為 {avail / w:.0%}", True)
+            w, h = avail, h * avail / w
+        inline = self.docx_doc.part.new_pic_inline(image_descriptor(self.store, it.obj.image), Emu(emu(w)), Emu(emu(h)))
+        p = el("w:p")
+        ppr = sub(p, "w:pPr")
+        if brk == "page":
+            sub(ppr, "w:pageBreakBefore")
+        sub(ppr, "w:spacing", {"w:before": twip(gap * self.f) if gap > self.params["min_gap_pt"] else 0, "w:after": 0, "w:line": 240, "w:lineRule": "auto"})
+        off = it.x0 - tl
+        if abs((it.x0 + it.x1) / 2 - (tl + tr) / 2) < self.params["center_tolerance"] * avail and off > 1.0:
+            sub(ppr, "w:jc", {"w:val": "center"})
+        elif off > 1.0 and off + w <= avail + 0.5:
+            sub(ppr, "w:ind", {"w:left": twip(off)})
+        # 圖片那一行的字級設成 1 pt：行高才不會比圖片多出一截字型的下緣（並排的格子裡多出來的高度會把列撐到下一頁）
+        mrpr = sub(ppr, "w:rPr")
+        sub(mrpr, "w:sz", {"w:val": 2})
+        sub(mrpr, "w:szCs", {"w:val": 2})
+        r = sub(p, "w:r")
+        rpr = sub(r, "w:rPr")
+        sub(rpr, "w:sz", {"w:val": 2})
+        sub(rpr, "w:szCs", {"w:val": 2})
+        sub(r, "w:drawing").append(inline)
+        out = [p]
+        for b, how, _ in self.attached.get(it.id, []):
+            self._float(b, it, p, tl)
+        return out
+
+    def _table(self, it: _Item, tl: float, tr: float, gap: float) -> list:
+        out = []
+        if gap > self.params["min_gap_pt"]:
+            out.append(empty_paragraph(max(1.0, gap * self.f)))
+        indent = it.x0 - tl
+        t = build_table(it.obj, self.ctx, self.styles, exact_rows=False, diff=True, width_limit_pt=tr - tl,
+                        indent_pt=indent if (1.0 < indent and indent + sum(it.obj.col_widths_pt) * self.s <= tr - tl + 0.5) else 0.0)
+        self.expect.extend(table_texts(it.obj))
+        out.append(t)
+        return out
+
+    # --- 一串節點 ---
+
+    def emit(self, nodes: list, tl: float, tr: float, start: float, in_cell: bool, brk: Optional[str] = None,
+             limit_bottom: Optional[float] = None) -> list:
+        """一串節點 → 段落與表格。tl、tr 是文字區的左右（輸出座標）；start 是上一個內容的下緣。
+        limit_bottom：頁面文字區的下緣（只在最外層給，限制底色列的最小高度，不讓它擠出這一頁）。"""
+        out: list = []
+        y = start
+        shrink = 0.0  # 到目前為止空隙被壓縮掉的高度（估計輸出位置用）
+        for kind, node in nodes:
+            if kind == "row":
+                gap = node.top - y
+                if out and out[-1].tag == q("w:tbl") or gap > self.params["min_gap_pt"]:
+                    out.append(empty_paragraph(max(1.0, gap * self.f)))  # 兩個表格之間一定要有段落，不然會被併成一個
+                    shrink += max(0.0, gap) * (1 - self.f)
+                if brk == "page":
+                    if out and out[0].tag == q("w:p"):
+                        ppr = out[0].find(q("w:pPr"))
+                        ppr.insert(0, el("w:pageBreakBefore"))
+                    else:
+                        out.insert(0, empty_paragraph(1.0, page_break_before=True))
+                    brk = None
+                row_top_out = node.top - shrink
+                out.append(self._row(node, tl, tr, limit_bottom - row_top_out if limit_bottom is not None else None))
+                c, g = _measure([("row", node)], node.top)
+                shrink += (1 - self.f) * g
+                y = node.bottom
+                continue
+            for it in ([node] if kind == "item" else node):
+                gap = it.y0 - y
+                if it.kind == "text":
+                    els = self._text(it, tl, tr, gap, in_cell, brk)
+                elif it.kind == "image":
+                    els = self._image(it, tl, tr, gap, brk)
+                else:
+                    els = self._table(it, tl, tr, gap)
+                    if out and out[-1].tag == q("w:tbl") and els[0].tag == q("w:tbl"):
+                        out.append(empty_paragraph(1.0))
+                    if brk == "page":
+                        els.insert(0, empty_paragraph(1.0, page_break_before=True))
+                brk = None
+                shrink += (1 - self.f) * (max(0.0, gap) + _inner_gaps(it))
+                out.extend(els)
+                y = max(y, it.y1, self.below.get(it.id, 0.0))
+        return out
+
+    def _row(self, row: _Row, tl: float, tr: float, max_h: Optional[float]) -> etree._Element:
+        """一列並排的版面 → 一列的表格：每欄一格，沒有框線，欄寬照原圖。"""
+        _plan_row(row, (tl, tr), self.shapes, self.W)
+        widths = [b - a for a, b in zip(row.bounds, row.bounds[1:])]
+        t = el("w:tbl")
+        tpr = sub(t, "w:tblPr")
+        sub(tpr, "w:tblW", {"w:w": sum(twip(w) for w in widths), "w:type": "dxa"})
+        sub(tpr, "w:jc", {"w:val": "left"})
+        ind = row.bounds[0] - tl
+        if abs(ind) > 0.05:
+            sub(tpr, "w:tblInd", {"w:w": twip(ind), "w:type": "dxa"})
+        bd = sub(tpr, "w:tblBorders")
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            sub(bd, f"w:{side}", {"w:val": "nil"})
+        sub(tpr, "w:tblLayout", {"w:type": "fixed"})
+        mar = sub(tpr, "w:tblCellMar")
+        for side in ("top", "left", "bottom", "right"):
+            sub(mar, f"w:{side}", {"w:w": 0, "w:type": "dxa"})
+        sub(tpr, "w:tblLook", {"w:val": "0000", "w:firstRow": 0, "w:lastRow": 0, "w:firstColumn": 0, "w:lastColumn": 0, "w:noHBand": 1, "w:noVBand": 1})
+        grid = sub(t, "w:tblGrid")
+        for w in widths:
+            sub(grid, "w:gridCol", {"w:w": twip(w)})
+        tr_el = sub(t, "w:tr")
+        trpr = sub(tr_el, "w:trPr")
+        height = row.bottom - row.top
+        if any(row.fills):
+            if max_h is not None:
+                # 留一段安全距離：目標軟體排出來的列上緣比估計的低一點時，最小高度仍放得進這一頁；放不進的話
+                # LibreOffice 會把整列移到下一頁（實測），這一頁就只剩頁首
+                height = min(height, max_h - max(self.params["bottom_slack_pt"], self.params["bottom_slack_ratio"] * self.page.height_pt * self.s))
+            if height > 1.0:
+                sub(trpr, "w:trHeight", {"w:val": twip(height), "w:hRule": "atLeast"})
+        for k, (kids, cell_items) in enumerate(zip(row.children, row.cols)):
+            x0, x1 = row.bounds[k], row.bounds[k + 1]
+            cx0, cx1 = min(i.x0 for i in cell_items), max(i.x1 for i in cell_items)
+            for rx0, rx1, ry, _, _, _ in self.rules:  # 格子裡的標題線比字寬時，文字區放寬到線的範圍（改成框線後才一樣長）
+                if rx0 >= x0 - 1 and rx1 <= x1 + 1 and row.top - 1 <= ry <= row.bottom + 1:
+                    cx0, cx1 = min(cx0, rx0), max(cx1, rx1)
+            ml, mr = max(0.0, cx0 - x0), max(0.0, x1 - cx1)
+            single = all(i.kind == "text" and not i.obj.wrap for i in cell_items)
+            aligns = {b.item.align for i in cell_items if i.kind == "text" for b in i.blocks}
+            if single and k > 0 and k == len(row.cols) - 1 and mr <= 3.0 and aligns <= {Align.LEFT, Align.JUSTIFY}:
+                aligns = {Align.RIGHT}  # 最右邊一格、貼齊右緣的單行字（例如日期）：當成靠右
+            if single and aligns <= {Align.LEFT, Align.JUSTIFY}:
+                mr = min(mr, 1.0)  # 只有單行靠左的字：右邊的空隙也給字用（換成較寬的字型時不折行）
+            elif single and aligns == {Align.RIGHT}:
+                ml = min(ml, 1.0)
+            elif aligns == {Align.RIGHT} and all(i.kind == "text" for i in cell_items):
+                ml = max(0.0, ml - self.params["nowrap_slack_ratio"] * (cx1 - cx0))
+            # 格子裡第一個元素與列上緣的距離寫成第一段的段前距離，不寫儲存格上邊距：
+            # 實測 LibreOffice 24.2 把一列裡最大的儲存格上邊距套到同一列的每一格，其他格的字因此往下掉
+            mt = 0.0
+            tc = sub(tr_el, "w:tc")
+            pr = sub(tc, "w:tcPr")
+            sub(pr, "w:tcW", {"w:w": twip(x1 - x0), "w:type": "dxa"})
+            borders = sub(pr, "w:tcBorders")
+            for side in ("top", "left", "bottom", "right"):
+                sub(borders, f"w:{side}", {"w:val": "nil"})
+            if row.fills[k] is not None:
+                sub(pr, "w:shd", {"w:val": "clear", "w:color": "auto", "w:fill": row.fills[k].hex})
+                self.used_fills.add(row.fill_ids[k])
+                self.ctx.degrade(row.fill_ids[k], "形狀 rect", "並排區塊背後的填色矩形：改成表格儲存格的底色", False)
+            m = sub(pr, "w:tcMar")
+            for side, v in (("top", mt), ("left", ml), ("bottom", 0.0), ("right", mr)):
+                sub(m, f"w:{side}", {"w:w": twip(v), "w:type": "dxa"})
+            sub(pr, "w:vAlign", {"w:val": "top"})
+            els = self.emit(kids, x0 + ml, x1 - mr, row.top, in_cell=True)
+            if not els or els[-1].tag != q("w:p"):
+                els.append(empty_paragraph(1.0))  # 儲存格最後一定要是段落
+            for e in els:
+                tc.append(e)
+        return t
+
+
+def _page_items(page: StyledPage, blocks: list[Block], s: float) -> list[_Item]:
+    items: dict[str, _Item] = {}
+    order = {i: k for k, i in enumerate(page.reading_order)}
+    for b in blocks:
+        it = items.get(b.elem_id)
+        if it is None:
+            bx = b.box
+            obj = next((t for t in page.text_boxes if t.id == b.elem_id), None) if b.kind == "para" else b.item
+            it = _Item("text" if b.kind == "para" else b.kind, b.elem_id, bx.x * s, bx.y * s, (bx.x + bx.w) * s, (bx.y + bx.h) * s, obj, [],
+                       order.get(b.elem_id, 10**6 + len(items)))
+            items[b.elem_id] = it
+        if b.kind == "para":
+            it.blocks.append(b)
+    return list(items.values())
+
+
+def _write_layout_page(writer: "BodyWriter", docx_doc, page: StyledPage, blocks: list[Block], ctx: Ctx, styles: dict, store: Store,
+                       params: dict, expect: list, s: float, left: float, right_x: float, top: float, H: float, bottom: float) -> None:
+    """不是報紙式分欄的頁：用版面樹寫成段落與看不見框線的表格。"""
+    items = _page_items(page, blocks, s)
+    if not items:
+        return
+    attached: dict = {}
+    shapes = _fill_shapes(page, s)
+    nodes = _layout(items, 0, params, attached, shapes)
+    W = page.width_pt * s
+    for kind, node in nodes:  # 先排好每一列，量高度時才知道底色列的上下緣
+        if kind == "row":
+            _plan_row(node, (left, right_x), shapes, W)
+    f = 1.0
+    if params["fit_page_gaps"]:
+        c, g = _measure(nodes, top)
+        avail = H - top - bottom - max(params["bottom_slack_pt"], params["bottom_slack_ratio"] * H)
+        if c + g > avail and g > 0:
+            f = max(params["min_gap_scale"], min(1.0, (avail - c) / g))
+            ctx.degrade(f"page-{page.page_index + 1}", "垂直空隙",
+                        f"原圖的內容貼到紙邊，放不進 Word 頁面的文字區：元素之間與段落前後的空隙等比壓縮為 {f:.0%}", True)
+    lay = _FlowLayout(docx_doc, ctx, styles, store, params, expect, s, page, attached, shapes, W, f)
+    brk = writer.pop_break() if writer.pending == "page" else None
+    els = lay.emit(nodes, left, right_x, top, in_cell=False, brk=brk, limit_bottom=H - bottom - 2.0)
+    for sh in page.shapes:
+        if sh.id not in lay.used_fills:
+            ctx.degrade(sh.id, f"形狀 {sh.geometry}", "可重排模式不輸出形狀", True)
+    for e in els:
+        writer.add(e)
+
+
 # ---------- 主程式 ----------
 
 
 def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFile:
     params = params_from(cfg, DEFAULT_PARAMS, "docx_flow")
-    ctx = make_ctx(doc)
+    ctx = make_ctx(doc, cfg)
     ctx._next_id = 10001  # 避開 python-docx 給行內圖片的編號
     first = doc.pages[0]
     s = min(1.0, MAX_PAGE_PT / max(first.width_pt, first.height_pt))
@@ -571,6 +1163,13 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     right = clamp(W - max(xs1, default=W - 72.0), W)
     top = clamp(min(ys0, default=72.0), H)
     bottom = clamp(H - max(ys1, default=H - 72.0) - max(params["bottom_slack_pt"], params["bottom_slack_ratio"] * H), H)
+    if params["side_by_side_tables"] and params["page_break"] == "source_page" and params["bottom_room"]:
+        # 每個來源頁本來就從新頁開始：下邊界不必貼著內容，留到頁尾（或最小邊界）為止。
+        # 並排的區塊是表格，整列的高度都在主文字流裡；目標軟體的行高略大時，多出來的高度才有地方放，不會把最後一列擠到下一頁
+        ftops = [tb.box.y * s for p in same for tb in p.text_boxes if tb.paragraphs and all(sp.role in (Role.FOOTER, Role.PAGE_NUMBER) for sp in tb.paragraphs)
+                 and tb.box.y + tb.box.h / 2 > p.height_pt / 2]
+        bottom = max(params["min_margin_pt"], (H - min(ftops) + 2.0) if ftops else 0.0)
+        bottom = min(bottom, params["max_margin_ratio"] * H)
     right_x = W - right
     expect: list[str] = []
     hdr, ftr = _write_header_footer(docx_doc, doc, ctx, styles, s, left, right_x, params, expect)
@@ -618,6 +1217,15 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
         if page.page_index > 0 and params["page_break"] == "source_page":
             writer.pending = "page"
         new_page_pending = page.page_index > 0 and params["page_break"] == "source_page"
+        if not col_info and params["side_by_side_tables"]:
+            if writer.cols is not None:
+                writer.new_section(None, new_page=new_page_pending and writer.pending == "page")
+            _write_layout_page(writer, docx_doc, page, blocks, ctx, styles, store, params, expect, s, left, right_x, top, H, bottom)
+            if not blocks and page.page_index > 0 and params["page_break"] == "source_page":
+                writer.add(empty_paragraph(1.0, page_break_before=writer.pop_break() == "page"))
+            continue
+        for sh in page.shapes:
+            ctx.degrade(sh.id, f"形狀 {sh.geometry}", "可重排模式不輸出形狀", True)
         prev_bottom: dict = {}
         anchors: list = []  # 本頁已輸出的文字框（框, 第一段）：旁置圖片的錨點候選
         cur_col: Optional[int] = None
@@ -735,6 +1343,7 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     if writer.count == 0:
         writer.add(empty_paragraph(1.0))
     writer.finish()
+    finish_package(docx_doc, ctx)
     data = save_bytes(docx_doc)
     ok, notes = selfcheck(data, writer.sections, expect, ctx.fonts)
     blob = store.put_blob(data, MIME, "docx")

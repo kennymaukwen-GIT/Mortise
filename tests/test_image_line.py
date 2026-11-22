@@ -82,3 +82,23 @@ def test_spaces_between_styled_runs_are_kept():
     line = _text_line(0, 0, ol, attrs, 1000.0)
     assert "".join(r.text for r in line.runs) == text
     assert [r.text for r in line.runs] == ["12 – 14 ", "JULY 2027"]
+
+
+def test_screenshot_shapes_over_photo_are_split(dark):
+    """slide_dark 的照片（make_fixtures._photo）上畫了平塗的黃橢圓與深藍矩形：要拆成疊在圖片上的形狀，
+    圖片被蓋住的地方補掉，補出來的像素照實記成生成。"""
+    pipe, _ = dark
+    el = pipe.store.load("s3/page-001", ElementList)
+    photo = next(i for i in el.images if i.kind.value == "photo")
+    px0, py0, px1, py1 = photo.quad.bbox
+
+    def inside(s):
+        x0, y0, x1, y1 = s.quad.bbox
+        return px0 - 1e-4 <= x0 and py0 - 1e-4 <= y0 and x1 <= px1 + 1e-4 and y1 <= py1 + 1e-4
+
+    over = [s for s in el.shapes if inside(s)]
+    assert sorted(s.geometry.value for s in over) == ["ellipse", "rect"]
+    assert all(s.z > photo.z for s in over)
+    want = {"ellipse": (235, 200, 70), "rect": (40, 60, 90)}
+    assert all(max(abs(a - b) for a, b in zip((s.fill.r, s.fill.g, s.fill.b), want[s.geometry.value])) <= 3 for s in over)
+    assert any(photo.id in n and "生成" in n for n in el.notes)

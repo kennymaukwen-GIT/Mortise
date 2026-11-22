@@ -80,14 +80,22 @@ def content_region(image: Image.Image, page) -> Image.Image:
     return image.transform(size, Image.EXTENT, (pl.x * k, pl.y * k, (pl.x + pl.w) * k, (pl.y + pl.h) * k), Image.BILINEAR)
 
 
+MAX_RENDER_PIXELS = 40_000_000  # 比對用渲染的整頁像素上限（與②工作影像的上限 max_working_pixels 預設值相同）
+
+
 def verify_dpi(dpi: float, page, spec: PageSpec | None) -> float:
     """比對用的渲染解析度。有 placement 時依縮放比例調整，讓原始內容那一塊的像素數與不縮放時相同
-    （縮小到小紙張時不會因為像素太少而失真，放大到大海報時也不必畫出巨大的影像）；調整幅度限制在 4 倍以內。"""
+    （縮小到小紙張時不會因為像素太少而失真，放大到大海報時也不必畫出巨大的影像）；調整幅度限制在 4 倍以內。
+    不論有沒有 placement，整頁的像素數都不超過 MAX_RENDER_PIXELS：大型看板、海報的實際尺寸（或多打一個 0）
+    不會讓渲染要求幾 GB 的記憶體而讓整個服務崩潰；工作影像本身也有同樣的上限，畫得更大並不會比得更準。"""
     pl = getattr(page, "placement", None)
-    if pl is None or spec is None or pl.w <= 0:
-        return dpi
-    s = pl.w / max(spec.page_width_pt.value, 1e-6)
-    return dpi * min(4.0, max(0.25, 1.0 / s))
+    if pl is not None and spec is not None and pl.w > 0:
+        s = pl.w / max(spec.page_width_pt.value, 1e-6)
+        dpi = dpi * min(4.0, max(0.25, 1.0 / s))
+    w, h = float(getattr(page, "width_pt", 0) or 0), float(getattr(page, "height_pt", 0) or 0)
+    if w > 0 and h > 0 and (w * dpi / 72.0) * (h * dpi / 72.0) > MAX_RENDER_PIXELS:
+        dpi = 72.0 * (MAX_RENDER_PIXELS / (w * h)) ** 0.5
+    return dpi
 
 
 def source_frame(page) -> tuple[float, float, float]:

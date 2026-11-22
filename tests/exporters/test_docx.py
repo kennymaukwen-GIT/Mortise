@@ -28,7 +28,7 @@ from mortise.artifacts import (
 )
 from mortise.artifacts.common import Role, exact
 from mortise.config import Config
-from mortise.exporters import docx_fixed, docx_flow
+from mortise.exporters import docx_common, docx_fixed, docx_flow
 from mortise.exporters.docx_common import emu, extract_texts, norm_text, q
 from mortise.pipeline import Pipeline
 from mortise.pipeline.store import Store
@@ -41,6 +41,7 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
 W = "test@1"
 CJK = "WenQuanYi Zen Hei"
 LAT = "Liberation Sans"
+WLAT, WCJK = "Arial", "Microsoft JhengHei"  # 寫進檔案的名稱：多數裝置都有的字型（見 docx_common「寫入的字型名稱」）
 needs_lo = pytest.mark.skipif(not libreoffice.available(), reason="沒有 LibreOffice")
 
 
@@ -250,7 +251,7 @@ def test_fixed_reopens_with_sections_per_page(synth):
     for sec, page in zip(d.sections, synth["doc"].pages):
         assert abs(sec.page_width.pt - page.width_pt) < 0.05 and abs(sec.page_height.pt - page.height_pt) < 0.05
         assert sec.left_margin == sec.right_margin == sec.top_margin == sec.bottom_margin == 0
-    assert set(out.fonts_used) == {LAT, CJK}
+    assert set(out.fonts_used) == {WLAT, WCJK}
 
 
 def test_fixed_text_fonts_size_color_position(synth):
@@ -269,8 +270,8 @@ def test_fixed_text_fonts_size_color_position(synth):
     runs = runs_of(a)
     assert [t for _, t in runs] == ["年度報告 ", "Annual Report"]
     (r0, _), (r1, _) = runs
-    assert rfonts_of(r0) == {"ascii": LAT, "hAnsi": LAT, "eastAsia": CJK, "cs": LAT}  # 中文段：東亞欄位寫中文字型
-    assert rfonts_of(r1) == {"ascii": LAT, "hAnsi": LAT, "eastAsia": CJK, "cs": LAT}  # 拉丁段的東亞欄位寫鄰近的中文字型
+    assert rfonts_of(r0) == {"ascii": WLAT, "hAnsi": WLAT, "eastAsia": WCJK, "cs": WLAT}  # 中文段：東亞欄位寫中文字型
+    assert rfonts_of(r1) == {"ascii": WLAT, "hAnsi": WLAT, "eastAsia": WCJK, "cs": WLAT}  # 拉丁段的東亞欄位寫鄰近的中文字型
     for r in (r0, r1):
         rpr = r.find(q("w:rPr"))
         assert rpr.find(q("w:sz")).get(q("w:val")) == "48" and rpr.find(q("w:color")).get(q("w:val")) == "1F3A5F"
@@ -417,14 +418,14 @@ def test_flow_styles_and_direct_formatting(synth):
     h1 = d.styles["Heading 1"].element
     assert h1.find(f"{q('w:pPr')}/{q('w:outlineLvl')}").get(q("w:val")) == "0"
     f = h1.find(f"{q('w:rPr')}/{q('w:rFonts')}")
-    assert (f.get(q("w:ascii")), f.get(q("w:eastAsia"))) == (LAT, CJK)
+    assert (f.get(q("w:ascii")), f.get(q("w:eastAsia"))) == (WLAT, WCJK)
     assert h1.find(f"{q('w:rPr')}/{q('w:sz')}").get(q("w:val")) == "48"
     assert body.style.name == "內文"
     # 與樣式相同的屬性不寫直接格式；中文段只寫字型
     assert body.runs[0]._r.find(q("w:rPr")) is None
     assert body.runs[1]._r.find(q("w:rPr")) is None  # 中文段的字型欄位也與樣式相同（樣式的 eastAsia 是中文字型）
     s1 = d.styles["內文"].element.find(f"{q('w:rPr')}/{q('w:rFonts')}")
-    assert (s1.get(q("w:ascii")), s1.get(q("w:hAnsi")), s1.get(q("w:eastAsia"))) == (LAT, LAT, CJK)
+    assert (s1.get(q("w:ascii")), s1.get(q("w:hAnsi")), s1.get(q("w:eastAsia"))) == (WLAT, WLAT, WCJK)
     sec = d.sections[0]
     assert (round(sec.page_width.pt), round(sec.page_height.pt)) == (612, 792)  # 取第一頁
     assert round(sec.left_margin.pt) == 72 and round(sec.top_margin.pt) == 72
@@ -495,8 +496,9 @@ def test_real_fixtures_selfcheck(real, name):
     for mode in ("fixed", "flow"):
         out = r[mode]
         assert out.selfcheck_ok, (mode, out.selfcheck_notes)
-        inferred = {run.font.family.value for p in r["doc"].pages for t in p.text_boxes for sp in t.paragraphs for run in sp.runs}
-        assert inferred <= set(out.fonts_used)
+        written = {docx_common.make_ctx(r["doc"]).font_name(run.font, record=False)
+                   for p in r["doc"].pages for t in p.text_boxes for sp in t.paragraphs for run in sp.runs}
+        assert written <= set(out.fonts_used)
         data = r["store"].read_blob(out.file)
         allt = norm_text("".join(extract_texts(data).values()))
         for p in r["doc"].pages:

@@ -14,6 +14,8 @@
      直線、圓弧、三次貝茲的一般擬合。
   4. 驗證：用 render 畫回來與原圖比色差（ΔE）與覆蓋範圍（IoU）；成塊的誤差表示漏了東西，就放細門檻重描，
      直到達標或到上限。照片之類不適合的內容回報 accepted=False 並說明原因。
+  0. 早期判斷（在 1 之前）：取樣幾十個方塊，平滑像素太少、或平坦處平滑後仍有成片的明暗起伏，就直接回報不適合
+     （大張照片原本要好幾秒到一分鐘才會被判定不適合；見 vector_segment.photo_precheck）。
      原圖與重畫兩邊都有邊緣的地方不算成塊誤差（模糊、縮放過的原圖邊緣比向量寬）；有遮罩時，路徑裁在遮罩內。
 整個過程不使用大型 AI，也不用隨機；同樣的輸入一定得到同樣的輸出。所有數值都是量出來的。
 """
@@ -32,7 +34,7 @@ import numpy as np
 from . import vector_fit as vf
 from . import vector_raster as vr
 from .types import RGB, TracedGradient, TracedPath, TracedPrimitive, VectorResult
-from .vector_segment import RegionModel, Segmentation, segment
+from .vector_segment import RegionModel, Segmentation, photo_precheck, segment
 
 # 預設參數。設定檔 [recognize] 裡以 vector_ 開頭的值會蓋過這裡（去掉前綴後同名）。
 DEFAULTS: dict = {
@@ -99,6 +101,14 @@ DEFAULTS: dict = {
     "max_refine_rounds": 2,  # 誤差成塊時最多放細重描幾輪
     "max_paths": 1500,  # 路徑數上限，超過視為不適合向量化
     "max_megapixels": 16.0,  # 影像大於此值先縮小再描（座標會換算回原尺寸）
+    # ---- 早期判斷：明顯像照片或材質的輸入，取樣幾十個方塊就回傳不適合（見 vector_segment.photo_precheck）
+    "photo_check": True,
+    "photo_check_tile_px": 40,  # 取樣方塊的邊長（像素）
+    "photo_check_tiles": 64,  # 最多取樣幾塊
+    "photo_check_min_tiles": 8,  # 平坦方塊至少要有幾塊才下判斷（小圖、全是線條的圖表不判斷，交給完整流程）
+    "photo_check_min_share": 0.3,  # 平坦方塊至少要佔取樣的這個比例
+    "photo_check_smooth": 0.15,  # 平滑像素不到此比例 → 像照片（完整流程的門檻是 min_core_fraction，這裡只擋明顯的）
+    "photo_check_texture_de": 3.0,  # 平坦方塊平滑後對平面的殘差（ΔE），各塊中位數超過此值 → 像照片（量到：插畫含放大三倍的雜訊圖 ≤ 2.7、照片 ≥ 3.5）
 }
 
 # 每一輪「放細」時覆蓋的參數（偵測更弱的邊、更小的區域、更低的對比）
@@ -205,6 +215,11 @@ def vectorize(image: np.ndarray, mask: Optional[np.ndarray] = None, params: Opti
         wmask = None if msk is None else cv2.resize(msk.astype(np.uint8), (w2, h2), interpolation=cv2.INTER_NEAREST).astype(bool)
     else:
         work, wmask = img, msk
+    if P["photo_check"]:
+        why, pre = photo_precheck(work, wmask, P)
+        if why is not None:
+            pre["seconds"] = round(time.perf_counter() - t_start, 4)
+            return _empty((W, H), why, pre)
     best: Optional[VectorResult] = None
     rounds = 0
     history = []

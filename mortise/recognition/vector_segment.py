@@ -56,6 +56,81 @@ class Segmentation:
     clip: Optional[np.ndarray] = None  # float32 (H, W)：有給遮罩時，每個區域的覆蓋率再乘上它（路徑不超出遮罩）
 
 
+def photo_precheck(image: np.ndarray, mask: Optional[np.ndarray], P: dict) -> tuple[Optional[str], dict]:
+    """便宜的早期判斷：明顯像照片或材質的輸入，不必走完整的分割（大張照片要好幾秒到一分鐘才會被判定不適合）。
+
+    只看取樣的方塊（最多 photo_check_tiles 塊、邊長 photo_check_tile_px），用的是與 segment 相同的量法與門檻：
+      1. 雜訊：方塊的 Laplacian 中位數；雜訊大時做與 segment 相同的保邊平滑。
+      2. 平滑像素（二階差分、梯度都小）佔取樣的比例太低（不到 photo_check_smooth）→ 像照片或材質。
+         完整流程的門檻是 min_core_fraction；這裡取得更嚴，只擋明顯的。
+      3. 沒有強邊緣、大多平滑的方塊（插畫裡的純色或漸層區）：在 CIELAB 裡以平面（線性漸層）擬合，殘差（ΔE）的中位數。
+         插畫的平坦區在平滑後幾乎沒有殘差（漸層也是平面）；照片的平坦處還留著成片的明暗起伏，起伏與分色帶（band_de）
+         同一個量級時，完整流程會把它切成上千個碎塊。這種方塊夠多（至少 photo_check_min_tiles 塊、佔取樣的
+         photo_check_min_share），而且各塊殘差的中位數超過 photo_check_texture_de → 像照片或材質。
+    回傳（不適合的原因或 None、量到的數值）。不會改動影像。"""
+    import math
+
+    H, W = image.shape[:2]
+    T = int(P.get("photo_check_tile_px", 40))
+    N = int(P.get("photo_check_tiles", 64))
+    stats: dict = {}
+    if H < T or W < T:
+        return None, stats
+    pad = 6
+    I = np.ascontiguousarray(image[..., :3]).astype(np.float32)
+    ny = max(1, min(H // T, int(round(math.sqrt(N * H / W)))))
+    nx = max(1, min(W // T, int(round(math.sqrt(N * W / H)))))
+    tiles = []
+    for y in np.linspace(0, H - T, ny).astype(int):
+        for x in np.linspace(0, W - T, nx).astype(int):
+            if mask is not None and float(mask[y : y + T, x : x + T].mean()) < 0.9:
+                continue
+            y0, x0, y1, x1 = max(0, y - pad), max(0, x - pad), min(H, y + T + pad), min(W, x + T + pad)
+            tiles.append((I[y0:y1, x0:x1], (int(y - y0), int(x - x0))))
+    stats["photo_check_tiles"] = len(tiles)
+    if len(tiles) < int(P.get("photo_check_min_tiles", 8)):
+        return None, stats
+    first = [_lap_grad(t) for t, _ in tiles]
+    s_lap = float(np.median(np.concatenate([l[oy : oy + T, ox : ox + T].ravel() for (l, _), (_, (oy, ox)) in zip(first, tiles)])))
+    sigma = s_lap / 4.5
+    denoise = s_lap > float(P["denoise_lap"])
+    sc = float(np.clip(6.0 * sigma, 10.0, 60.0))
+    proc = []
+    for (t, (oy, ox)), lg in zip(tiles, first):
+        F, (l, g) = t, lg
+        if denoise:
+            F = cv2.bilateralFilter(t, 5, sc, 1.6)
+            F = cv2.bilateralFilter(F, 5, sc, 1.6)
+            l, g = _lap_grad(F)
+        sl = (slice(oy, oy + T), slice(ox, ox + T))
+        proc.append((F[sl], l[sl], g[sl]))
+    s2 = float(np.median(np.concatenate([l.ravel() for _, l, _ in proc]))) if denoise else s_lap
+    t_lap = max(float(P["smooth_lap"]), float(P["smooth_lap_k"]) * s2)
+    t_grad = float(P["smooth_grad"])
+    smooth = [(l <= t_lap) & (g <= t_grad) for _, l, g in proc]
+    smooth_frac = float(np.mean([s.mean() for s in smooth]))
+    stats.update({"photo_check_sigma": round(sigma, 3), "photo_check_smooth": round(smooth_frac, 4)})
+    if smooth_frac < float(P.get("photo_check_smooth", 0.15)):
+        return f"快速檢查：取樣的 {len(tiles)} 個方塊裡，平滑的像素只佔 {smooth_frac:.0%}，像照片或材質，不適合向量化。", stats
+    yy, xx = np.mgrid[0:T, 0:T]
+    A = np.stack([np.ones(T * T), xx.ravel(), yy.ravel()], axis=1).astype(np.float64)
+    ratios = []
+    for (F, l, g), sm in zip(proc, smooth):
+        if F.shape[:2] != (T, T) or float(g.max()) > 2.0 * t_grad or float(sm.mean()) < 0.5:
+            continue  # 有強邊緣的方塊（插畫的輪廓、文字）不拿來判斷
+        c = cv2.cvtColor(np.ascontiguousarray(F) / 255.0, cv2.COLOR_RGB2Lab).reshape(-1, 3).astype(np.float64)
+        coef, *_ = np.linalg.lstsq(A, c, rcond=None)
+        ratios.append(float(np.median(np.linalg.norm(c - A @ coef, axis=1))))
+    n_flat = len(ratios)
+    score = float(np.median(ratios)) if ratios else 0.0
+    stats.update({"photo_check_flat_tiles": n_flat, "photo_check_texture_de": round(score, 3)})
+    if n_flat >= int(P.get("photo_check_min_tiles", 8)) and n_flat >= float(P.get("photo_check_min_share", 0.3)) * len(tiles) \
+            and score >= float(P.get("photo_check_texture_de", 3.0)):
+        return (f"快速檢查：取樣的 {n_flat} 個平坦方塊在平滑後仍有成片的明暗起伏（中位數 ΔE {score:.1f}），"
+                "像照片或材質，不適合向量化。"), stats
+    return None, stats
+
+
 def _lap_grad(F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     lap = np.abs(cv2.Laplacian(F, cv2.CV_32F, ksize=1, borderType=cv2.BORDER_REPLICATE)).max(axis=2)
     k = np.array([[-0.5, 0.0, 0.5]], dtype=np.float32)
@@ -368,11 +443,17 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
             for j in range(1, nb):
                 if sb[j, cv2.CC_STAT_AREA] < min_core:
                     continue
-                m = cb == j
+                # 只在這一塊的外接框裡比對（照片會切出上千塊，每塊都掃整個核心會非常慢）；結果與掃整個核心相同
+                bx0, by0, bw, bh = (int(sb[j, i]) for i in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+                m = cb[by0 : by0 + bh, bx0 : bx0 + bw] == j
                 rid = len(regions)
-                cj = I[y0 : y0 + h, x0 : x0 + w][m]
+                cj = I[y0 + by0 : y0 + by0 + bh, x0 + bx0 : x0 + bx0 + bw][m]
                 regions.append(RegionModel("flat", cj.mean(axis=0).astype(np.float64), banded=True, residual=float(np.percentile(np.abs(cj - cj.mean(axis=0)).max(axis=1), 95))))
-                core[y0 : y0 + h, x0 : x0 + w][m] = rid
+                core[y0 + by0 : y0 + by0 + bh, x0 + bx0 : x0 + bx0 + bw][m] = rid
+                if len(regions) > max_regions:
+                    break  # 已經超過上限：結果一定是「色塊太多」，不必再切
+            if len(regions) > max_regions:
+                break
         if len(regions) > max_regions:
             return _rejected(H, W, sigma, stats, f"色塊太多（超過 {max_regions} 個），像照片或有複雜明暗，不適合向量化。")
     stats["banded_cores"] = n_banded

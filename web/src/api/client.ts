@@ -95,14 +95,23 @@ export function buildJobForm(input: CreateJobInput): FormData {
   return fd;
 }
 
-/** Upload a file and create a job. Uses XHR so upload progress can be reported. */
+/**
+ * Upload a file and create a job. Uses XHR so upload progress can be reported.
+ * Aborting stops the upload; once the whole file has been sent the request is NOT aborted any more
+ * (the server may already have created the job): it resolves normally and the caller, seeing its signal
+ * aborted, deletes the job it no longer wants.
+ */
 export function createJob(input: CreateJobInput, opts: { onUpload?: (fraction: number) => void; signal?: AbortSignal } = {}): Promise<JobStatus> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
+    let sent = false;
     xhr.open("POST", apiUrl("/api/jobs"));
     xhr.responseType = "text";
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && opts.onUpload) opts.onUpload(e.loaded / Math.max(1, e.total));
+    };
+    xhr.upload.onload = () => {
+      sent = true;
     };
     xhr.onload = () => {
       let body: unknown = null;
@@ -117,8 +126,8 @@ export function createJob(input: CreateJobInput, opts: { onUpload?: (fraction: n
     xhr.onerror = () => reject(new ApiError(0, "network"));
     xhr.onabort = () => reject(new DOMException("aborted", "AbortError"));
     if (opts.signal) {
-      if (opts.signal.aborted) return xhr.abort();
-      opts.signal.addEventListener("abort", () => xhr.abort(), { once: true });
+      if (opts.signal.aborted) return reject(new DOMException("aborted", "AbortError"));
+      opts.signal.addEventListener("abort", () => !sent && xhr.abort(), { once: true });
     }
     xhr.send(buildJobForm(input));
   });
@@ -172,6 +181,19 @@ export function downloadUrl(id: string, what: string): string {
   return apiUrl(`/api/jobs/${encodeURIComponent(id)}/download/${encodeURIComponent(what)}`);
 }
 
+/** Retry a request a few times (with back-off) when the network drops or the server answers 5xx. */
+export async function withRetry<T>(fn: () => Promise<T>, stop: () => boolean = () => false, delays: number[] = [500, 1500, 4000]): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const transient = e instanceof ApiError && (e.status === 0 || e.status >= 500);
+      if (!transient || i >= delays.length || stop()) throw e;
+      await new Promise((r) => setTimeout(r, delays[i]));
+    }
+  }
+}
+
 export interface JobWatcher {
   close(): void;
 }
@@ -195,7 +217,7 @@ export function watchJob(
     finishing = true;
     es?.close();
     try {
-      const st = await getJob(id);
+      const st = await withRetry(() => getJob(id), () => closed);
       if (!closed) {
         closed = true;
         handlers.onFinal(st);

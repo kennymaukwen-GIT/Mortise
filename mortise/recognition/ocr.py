@@ -38,6 +38,11 @@
    投影最低點（谷底）；每個字的 x0、x1 再收緊到格子內的墨跡範圍。
 9. **空白**：以量到的墨跡間隙（換算成 em，em 由行高與字的種類估計）決定補入或刪除空白；
    全形標點本身帶留白，門檻另計。補入的空白依間隙超出門檻的幅度給信心值。
+9b. **字距拉開的行**（標題常見，模型會讀成「S K I L L S」）：合併同基線的行之後，每對相鄰字母的墨跡間隙
+   扣掉兩個字母本身的左右留白（字形表 _LSB_RSB）得到「額外的字距」；從低處反覆取中位數分出字母間距與詞間距。
+   字母間距一致、明顯大於正常字距，而且模型讀成空白的間距也落在字母間距這一群時，拿掉這些空白，詞與詞之間
+   保留一個空白（「A B O U T   M E」→「ABOUT ME」）。數字、符號、中日韓字不參與；「U S A」這類本來就有空白的
+   縮寫、句子中的單字母詞不併（判斷條件見 _letter_spacing，門檻是 ls_* 參數）。字距本身由 text_attributes 量。
 10. **濾誤判**：筆畫寬 ÷ 行高（距離轉換的脊線中位數）、墨跡填滿率、字數與行長比例三個
     線索合成「像文字的程度」；分數極低，或「不像文字且分數不夠高」才刪，其餘保留但降信心。
 11. **誤差範圍**：字界誤差由取樣間距、邊緣模糊寬度、是否相黏推出（OcrChar.x_error）；
@@ -60,6 +65,10 @@
   IoU 可能低於 0.5，評測時會被算成漏偵測。
 - 低解析度（墨跡行高低於約 8 像素）時，模型會在字間多讀空白，字界量測也不夠準去刪掉它們；
   這些行會標「低解析度」並降信心。
+- 字距拉開的行：每個字母間都讀成空白、字距又接近一般空白寬（0.19 em 以上）時，只有連續 5 個字母以上才併
+  （「T E A M」這種 4 個字母、字距很寬的標題會保留空白）；反過來，一行只有 5 個以上以真正空白隔開的單字母
+  （例如「A B C D E」）會被誤併。字距拉開的數字（「2 0 2 6」）不併。字形表取自無襯線字，襯線字與特殊字型
+  的留白不同，量到的字距約有 ±0.03 em 的偏差。
 
 可單獨升級的點
 --------------
@@ -187,6 +196,17 @@ DEFAULT_PARAMS: dict = {
     "drop_textlike_keep_score": 0.97,  # ……且平均字機率低於此值，才刪除整行
     "blob_chars": "•·●■▪◆-—–_|一.。、，,:;：；'\"`~～",  # 本身就是實心小塊的字：只有這些字的行不做形狀檢查
     "dup_iou": 0.5,  # 兩行四角的 IoU 超過此值視為重複，只留分數高的
+    # ---- 字距拉開的行（標題常見：「S K I L L S」→「SKILLS」）。間距都先扣掉兩個字母本身的左右留白（字形表），單位 em
+    "ls_enable": True,  # 是否辨認字距拉開的行並拿掉字母間多讀的空白
+    "ls_min_letters": 4,  # 至少要有幾個以字母間距相連的字母才判斷：字母太少時間距的統計不可靠，也避開「U S A」這種三個字母的縮寫
+    "ls_min_letter_frac": 0.8,  # 非空白字中拉丁（含希臘、西里爾）字母的比例下限；數字、符號多的行（電話、日期、程式碼）不處理
+    "ls_min_track_em": 0.06,  # 字母間距（扣掉左右留白）至少要大於此值才算「拉開」：正常排字含字距調整約 0 ± 0.03 em，再加上字界量測誤差約 0.03 em
+    "ls_max_track_em": 0.6,  # 字母間距超過此值就不當成字距，而是分開擺放的標籤（圖表座標軸的 A B C、表格欄名）；設計上最寬的字距約 0.5 em
+    "ls_word_jump_em": 0.15,  # 間距比字母間距大出此值以上就是詞與詞之間：詞間距 = 字母間距 + 空白寬（一般字型 0.22 到 0.32 em）+ 再一次字距，至少大 0.2 em；取一半多一點，留量測誤差
+    "ls_uniform_em": 0.08,  # 字母間距與其中位數的差在此之內才算「一致」：字形表與實際字型的留白差約 0.03 em、字界誤差約 0.04 em、字距調整（AV、LT）約 −0.08 em
+    "ls_uniform_frac": 0.75,  # 至少這個比例的字母間距要「一致」，才算字距拉開的行
+    "ls_space_like_em": 0.19,  # 每個字母間都被讀成空白（沒有同一詞內的字母可對照）時，字母間距要小於此值才拿掉空白：真正的空白寬至少約 0.22 em（Calibri、Arial Narrow），「U S A」這類本來就有空白的字會落在此值之上
+    "ls_long_run": 5,  # 但連續至少這麼多個字母的間距都一致時，即使接近空白寬也視為字距拉開（真正以空白隔開的單字母幾乎不會連續 5 個以上）
     # ---- 誤差與信心
     "low_res_px": 10.0,  # 墨跡行高低於此值（像素）時標低解析度並降信心
     "low_res_factor": 0.7,  # 低解析度時信心值乘上此係數
@@ -240,6 +260,32 @@ _ADV.update(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", [0.667, 0.667, 0.722, 0.722, 0.667
 _ADV.update({c: 0.556 for c in "0123456789$#?_"})
 _ADV.update({c: 0.278 for c in ".,:;!/\\|[]'`"})
 _ADV.update({"(": 0.333, ")": 0.333, "-": 0.333, "%": 0.889, "&": 0.667, "@": 1.015, '"': 0.355, "+": 0.584, "=": 0.584, "*": 0.389, "–": 0.556, "—": 1.0, "{": 0.334, "}": 0.334, "<": 0.584, ">": 0.584, "~": 0.584})
+
+
+# 字母墨跡左右的留白（em）：Liberation Sans 與 Inter 的一般、粗體四種字的平均（左, 右），只用來把量到的墨跡間隙
+# 換算成「額外的字距」；與實際字型差約 ±0.03 em
+_LSB_RSB = dict(zip(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    zip(
+        [0.02, 0.08, 0.05, 0.08, 0.08, 0.08, 0.05, 0.08, 0.08, 0.03, 0.08, 0.08, 0.08, 0.08, 0.05, 0.08, 0.05, 0.08, 0.04, 0.03, 0.07, 0.02, 0.01, 0.02, 0.02, 0.04,
+         0.04, 0.07, 0.04, 0.04, 0.04, 0.01, 0.04, 0.07, 0.06, -0.02, 0.07, 0.07, 0.07, 0.07, 0.04, 0.07, 0.04, 0.07, 0.04, 0.01, 0.07, 0.01, 0.01, 0.02, 0.01, 0.05],
+        [0.02, 0.05, 0.04, 0.05, 0.05, 0.05, 0.06, 0.08, 0.08, 0.07, 0.02, 0.04, 0.08, 0.08, 0.05, 0.04, 0.05, 0.03, 0.05, 0.03, 0.07, 0.02, 0.01, 0.02, 0.02, 0.04,
+         0.03, 0.04, 0.04, 0.07, 0.04, 0.01, 0.07, 0.07, 0.06, 0.06, 0.0, 0.07, 0.07, 0.07, 0.04, 0.04, 0.07, 0.02, 0.04, 0.01, 0.07, 0.01, 0.01, 0.02, 0.01, 0.05],
+    ),
+))
+
+
+def _is_letter(ch: str) -> bool:
+    """字距判斷用的「字母」：拉丁、希臘、西里爾字母（不含數字、符號、中日韓字）。"""
+    return len(ch) == 1 and ch.isalpha() and ord(ch) < 0x0530 and not _is_wide(ch)
+
+
+def _bearings(ch: str) -> tuple[float, float]:
+    """字母墨跡左右的留白（em）；帶附加符號的字母取基本字母，查不到的取 0.05。"""
+    if ch not in _LSB_RSB:
+        base = unicodedata.normalize("NFD", ch)[:1]
+        return _LSB_RSB.get(base, (0.05, 0.05))
+    return _LSB_RSB[ch]
 
 
 def _advance(ch: str) -> float:
@@ -487,6 +533,7 @@ class OcrEngine:
             if line is not None:
                 lines.append(line)
         lines = _merge_collinear(lines, p)
+        lines = [(_letter_spacing(l, e, p), e) for l, e in lines]
         out = _dedup([l for l, _ in lines], p)
         out = _reading_order(out)
         t4 = time.perf_counter()
@@ -1414,6 +1461,104 @@ def _join_lines(la: OcrLine, lb: OcrLine, ua, va, wa, ha, sB, tB, gap_em: float,
         quad_error=max(la.quad_error, lb.quad_error),
         angle_error_deg=max(la.angle_error_deg, lb.angle_error_deg),
         notes=sorted(set(la.notes) | set(lb.notes) | {"由兩個偵測框合併"}),
+    )
+
+
+def _letter_gaps(line: OcrLine, em: float, p: dict):
+    """相鄰兩個字母之間「額外的字距」（em）：墨跡間隙扣掉兩個字母本身的左右留白。
+
+    回傳 (非空白字的位置清單, [(k, 額外字距, 模型是否在這裡讀出空白)])；k 是第 k 與第 k+1 個非空白字。
+    只算兩邊都是字母的字對；數字、符號、中日韓字不參與。行不適合判斷時回傳 None。
+    """
+    chars = line.chars
+    if em <= 0 or len(chars) != len(line.text):
+        return None
+    ns = [i for i, c in enumerate(chars) if c.text != " "]
+    if any(_is_wide(chars[i].text) for i in ns):  # 中日韓字、全形字：不處理
+        return None
+    is_l = [_is_letter(chars[i].text) for i in ns]
+    if sum(is_l) < max(p["ls_min_letters"], p["ls_min_letter_frac"] * len(ns)):
+        return None
+    pairs = []
+    for k in range(len(ns) - 1):
+        if not (is_l[k] and is_l[k + 1]):
+            continue
+        a, b = chars[ns[k]], chars[ns[k + 1]]
+        gap = (b.x0 - a.x1) / em
+        pairs.append((k, gap - _bearings(a.text)[1] - _bearings(b.text)[0], ns[k + 1] > ns[k] + 1))
+    return ns, pairs
+
+
+def _letter_spacing(line: OcrLine, em: float, p: dict) -> OcrLine:
+    """字距拉開的一行（「S K I L L S」）：拿掉字母之間多讀的空白，詞與詞之間保留一個空白。
+
+    用量到的墨跡間隙判斷，不看字串樣子：
+    1. 每對相鄰字母的墨跡間隙扣掉兩個字母本身的左右留白，得到「額外的字距」c（em）。
+    2. 從低處的分位數出發，反覆取「不超過 t + ls_word_jump_em 的 c」的中位數當字母間距 t；
+       這一群是字母與字母之間，比它大 ls_word_jump_em 以上的是詞與詞之間。
+    3. 字母間距大致一致（ls_uniform_em、ls_uniform_frac）、明顯大於正常字距（ls_min_track_em）、
+       而且模型讀成空白的間距也落在字母間距這一群裡時，就把這些空白拿掉。
+    4. 證據要夠：同一行中有模型「沒」讀成空白、間距卻和 t 差不多的字母對（例如「S O FT WA R E」的 FT、WA），
+       就足以說明那些空白只是字距；每個字母間都讀成空白時（「S K I L L S」），另外要求整行沒有正常字距的字母對，
+       而且 t 小於一般的空白寬（ls_space_like_em），或至少連續 ls_long_run 個字母。
+       所以「U S A」這種本來就有空白的縮寫、句子中的單字母詞（「a」「I」）都不會被併。
+    """
+    if not p["ls_enable"]:
+        return line
+    got = _letter_gaps(line, em, p)
+    if got is None:
+        return line
+    ns, pairs = got
+    if len(pairs) < p["ls_min_letters"] - 1:
+        return line
+    cs = np.array([q[1] for q in pairs])
+    jump, tol = p["ls_word_jump_em"], p["ls_uniform_em"]
+    t = float(np.percentile(cs, 30))
+    for _ in range(4):
+        t = float(np.median(cs[cs <= t + jump]))
+    letter = cs <= t + jump
+    if int(letter.sum()) < p["ls_min_letters"] - 1:
+        return line
+    if not (p["ls_min_track_em"] <= t <= p["ls_max_track_em"]):
+        return line
+    close = np.abs(cs - t) <= tol
+    if float(close[letter].mean()) < p["ls_uniform_frac"]:
+        return line
+    drop = [q[0] for q, m in zip(pairs, letter) if m and q[2]]
+    if not drop:
+        return line
+    inner = any(m and c and not q[2] for q, m, c in zip(pairs, letter, close))
+    if not inner:
+        if float(cs.min()) < p["ls_min_track_em"]:  # 行內有正常字距的字母對：是一般文字夾著單字母，不是字距拉開
+            return line
+        run = best = 1
+        ks = [q[0] for q, m in zip(pairs, letter) if m]
+        for a, b in zip(ks, ks[1:]):
+            run = run + 1 if b == a + 1 else 1
+            best = max(best, run)
+        n_run = (best + 1) if ks else 0
+        if t >= p["ls_space_like_em"] and n_run < p["ls_long_run"]:
+            return line
+    drop_set = set(drop)
+    word = {q[0]: q[1] for q, m in zip(pairs, letter) if not m}
+    chars = line.chars
+    out: list[OcrChar] = list(chars[: ns[0] + 1])
+    for k in range(len(ns) - 1):
+        i, j = ns[k], ns[k + 1]
+        between = chars[i + 1 : j]
+        if k in drop_set:
+            between = []
+        elif k in word and not between:
+            conf = 1.0 / (1.0 + math.exp(-(word[k] - t - jump) / p["space_soft_em"]))
+            err = max(chars[i].x_error, chars[j].x_error)
+            between = [OcrChar(" ", conf, chars[i].x1, chars[j].x0, [CharCandidate(" ", conf), CharCandidate("", 1.0 - conf)], x_error=err)]
+        out.extend(between)
+        out.append(chars[j])
+    out.extend(chars[ns[-1] + 1 :])
+    note = f"字距拉開的一行：拿掉 {len(drop)} 個字母間的空白（扣掉字形留白後，字母間距約 {t:.2f} em）"
+    return OcrLine(
+        quad=line.quad, text="".join(c.text for c in out), score=line.score, chars=out, vertical=line.vertical,
+        quad_error=line.quad_error, angle_error_deg=line.angle_error_deg, notes=list(line.notes) + [note],
     )
 
 

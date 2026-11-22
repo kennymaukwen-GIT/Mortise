@@ -60,7 +60,11 @@ from .docx_common import (
     el,
     emu,
     empty_paragraph,
+    finish_package,
     font_first_baseline_em,
+    worst_case_width_pt,
+    condense_spacing,
+    hard_breaks,
     image_descriptor,
     line_props,
     make_ctx,
@@ -85,8 +89,12 @@ DEFAULT_PARAMS = {
     "max_page_pt": MAX_PAGE_PT,  # Word 頁面邊長上限（pt）；超過時整頁等比縮小
     "textbox_autofit": True,  # 文字方塊寫 spAutoFit：目標軟體的字比較寬、行比較高時框往下長，不裁掉文字
     "baseline_compensation": True,  # 單倍行距的文字框依驗證字型的上緣量度微調 y，讓第一行基線落在「框上緣 + 字級」
-    "nowrap_slack_ratio": 0.15,  # 不換行的文字方塊加寬這個比例（往對齊基準的反方向加，字的位置不變）。
+    "nowrap_slack_ratio": 0.15,  # 不換行的文字方塊至少加寬這個比例（往對齊基準的反方向加，字的位置不變）。
     # 實測：LibreOffice 24.2 不理會 wrap="none"，字寬略大時仍會折行，折下去的那行被框高裁掉
+    "nowrap_margin_ratio": 0.05,  # 依最寬字型量出的寬度再多留這個比例（見 _single_line_room）
+    "nowrap_page_margin_pt": 1.0,  # 加寬時與紙邊保持的距離（pt）
+    "condense_wider_fonts": True,  # 寫入的字型比量測用的字型寬時緊縮字距（見 docx_common.condense_spacing）
+    "condense_max_ratio": 0.03,  # 每個字最多緊縮字級的這個比例
 }
 
 MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -136,9 +144,11 @@ def _shape_wsp(shape, w: float, h: float, ctx: Ctx):
     return wsp
 
 
-def _baseline_shift(tb) -> float:
+def _baseline_shift(tb, ctx: Ctx | None = None) -> float:
     """第一行基線應在「框上緣 + first_baseline_pt」（成品文件明寫；沒有時沿用舊約定「框上緣 + 字級」）。
-    目標引擎把基線放在「框上緣 + 字型上緣量度（+ 固定行高多出的行距）」，兩者差多少就把框移多少（pt）。"""
+    目標引擎把基線放在「框上緣 + 字型上緣量度（+ 固定行高多出的行距）」，兩者差多少就把框移多少（pt）。
+    給了 ctx 時，拉丁字用寫入檔案的字型名稱查量度（例如寫成 Arial，就用字寬與上緣都相容的 Liberation Sans）；
+    中文字仍用驗證字型（伺服器上沒有寫入的中文字型，LibreOffice 依語言挑的也是驗證字型）。"""
     if not tb.paragraphs or not tb.paragraphs[0].runs:
         return 0.0
     sp = tb.paragraphs[0]
@@ -154,11 +164,52 @@ def _baseline_shift(tb) -> float:
         return target - 0.8 * ls.value
     preds = []
     for r in sp.runs:
-        em = font_first_baseline_em(r.font.verification_family or r.font.family.value)
+        fam = r.font.verification_family or r.font.family.value
+        if ctx is not None and not r.font.east_asian:
+            fam = ctx.font_name(r.font, record=False)
+        em = font_first_baseline_em(fam)
         if em is None:
             return 0.0
         preds.append(em * r.size_pt.value)
     return target - max(preds)  # 倍數行距：第一行上方不加行距（實測 1.0、1.5 倍相同）
+
+
+def _single_line_room(item, x: float, w: float, W: float, ctx: Ctx, params: dict, s: float, paras=None) -> tuple[float, float, str | None]:
+    """單行（不換行）的文字框留足寬度：別的裝置換了較寬的字型時也不折行、不超出紙邊。回傳（x, 寬, 改寫的對齊或 None）。
+
+    為什麼不靠 wrap="none"：實測 LibreOffice 24.2 不理會它，字一寬就折行（「SKILLS」被擠成「SKILL／S」）。
+    需要的寬度 = 寫入的字型與常見寬字型（DejaVu Sans）量出的最寬寬度 ×（1 + nowrap_margin_ratio），至少原寬 ×（1 + nowrap_slack_ratio）。
+    加寬的方向依對齊：靠左往右、靠右往左、置中兩邊；框本身沒有填色與框線，加寬看不出來，字的起點（或終點、中心）不動。
+    靠左的框往右加寬會超出紙邊、而且框在頁面右半邊（例如右上角的日期「2026 – present」）時，
+    改成靠右對齊、右緣不動、往左加寬：字一寬就往左長，不會被紙邊切掉。"""
+    paras = paras if paras is not None else item.paragraphs
+    aligns = {sp.align for sp in paras}
+    latin, _ = context_fonts(paras, ctx)
+    written = sorted({ctx.font_name(r.font, record=False, context_latin=latin) for sp in paras for r in sp.runs})
+    need = max((worst_case_width_pt(sp, written) for sp in paras), default=0.0) * s * (1 + params["nowrap_margin_ratio"])
+    need = max(need, w * (1 + params["nowrap_slack_ratio"]))
+    edge = params["nowrap_page_margin_pt"]
+    if need <= w:
+        return x, w, None
+    if aligns <= {Align.LEFT, Align.JUSTIFY}:
+        room = W - edge - x
+        if need <= room:
+            return x, need, None
+        x1 = x + w
+        if x + w / 2 > W / 2 and x1 - edge > room:
+            nw = max(w, min(need, x1 - edge))
+            ctx.degrade(item.id, "單行文字框的對齊", "貼近右側紙邊、換成較寬的字型時會超出紙邊：改成靠右對齊（右緣不動），框往左加寬", False)
+            return x1 - nw, nw, "right"
+        return x, max(w, room), None
+    if aligns == {Align.RIGHT}:
+        x1 = x + w
+        nw = max(w, min(need, x1 - edge))
+        return x1 - nw, nw, None
+    if aligns == {Align.CENTER}:
+        c = x + w / 2
+        half = max(w / 2, min(need / 2, c - edge, W - edge - c))
+        return c - half, 2 * half, None
+    return x, w, None
 
 
 def _page_items(page: StyledPage) -> list[tuple[int, int, str, object]]:
@@ -212,17 +263,26 @@ def _add_page(docx_doc, page: StyledPage, ctx: Ctx, styles: dict[str, WordStyle]
         behind = min_table_z is not None and z < min_table_z
         if kind == "text":
             latin, ea = context_fonts(item.paragraphs, ctx)
-            blocks = [build_paragraph(sp, ctx, item.id, latin, ea, styles.get(sp.style_id or "")) for sp in item.paragraphs]
-            if not item.wrap and params["nowrap_slack_ratio"]:
-                extra = w * params["nowrap_slack_ratio"]
-                aligns = {sp.align for sp in item.paragraphs}
-                # 只加寬靠左（含左右對齊）的框；置中與靠右的框實測在 LibreOffice 加寬後位置會偏
-                if not rot and aligns <= {Align.LEFT, Align.JUSTIFY}:  # 旋轉的框以中心旋轉，加寬會移動中心，不加
-                    w = w + extra
+            align_override = None
+            paras, wrap = list(item.paragraphs), item.wrap
+            if wrap and not rot and {sp.align for sp in paras} <= {Align.RIGHT, Align.CENTER}:
+                # 靠右或置中的多行字（地址、電話）：照原圖斷行寫成強制換行，之後當成單行框處理（留足寬度，不再自動換行）
+                hb = [hard_breaks(sp, item.box.w) if sp.source_line_count >= 2 else sp for sp in paras]
+                if all(h is not None for h in hb) and any(h is not sp for h, sp in zip(hb, paras)):
+                    paras, wrap = hb, False
+                    ctx.degrade(item.id, "斷行", "靠右或置中的多行字：照原圖的斷行位置寫成強制換行，框留足寬度（換了字型也不會改變斷行）", False)
+            if not wrap and not rot:  # 旋轉的框以中心旋轉，加寬會移動中心，不加
+                x, w, align_override = _single_line_room(item, x, w, W, ctx, params, s, paras)
+            spacing = [condense_spacing(sp, ctx, latin, params["condense_max_ratio"]) if params["condense_wider_fonts"] and not rot else None
+                       for sp in paras]
+            if any(any(v) for v in spacing if v):
+                ctx.degrade(item.id, "字距", "寫入的字型比量測用的字型寬：緊縮字距抵消字寬差，換行位置才與原圖一樣（框不會多一行而蓋到下一個框）", False)
+            blocks = [build_paragraph(sp, ctx, item.id, latin, ea, styles.get(sp.style_id or ""), align_override=align_override, run_spacing=sv)
+                      for sp, sv in zip(paras, spacing)]
             if params["baseline_compensation"] and not rot:
-                y += _baseline_shift(item) * s
+                y += _baseline_shift(item, ctx) * s
             fb = vml_textbox_fallback(blocks, x=x, y=y, w=w, h=h, rot=rot, z_index=rel[0] + 2) if params["vml_fallback"] else None
-            place(textbox_wsp(blocks, w, h, rot, item.wrap, params["textbox_autofit"]), URI_WPS, item.id, x, y, w, h, rot, behind, True, fb)
+            place(textbox_wsp(blocks, w, h, rot, wrap, params["textbox_autofit"]), URI_WPS, item.id, x, y, w, h, rot, behind, True, fb)
             expect_texts.extend("".join(r.text for r in sp.runs) for sp in item.paragraphs)
         elif kind == "image":
             rid, _ = docx_doc.part.get_or_add_image(image_descriptor(store, item.image))
@@ -246,7 +306,7 @@ def _add_page(docx_doc, page: StyledPage, ctx: Ctx, styles: dict[str, WordStyle]
 
 def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFile:
     params = params_from(cfg, DEFAULT_PARAMS, "docx_fixed")
-    ctx = make_ctx(doc)
+    ctx = make_ctx(doc, cfg)
     docx_doc = Document()
     sizes = Counter(round(r.size_pt.value, 1) for p in doc.pages for t in p.text_boxes for sp in t.paragraphs if sp.role == Role.BODY for r in sp.runs)
     from .docx_common import setup_package
@@ -272,6 +332,7 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
             anchor_p.find(q("w:pPr")).append(sect)  # sectPr 必須是 pPr 的最後一個子元素
         else:
             set_sect(body_sect, W, H)
+    finish_package(docx_doc, ctx)
     data = save_bytes(docx_doc)
     ok, notes = selfcheck(data, max(1, len(doc.pages)), expect_texts, ctx.fonts)
     got = anchor_geometry(data)

@@ -102,6 +102,16 @@ vector_overshoot = 0.2               # 壓縮過的圖容許邊緣像素超出�
 vector_overshoot_clean = 0.12        # 沒量到雜訊時容許的過衝比例（雙三次放大約一成；初始值）
 vector_ring_fraction = 0.22          # 貼著邊緣、與相鄰區域色差在「邊緣兩側色差 × 此值」以內的小塊當成振鈴併回去（初始值）
 vector_feature_colors = 6            # 連成一塊的細線（圖表的軸、格線、資料線）最多拆成幾種顏色
+vector_photo_check = true            # 描圖前先取樣幾十個方塊，明顯像照片或材質的直接回報不適合（大張照片原本要好幾秒到一分鐘）
+vector_photo_check_smooth = 0.15     # 取樣裡平滑像素不到此比例 → 像照片或材質
+vector_photo_check_texture_de = 3.0  # 平坦方塊平滑後對平面的殘差（ΔE）中位數超過此值 → 像照片（量到：插畫 ≤ 2.7、照片 ≥ 3.5；初始值）
+region_overlay_enabled = true        # 照片（或有紋理的插畫）上「後來疊上去」的平塗色塊拆成獨立的形狀，照片被蓋住處補上（屬於生成）
+region_overlay_min_area_rel = 0.001  # 拆出來的色塊至少佔影像面積的這個比例
+region_overlay_noise_ratio = 0.35    # 色塊內部的顆粒 ÷ 照片最平坦處的顆粒，不超過此值才拆（初始值）
+region_overlay_min_texture = 1.5     # 照片本身的顆粒至少要這麼大（色階）才比得出來；照片太乾淨就不拆
+region_overlay_max_gradient = 10.0   # 色塊內部的顏色變化上限（色階）；有明暗的（天空、牆面）不拆
+region_overlay_edge_sharpness = 0.25 # 邊緣銳利度（邊緣上最大梯度 ÷ 兩側色差）下限；模糊的色塊不拆（初始值）
+region_overlay_edge_continuity = 0.85  # 沒被遮住的邊界中，銳利而且有對比的比例下限（初始值）
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）

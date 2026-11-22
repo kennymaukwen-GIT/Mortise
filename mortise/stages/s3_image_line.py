@@ -3,8 +3,8 @@
 順序是「剝洋蔥」：先處理最可靠的文字，再處理剩下的區域，最後補回底圖。
   s3.ocr          文字偵測與文字辨識（PP-OCRv6，保留每個字的候選字與機率）
   s3.text_attr    文字屬性：筆畫遮罩、顏色、字級與字型一起解（檢索加重繪比對）、粗斜體、基線
-  s3.regions      扣掉文字後的區域：照片、插畫、形狀（擬合成基本幾何）、表格格線；遮罩可以重疊
-  s3.crop         裁出照片與插畫（被文字蓋住的部分先修補再裁）
+  s3.regions      扣掉文字後的區域：照片、插畫、形狀（擬合成基本幾何；照片上後來疊上去的平塗圖形也拆出來）、表格格線；遮罩可以重疊
+  s3.crop         裁出照片與插畫（被文字、被疊在上面的形狀蓋住的部分先補再裁；補的部分屬於生成，記在 notes）
   s3.vectorize    插畫（標誌、圖示、圖表）描成向量路徑；重畫驗證過關才交出向量圖，否則只留圖片。照片不描
   s3.background   擦掉所有元素後補回底圖；純色與漸層用擬合，紋理用修補（修補屬於生成，會記錄位置）
 這裡只負責轉換座標與產物格式；量測與感知的細節在各模組。所有數值都是原始量測值，不吸附、不定案。
@@ -166,7 +166,9 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         text_free = bgmod.reconstruct_background(color, text_mask).image
     # 被上層的形狀或插畫（例如從照片裡拆出來的平塗圖形）蓋住的地方也先補掉，否則移動形狀會露出殘影。
     # 補出來的像素屬於生成，記在 notes（圖片元素本身沒有生成範圍的欄位）。
+    # 補好的影像只給這張照片自己裁圖用：疊在上面的插畫要從沒補過的影像裁，不然裁到的是補出來的照片。
     covered_px: dict[int, tuple[int, int]] = {}
+    filled_src: dict[int, np.ndarray] = {}
     for rg in photos:
         cover = np.zeros((H, W), dtype=bool)
         for up in regions:
@@ -182,7 +184,7 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         filled, gen_mask = regmod.fill_covered(base, rg, cover, region_params or None)
         n_gen = int(gen_mask.sum())
         if n_gen:
-            text_free = filled
+            filled_src[id(rg)] = filled
             covered_px[id(rg)] = (n_gen, int(rg.mask.sum()))
 
     images: list[ImageElement] = []
@@ -194,7 +196,7 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         x0, y0, x1, y1 = rg.bbox
         q = Quad.from_rect(x0 / W, y0 / W, x1 / W, y1 / W)
         if rg.kind in ("photo", "illustration"):
-            rgba = regmod.crop_region(color, rg, inpainted=text_free)
+            rgba = regmod.crop_region(color, rg, inpainted=filled_src.get(id(rg), text_free))
             blob = store.put_blob(_png(rgba), "image/png", "png")
             kind = ImageKind.PHOTO if rg.kind == "photo" else ImageKind.ILLUSTRATION
             images.append(ImageElement(
@@ -208,7 +210,10 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
                              "已補成周圍的內容（平滑內插加上照片本身的顆粒）；這部分是生成的，不是原圖。")
             # ---------- s3.vectorize：插畫描成向量（照片不描）；對應的圖片照樣留在 images 裡
             if rg.kind == "illustration" and c.get("vector_enabled", True):
-                vg = _trace_vector(page, images[-1], rgba, (x0, y0), W, vector_params, notes)
+                trace_in = rgba
+                if rg.features.get("overlay") == 1.0:  # 從照片上拆出來的圖形：透明處底下是照片，先換成單色再描
+                    trace_in = np.dstack([regmod.isolate_overlay(rgba[..., :3], rgba[..., 3] >= 128), rgba[..., 3]])
+                vg = _trace_vector(page, images[-1], trace_in, (x0, y0), W, vector_params, notes)
                 if vg is not None:
                     vectors.append(vg)
         elif rg.kind == "shape" and rg.shape is not None:

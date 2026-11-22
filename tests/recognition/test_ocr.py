@@ -587,3 +587,182 @@ def test_rule_line_above_text_keeps_spaces():
     # 對照：拿掉寬度上限就會重現錯誤（確保這個測試真的在測這件事）
     old = [ln.text for ln in OcrEngine(params={"cc_attach_max_width": 1e9}).read(img) if "JULY" in ln.text]
     assert old == ["12–14JULY2027"], old
+
+
+# ============================================================================ 字距拉開的標題（「S K I L L S」→「SKILLS」）
+#
+# 標題常把字距拉開（CSS letter-spacing、Word 的字元間距），模型會在字母間讀出空白。ocr._letter_spacing 用量到的
+# 墨跡間隙（扣掉字形左右留白）判斷：字母間距一致、明顯大於正常字距，模型讀成空白的間距也和字母間距差不多大時拿掉空白；
+# 詞與詞之間（間距大出一個空白寬以上）保留一個空白。下面先用排好的假行測判斷邏輯（不經模型，結果固定），
+# 再用畫出來的影像測整條讀法。
+
+INTER_B = _font_path("/usr/share/fonts/opentype/inter/Inter-Bold.otf", "Inter:bold")
+INTER_R = _font_path("/usr/share/fonts/opentype/inter/Inter-Regular.otf", "Inter")
+SERIF_B = _font_path("/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf", "Liberation Serif:bold")
+DEJAVU = _font_path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "DejaVu Sans")
+
+
+def _fake_line(model_text: str, truth: str, em: float = 20.0, track_em: float = 0.0, space_em: float = 0.28) -> OcrLine:
+    """排好的假行：truth 是真正的排法（詞與詞之間一個空白），每個字的墨跡位置按 ocr 的字寬表與字形留白表排出，
+    字與字之間多加 track_em（空白也加，和 CSS letter-spacing 一樣）；模型讀出的文字是 model_text（可能在字母間多了空白）。"""
+    from mortise.recognition.ocr import _advance, _bearings
+    from mortise.recognition.types import CharCandidate, OcrChar
+
+    pen, boxes = 0.0, []
+    for ch in truth:
+        if ch == " ":
+            pen += space_em + track_em
+            continue
+        lsb, rsb = _bearings(ch) if ch.isalpha() else (0.05, 0.05)
+        adv = _advance(ch)
+        boxes.append(((pen + lsb) * em, (pen + adv - rsb) * em))
+        pen += adv + track_em
+    assert model_text.replace(" ", "") == truth.replace(" ", "")
+    chars, k = [], 0
+    for ch in model_text:
+        if ch == " ":
+            chars.append(OcrChar(" ", 0.9, boxes[k - 1][1], boxes[k][0], [CharCandidate(" ", 0.9), CharCandidate("", 0.1)]))
+        else:
+            chars.append(OcrChar(ch, 0.99, boxes[k][0], boxes[k][1], [CharCandidate(ch, 0.99)]))
+            k += 1
+    quad = np.array([[0, 0], [boxes[-1][1], 0], [boxes[-1][1], 0.72 * em], [0, 0.72 * em]], float)
+    return OcrLine(quad=quad, text=model_text, score=0.99, chars=chars)
+
+
+@pytest.mark.parametrize("model_text, truth, track_em, expected", [
+    ("S K I L L S", "SKILLS", 0.13, "SKILLS"),  # 每個字母間都讀成空白，字距小於一般空白寬
+    ("A B O U T M E", "ABOUT ME", 0.13, "ABOUT ME"),  # 兩個詞：詞間距大出一個空白寬以上，保留一個空白
+    ("S O FT WA R E", "SOFTWARE", 0.25, "SOFTWARE"),  # 字距接近空白寬，但 FT、WA 沒讀成空白、間距卻一樣大：那些空白只是字距
+    ("C O N T A C T", "CONTACT", 0.30, "CONTACT"),  # 每個字母間都是空白、字距大：連續 7 個字母間距一致，仍視為字距拉開
+    ("r e f e r e n c e s", "references", 0.20, "references"),  # 小寫也一樣
+])
+def test_letter_spacing_logic_collapses(model_text, truth, track_em, expected):
+    from mortise.recognition.ocr import _letter_spacing
+
+    out = _letter_spacing(_fake_line(model_text, truth, track_em=track_em), 20.0, DEFAULT_PARAMS)
+    assert out.text == expected
+    assert len(out.chars) == len(out.text)
+    assert any("字距拉開" in n for n in out.notes)
+    m = __import__("re").search(r"約 ([0-9.]+) em", out.notes[-1])
+    assert m and abs(float(m.group(1)) - track_em) < 0.02, out.notes  # 假行用的就是同一張字形表，量到的字距應幾乎精確
+
+
+@pytest.mark.parametrize("model_text, truth, track_em", [
+    ("U S A", "U S A", 0.0),  # 本來就有空白的縮寫：字母太少
+    ("A B C D", "A B C D", 0.0),  # 四個以真正空白隔開的字母：間距等於空白寬，連續不到 5 個
+    ("Made in the U S A today", "Made in the U S A today", 0.0),  # 句子中的縮寫：其他字母對是正常字距
+    ("I am a cat", "I am a cat", 0.0),  # 本來就是單字母的詞
+    ("2 0 2 6", "2026", 0.13),  # 數字不併（數字之間的空白可能是真的：電話、金額）
+    ("S K I L L S 技能", "SKILLS 技能", 0.13),  # 混有中文字的行不處理
+    ("L A B E L S", "LABELS", 1.0),  # 間距大到不像字距（分開擺放的標籤）
+])
+def test_letter_spacing_logic_leaves_alone(model_text, truth, track_em):
+    from mortise.recognition.ocr import _letter_spacing
+
+    line = _fake_line(model_text, truth, track_em=track_em)
+    out = _letter_spacing(line, 20.0, DEFAULT_PARAMS)
+    assert out.text == model_text
+    assert not any("字距拉開" in n for n in out.notes)
+
+
+def test_letter_spacing_can_be_disabled():
+    from mortise.recognition.ocr import _letter_spacing
+
+    line = _fake_line("S K I L L S", "SKILLS", track_em=0.13)
+    assert _letter_spacing(line, 20.0, {**DEFAULT_PARAMS, "ls_enable": False}).text == "S K I L L S"
+
+
+def _draw_tracked(canvas: Image.Image, text: str, font_path: str, size: int, xy, track_em: float, color=(30, 60, 80)):
+    """CSS letter-spacing 的畫法（4 倍解析度畫再面積平均縮小）：第 i 個字放在「含字距調整的排字位置 + i × 字距」。"""
+    ss = 4
+    font = ImageFont.truetype(font_path, size * ss, layout_engine=ImageFont.Layout.RAQM)
+    tr = track_em * size * ss
+    w = int((font.getlength(text) + len(text) * tr) / ss + 2 * size)
+    h = int(size * 2)
+    layer = Image.new("L", (w * ss, h * ss), 0)
+    d = ImageDraw.Draw(layer)
+    for i, ch in enumerate(text):
+        d.text((size * 0.5 * ss + font.getlength(text[:i]) + i * tr, size * 1.4 * ss), ch, font=font, fill=255, anchor="ls")
+    canvas.paste(Image.new("RGB", (w, h), color), tuple(xy), layer.resize((w, h), Image.Resampling.BOX))
+
+
+TRACKED = [  # (文字, 字型, 字級 px, 字距 em)：不同字型、字級、字距，含兩個詞與小寫
+    ("SKILLS", SANS_B, 26, 0.13), ("PROFILE", INTER_B, 20, 0.15), ("EXPERIENCE", INTER_B, 34, 0.12),
+    ("ABOUT ME", SANS_B, 30, 0.20), ("WORK EXPERIENCE", INTER_R, 24, 0.25), ("SOFTWARE", DEJAVU, 22, 0.18),
+    ("LANGUAGES", SERIF_B, 28, 0.15), ("CONTACT", INTER_B, 16, 0.30), ("EDUCATION", SANS, 40, 0.10),
+    ("references", INTER_R, 30, 0.20),
+]
+UNTOUCHED = [  # 一般字距的行：開不開這個功能，讀出來都要一樣
+    ("Made in the U S A today", SANS, 26), ("U S A", SANS_B, 30), ("A B C D", SANS, 26), ("I am a student", INTER_R, 26),
+    ("Call +44 7707 391793", SANS, 24), ("Normal body text stays the same", INTER_R, 22), ("第二季 Word 與 Excel 輸出", WQY, 30),
+]
+ROW = 80
+
+
+@lru_cache(maxsize=None)
+def tracked_page() -> np.ndarray:
+    rows = TRACKED + [(t, f, s, 0.0) for t, f, s in UNTOUCHED]
+    img = Image.new("RGB", (1200, ROW * len(rows) + 40), (250, 250, 248))
+    for k, (t, f, s, tr) in enumerate(rows):
+        _draw_tracked(img, t, f, s, (40, 20 + ROW * k), tr)
+    return np.asarray(img).copy()
+
+
+@lru_cache(maxsize=None)
+def tracked_results(enable: bool = True, degrade: bool = False) -> tuple:
+    """每一列讀到的行（以行的垂直中心對應到列）。"""
+    img = tracked_page()
+    if degrade:
+        img = jpeg(blur(img, 0.8), 60)
+    lines = engine().read(img, None if enable else {"ls_enable": False})
+    rows = [[] for _ in range(len(TRACKED) + len(UNTOUCHED))]
+    for ln in lines:
+        k = int((float(ln.quad[:, 1].mean()) - 20) // ROW)
+        if 0 <= k < len(rows):
+            rows[k].append(ln)
+    return tuple(tuple(r) for r in rows)
+
+
+def _track_from_note(ln: OcrLine) -> float | None:
+    import re
+
+    for n in ln.notes:
+        m = re.search(r"字距拉開.*約 ([0-9.]+) em", n)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def test_letter_spaced_headings_read_as_words():
+    """實測（乾淨影像）：10 行全部讀對；量到的字距與答案相差最多約 0.03 em（字形表與實際字型的留白差）。"""
+    rows = tracked_results()
+    errs = []
+    for (text, _f, size, tr), got in zip(TRACKED, rows):
+        assert len(got) == 1, (text, [l.text for l in got])
+        ln = got[0]
+        assert ln.text == text, (ln.text, text)
+        t = _track_from_note(ln)
+        assert t is not None, ln.notes
+        errs.append(t - tr)
+        assert abs(t - tr) <= 0.05, (text, t, tr)
+    print("\n字距誤差（em）", [round(e, 3) for e in errs])
+
+
+def test_letter_spaced_headings_degraded():
+    """模糊（σ 0.8）加 JPEG（品質 60）。實測 10 行全部讀對（量到的字距誤差最大約 0.08 em：模糊讓字界外擴）；
+    門檻設至少 9 行（拿掉空白靠墨跡間隙，模糊再重一點字界誤差就會變大）。"""
+    rows = tracked_results(degrade=True)
+    ok = [bool(got) and got[0].text == text for (text, *_), got in zip(TRACKED, rows)]
+    assert sum(ok) >= 9, [(t[0], [l.text for l in g]) for t, g in zip(TRACKED, rows)]
+
+
+def test_letter_spacing_leaves_normal_lines_alone():
+    """一般字距的行（縮寫「U S A」、單字母詞、電話號碼、中英混排）：開不開這個功能，讀出來完全一樣，也沒有字距拉開的標記。"""
+    on, off = tracked_results(True), tracked_results(False)
+    base = len(TRACKED)
+    for k, (text, *_r) in enumerate(UNTOUCHED):
+        a, b = [l.text for l in on[base + k]], [l.text for l in off[base + k]]
+        assert a == b, (text, a, b)
+        assert not any(_track_from_note(l) is not None for l in on[base + k]), text
+    # 沒有這個功能時，標題會讀成字母間有空白的樣子（確保這個測試真的在測這件事）
+    assert [l.text for l in off[0]] == ["S K I L L S"], [l.text for l in off[0]]
