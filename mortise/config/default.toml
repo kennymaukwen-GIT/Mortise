@@ -173,6 +173,26 @@ svg_kerning_aware = true             # 置中、靠右、左右對齊的行，�
 svg_tspan_y = false                  # 行內片段的 tspan 另寫 y：resvg 這類渲染器才會逐片段選字型；編輯軟體的行為未實測，預設不寫
 svg_hairline_pt = 0.25               # 來源是 PDF 零寬細線的筆畫，在 SVG 裡寫成多寬（pt，初始值）
 svg_outline_slant_deg = 12.0         # 文字轉外框而字型沒有斜體檔時，字形傾斜的角度（初始值）
+# ---- Word（exporters/docx_*.py）：設定加在這一行下面，名稱以 docx_ 開頭 ----
+# 寫進檔案的字型名稱（見 exporters/docx_common.py「寫入的字型名稱」）。成品文件裡⑤推論的字型不改，原本的名稱記在降級紀錄。
+docx_font_names = "portable"         # portable：換成多數裝置都有、或字寬相容的字型；inferred：照推論的名稱寫（舊做法，冷門字型也照寫）
+docx_font_map = [                    # 1. 字寬相容的對照（推論的名稱 → 寫進檔案的名稱），量度相同，換了不會跑版（與 [fonts.substitutes] 方向相反）
+  ["Liberation Sans", "Arial"], ["Arimo", "Arial"], ["Helvetica", "Arial"], ["Liberation Sans Narrow", "Arial"],
+  ["Liberation Serif", "Times New Roman"], ["Tinos", "Times New Roman"], ["Times", "Times New Roman"],
+  ["Liberation Mono", "Courier New"], ["Cousine", "Courier New"], ["Courier", "Courier New"],
+  ["Carlito", "Calibri"], ["Caladea", "Cambria"],
+  ["Noto Sans TC", "Microsoft JhengHei"], ["Noto Sans CJK TC", "Microsoft JhengHei"], ["Source Han Sans TC", "Microsoft JhengHei"],
+  ["WenQuanYi Zen Hei", "Microsoft JhengHei"], ["微軟正黑體", "Microsoft JhengHei"],
+  ["Noto Serif TC", "PMingLiU"], ["Noto Serif CJK TC", "PMingLiU"], ["Source Han Serif TC", "PMingLiU"], ["新細明體", "PMingLiU"],
+  ["MingLiU", "PMingLiU"], ["細明體", "PMingLiU"], ["LXGW WenKai TC", "DFKai-SB"], ["標楷體", "DFKai-SB"],
+]
+docx_portable_fonts = [              # 2. 已經是多數裝置都有的字型：照原名寫
+  "Arial", "Times New Roman", "Courier New", "Calibri", "Cambria", "Georgia", "Verdana", "Tahoma", "Trebuchet MS",
+  "Microsoft JhengHei", "PMingLiU", "DFKai-SB",
+]
+# 3. 其他字型依類別（字型檔的等寬旗標、PANOSE、名稱）寫成該類的常見字型（有損，記錄）。等寬字型只在整個文字框都是等寬字時保留
+docx_fallback_fonts = { sans = "Arial", serif = "Times New Roman", mono = "Courier New", cjk_sans = "Microsoft JhengHei", cjk_serif = "PMingLiU", cjk_kai = "DFKai-SB" }
+docx_embed_fonts = false             # 是否把字型內嵌進 Word 檔（見 docx_common.py「內嵌字型」；預設關）
 
 [verify]                             # ⑦ 驗證
 render_dpi = 100                     # 比對用的渲染解析度（dpi）

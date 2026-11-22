@@ -1,14 +1,18 @@
 // The big black frame: drop a file in, page through it, watch the conversion, compare and correct the result.
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch } from "react";
 import * as api from "../api/client";
+import { ApiError } from "../api/client";
 import type { CorrectionIn, PageElements, PageInfo } from "../api/types";
 import { useI18n } from "../i18n/I18n";
+import { LIBREOFFICE_PREVIEW, targetApp } from "../lib/catalog";
+import { hasCjk } from "../lib/errors";
 import type { LocalDoc } from "../lib/localDoc";
+import { loadServerImage, renderKind } from "../lib/serverImages";
 import { fmtMm, widthBucket } from "../lib/units";
 import { detectedSizeMm, pageGeometry } from "../state/derive";
 import { pageCount, type Action, type FrameMessage, type State, type View } from "../state/store";
 import { EditDialog, EditLayer } from "./EditLayer";
-import { Alert, ChevronLeft, ChevronRight, Close, Grid, Pencil, Upload } from "./Icons";
+import { Alert, ChevronLeft, ChevronRight, Close, Grid, Info, Pencil, Upload } from "./Icons";
 import { preload, SmartImg } from "./SmartImg";
 import { Viewer, type ViewerRenderInfo } from "./Viewer";
 
@@ -16,11 +20,15 @@ export interface StageProps {
   state: State;
   dispatch: Dispatch<Action>;
   maxMb: number;
+  /** LibreOffice is installed on the server (GET /api/health verify_engine). */
+  serverHasLibreOffice: boolean;
   onPickFile: () => void;
   onDropFile: (f: File) => void;
   onCancel: () => void;
   onRetry: () => void;
   onCorrect: (items: CorrectionIn[]) => Promise<void>;
+  /** A request about the current job failed with 404: check whether the job is gone. */
+  onJobMissing: () => void;
 }
 
 function useFrameMessage(m: FrameMessage | null): string | null {
@@ -29,21 +37,39 @@ function useFrameMessage(m: FrameMessage | null): string | null {
   return "text" in m ? m.text : t(m.key, m.vars);
 }
 
+/** Server text (Traditional Chinese) shown in the English UI: marked as Chinese for screen readers and fonts. */
+function ServerText({ text }: { text: string }) {
+  return <span lang={hasCjk(text) ? "zh-Hant" : undefined}>{text}</span>;
+}
+
+/** Notes from the server that explain why a check or a drawing did not happen. */
+export function whyNotes(notes: string[]): string[] {
+  return notes.filter((n) => /沒有執行|失敗|找不到|無法|沒有輸出|沒能/.test(n)).slice(0, 4);
+}
+
 /* ------------------------------------------------------------------ images */
 
 function LocalLayer({ doc, index, info, alt }: { doc: LocalDoc; index: number; info: ViewerRenderInfo; alt: string }) {
   const bucket = doc.kind === "image" ? 0 : widthBucket(info.pixelWidth);
-  const load = useCallback(() => doc.render(index, bucket || 1000), [doc, index, bucket]);
+  const load = useCallback(() => doc.render(index, bucket || 1000, "main"), [doc, index, bucket]);
   const [st, setSt] = useState<"loading" | "ready" | "error">("loading");
   return (
     <>
-      <SmartImg baseKey={`local:${index}`} srcKey={String(bucket)} load={load} alt={alt} className="layer-img" onState={setSt} />
+      {/* The document id is part of the key: a newly opened file never shows the previous file's picture. */}
+      <SmartImg baseKey={`local:${doc.id}:${index}`} srcKey={String(bucket)} load={load} alt={alt} className="layer-img" onState={setSt} />
       {st === "loading" && <Spinner />}
     </>
   );
 }
 
-function ServerLayer({ jobId, page, kind, format, version, info, alt }: {
+export interface LayerInfo {
+  render: string | null;
+  status: "loading" | "ready" | "error";
+  errorStatus?: number;
+  errorDetail?: string;
+}
+
+function ServerLayer({ jobId, page, kind, format, version, info, alt, onInfo, reason }: {
   jobId: string;
   page: number;
   kind: "original" | "result" | "overlay";
@@ -51,19 +77,47 @@ function ServerLayer({ jobId, page, kind, format, version, info, alt }: {
   version: number;
   info: ViewerRenderInfo;
   alt: string;
+  onInfo?: (i: LayerInfo) => void;
+  /** Extra explanation shown when the picture cannot be drawn. */
+  reason?: string | null;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const bucket = widthBucket(info.pixelWidth);
   const url = api.pageImageUrl(jobId, page, kind, { width: bucket, format: format ?? undefined, v: kind === "original" ? undefined : version });
-  const load = useCallback(() => preload(url), [url]);
+  const [err, setErr] = useState<ApiError | null>(null);
   const [st, setSt] = useState<"loading" | "ready" | "error">("loading");
+  const infoRef = useRef(onInfo);
+  infoRef.current = onInfo;
+  const load = useCallback(
+    () =>
+      loadServerImage(url).then(
+        (im) => {
+          setErr(null);
+          infoRef.current?.({ render: im.render, status: "ready" });
+          return im.src;
+        },
+        (e: unknown) => {
+          const ae = e instanceof ApiError ? e : new ApiError(0, String(e));
+          setErr(ae);
+          infoRef.current?.({ render: null, status: "error", errorStatus: ae.status, errorDetail: ae.message });
+          throw e;
+        },
+      ),
+    [url],
+  );
   return (
     <>
       <SmartImg baseKey={`${jobId}:${page}:${kind}:${format}:${version}`} srcKey={String(bucket)} load={load} alt={alt} className="layer-img" onState={setSt} />
       {st === "loading" && <Spinner />}
       {st === "error" && (
         <div className="layer-msg" role="status">
-          {kind === "original" ? t("view.loadFailed") : t("view.noRender")}
+          <p>{kind === "original" ? t("view.loadFailed") : t("view.noRender")}</p>
+          {kind !== "original" && reason && <p className="layer-msg__why">{reason}</p>}
+          {err && err.status !== 0 && err.message && !/^HTTP \d+$/.test(err.message) && (lang === "zh-Hant" || !hasCjk(err.message)) && (
+            <p className="layer-msg__detail">
+              <ServerText text={err.message} />
+            </p>
+          )}
         </div>
       )}
     </>
@@ -126,40 +180,80 @@ function CompareDivider({ split, onSplit }: { split: number; onSplit: (v: number
 
 /* ------------------------------------------------------------------ thumbnails */
 
+/** True once the element has come near the visible part of its scrolling strip (thumbnails load lazily). */
+function useNearView<T extends HTMLElement>(): [React.RefObject<T | null>, boolean] {
+  const ref = useRef<T>(null);
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || near) return;
+    if (typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
+    }
+    const io = new IntersectionObserver((entries) => entries.some((e) => e.isIntersecting) && setNear(true), { root: el.closest(".thumbs"), rootMargin: "0px 240px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [near]);
+  return [ref, near];
+}
+
 function Thumb({ state, index, active, onClick }: { state: State; index: number; active: boolean; onClick: () => void }) {
   const { t } = useI18n();
+  const [ref, near] = useNearView<HTMLButtonElement>();
   const done = state.phase === "done" && state.jobId && state.pages;
+  const doc = state.doc;
   const load = useCallback(() => {
-    if (state.doc) return state.doc.render(index, 160);
+    if (doc) return doc.render(index, 160, "thumb");
     if (state.jobId) return preload(api.pageImageUrl(state.jobId, index + 1, "original", { width: 160 }));
     return Promise.reject(new Error("none"));
-  }, [state.doc, state.jobId, index]);
+  }, [doc, state.jobId, index]);
+  const base = doc ? `l:${doc.id}:${index}` : `s:${state.jobId}:${index}`;
   return (
     <button
+      ref={ref}
       type="button"
       className={"thumb" + (active ? " is-active" : "")}
       aria-label={t("nav.thumbLabel", { n: index + 1 })}
       aria-current={active ? "page" : undefined}
       onClick={onClick}
       data-no-pan
+      data-done={done ? "1" : undefined}
     >
-      <SmartImg baseKey={`${done ? "s" : "l"}:${index}`} srcKey="t" load={load} alt="" className="thumb__img" />
+      {near && <SmartImg baseKey={base} srcKey="t" load={load} alt="" className="thumb__img" />}
       <span className="thumb__n">{index + 1}</span>
     </button>
   );
 }
 
+/* ------------------------------------------------------------------ progress */
+
+/** Only changes when the step (or page) changes, so screen readers are not told every percent. */
+function useStepAnnouncement(state: State): string {
+  const { t } = useI18n();
+  const p = state.progress;
+  if (state.phase === "uploading") return t("progress.uploadingShort");
+  if (p.finishing) return t("progress.finishing");
+  if (p.rerun) return t("progress.rerun");
+  if (!p.stage) return t("progress.queued");
+  const name = t(`stage.${p.stage}` as "stage.1");
+  return p.page != null && (p.pages ?? 0) > 1 && p.stage <= 4 ? t("progress.pageStage", { n: p.page, total: p.pages ?? 0, name }) : t("progress.stage", { n: p.stage, name });
+}
+
 /* ------------------------------------------------------------------ stage */
 
-export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel, onRetry, onCorrect }: StageProps) {
-  const { t } = useI18n();
+export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile, onDropFile, onCancel, onRetry, onCorrect, onJobMissing }: StageProps) {
+  const { t, lang } = useI18n();
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
   const [thumbs, setThumbs] = useState(false);
   const [split, setSplit] = useState(0.5);
   const [elements, setElements] = useState<{ key: string; data: PageElements | null; error: string | null } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [layer, setLayer] = useState<{ key: string; info: LayerInfo } | null>(null);
   const frameMsg = useFrameMessage(state.frameError);
+  const announcement = useStepAnnouncement(state);
+  const editReturnFocus = useRef<HTMLElement | null>(null);
 
   const total = pageCount(state);
   const index = state.pageIndex;
@@ -167,6 +261,15 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
   const isDone = state.phase === "done" && !!state.jobId && !!state.pages;
   const busy = state.phase === "uploading" || state.phase === "converting";
   const view: View = state.view;
+  const layerKey = `${state.jobId}:${index + 1}:${state.jobFormat}:${state.resultVersion}`;
+  const resultInfo = layer?.key === layerKey ? layer.info : null;
+  const onLayerInfo = useCallback(
+    (info: LayerInfo) => {
+      setLayer({ key: layerKey, info });
+      if (info.status === "error" && info.errorStatus === 404) onJobMissing();
+    },
+    [layerKey, onJobMissing],
+  );
 
   useEffect(() => setSelected(null), [index, state.editMode, state.resultVersion]);
 
@@ -180,18 +283,27 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
     api
       .getElements(state.jobId, index + 1)
       .then((data) => alive && setElements({ key: elKey, data, error: null }))
-      .catch((e) => alive && setElements({ key: elKey, data: null, error: e instanceof Error ? e.message : String(e) }));
+      .catch((e) => {
+        if (!alive) return;
+        if (e instanceof ApiError && e.status === 404) onJobMissing();
+        setElements({ key: elKey, data: null, error: t("edit.loadFailed") });
+      });
     return () => {
       alive = false;
     };
   }, [state.editMode, isDone, elKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ← → change pages anywhere on the page unless typing in a field or a dialog is open.
+  // ← → change pages unless the focus is on a control that uses the arrow keys itself.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
       const el = e.target as HTMLElement | null;
-      if (el && (el.closest("input, textarea, select, [contenteditable], [role=slider], [role=dialog], [role=menu]") || el.isContentEditable)) return;
+      if (
+        el &&
+        (el.closest("input, textarea, select, [contenteditable], [role=slider], [role=dialog], [role=menu], [role=radio], [role=radiogroup], [role=tab], [role=tablist], [role=switch]") ||
+          el.isContentEditable)
+      )
+        return;
       if (e.key === "ArrowLeft" || e.key === "PageUp") dispatch({ type: "SET_PAGE", index: state.pageIndex - 1 });
       else if (e.key === "ArrowRight" || e.key === "PageDown") dispatch({ type: "SET_PAGE", index: state.pageIndex + 1 });
       else return;
@@ -228,6 +340,8 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
 
   const geometry = useMemo(() => pageGeometry(page, state.doc, index), [page, state.doc, index]);
   const localSize = state.doc?.sizes[index];
+  const why = whyNotes(state.reportNotes);
+  const noRenderReason = why.length ? (lang === "zh-Hant" ? why.join(" ") : t("render.noneWhy")) : null;
 
   // What to draw, and its aspect ratio.
   let aspect = 1 / Math.SQRT2;
@@ -254,15 +368,34 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
       aspect = geometry.resultAspect;
       content = (info) => (
         <>
-          <ServerLayer jobId={jobId} page={p} kind={view} format={fmt} version={v} info={info} alt={alt(t(view === "result" ? "view.result" : "view.overlay"))} />
-          {view === "result" && state.editMode && elements?.data && <EditLayer elements={elements.data} selectedId={selected} onSelect={setSelected} />}
+          <ServerLayer
+            jobId={jobId}
+            page={p}
+            kind={view}
+            format={fmt}
+            version={v}
+            info={info}
+            alt={alt(t(view === "result" ? "view.result" : "view.overlay"))}
+            onInfo={onLayerInfo}
+            reason={noRenderReason}
+          />
+          {view === "result" && state.editMode && elements?.data && (
+            <EditLayer
+              elements={elements.data}
+              selectedId={selected}
+              onSelect={(id) => {
+                editReturnFocus.current = document.activeElement as HTMLElement | null;
+                setSelected(id);
+              }}
+            />
+          )}
         </>
       );
     } else {
       aspect = geometry.resultAspect;
       content = (info) => (
         <>
-          <ServerLayer jobId={jobId} page={p} kind="result" format={fmt} version={v} info={info} alt={alt(t("view.result"))} />
+          <ServerLayer jobId={jobId} page={p} kind="result" format={fmt} version={v} info={info} alt={alt(t("view.result"))} onInfo={onLayerInfo} reason={noRenderReason} />
           <div className="compare-clip" style={{ clipPath: `inset(0 ${(1 - split) * 100}% 0 0)` }}>
             <div className="compare-clip__orig" style={placementStyle}>
               <ServerLayer jobId={jobId} page={p} kind="original" format={null} version={v} info={{ ...info, pixelWidth: info.pixelWidth * (geometry.placement ? geometry.placement.w / geometry.width : 1) }} alt={alt(t("view.original"))} />
@@ -280,9 +413,25 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
     content = (info) => <LocalLayer doc={doc} index={index} info={info} alt={alt(state.file?.name ?? "")} />;
   }
 
-  const showNav = total > 0 && (state.phase !== "empty" && state.phase !== "opening");
+  const showNav = total > 0 && state.phase !== "empty" && state.phase !== "opening";
   const detected = isDone && !state.jobHadOriginSize ? detectedSizeMm(state.pages?.[0]) : null;
-  const pct = Math.round((state.phase === "uploading" ? (state.progress.upload ?? 0) * 0.05 : state.progress.fraction) * 100);
+  const uploading = state.phase === "uploading";
+  const pct = Math.round((uploading ? (state.progress.upload ?? 0) : state.progress.fraction) * 100);
+  const prog = state.progress;
+
+  // Who drew the result preview (only explained when it is not the output file itself).
+  let renderNote: string | null = null;
+  if (isDone && view !== "original" && resultInfo?.status === "ready") {
+    const kind = renderKind(resultInfo.render);
+    const app = targetApp(state.jobFormat, lang);
+    if (state.jobFormat === "svg_assets") renderNote = t("render.assets");
+    else if (kind === "neutral") {
+      renderNote = t("render.neutral", { app });
+      if (state.jobFormat === "docx_flow") renderNote += t("render.neutralFlow", { app });
+      if (LIBREOFFICE_PREVIEW.has(state.jobFormat ?? "")) renderNote += serverHasLibreOffice ? t("render.neutralLoFailed") : t("render.neutralLo");
+    } else if (kind === "standin") renderNote = t("render.standin", { app });
+  }
+  const scoreNone = isDone && state.score == null;
 
   return (
     <section
@@ -320,9 +469,9 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
       {content && (
         <Viewer
           aspect={aspect}
-          resetKey={`${index}:${view === "original" ? "o" : "r"}:${state.jobId ?? "local"}`}
+          resetKey={`${index}:${view === "original" ? "o" : "r"}:${state.jobId ?? "local"}:${state.doc?.id ?? 0}`}
           label={t("nav.pageLabel", { n: index + 1, total })}
-          inset={{ top: isDone ? 72 : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0), left: 24 }}
+          inset={{ top: isDone ? 72 : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0) + (isDone && (renderNote || scoreNone) ? 40 : 0), left: 24 }}
           disabled={busy}
         >
           {(info) => <div className={"page-sheet" + (view === "compare" && isDone ? " page-sheet--compare" : "")}>{content!(info)}</div>}
@@ -337,6 +486,11 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
               {state.score != null ? t("done.score", { pct: Math.round(state.score * 100) }) : t("done.scoreNone")}
             </span>
             {detected && <span className="chip">{t("done.detected", { w: fmtMm(detected.w), h: fmtMm(detected.h) })}</span>}
+            {prog.background && (
+              <span className="chip chip--busy" role="status">
+                <span className="spinner spinner--inline" aria-hidden="true" /> {t("done.updating")}
+              </span>
+            )}
           </div>
           <div
             className="view-tabs"
@@ -376,6 +530,7 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
                 type="button"
                 className={"tool-btn tool-btn--text" + (state.editMode ? " is-on" : "")}
                 aria-pressed={state.editMode}
+                disabled={prog.background}
                 onClick={() => dispatch({ type: "SET_EDIT", on: !state.editMode })}
               >
                 <Pencil size={16} />
@@ -386,11 +541,41 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
         </div>
       )}
 
-      {isDone && view === "overlay" && <p className="stage-note">{t("view.overlayHint")}</p>}
-      {isDone && state.editMode && view === "result" && (
-        <p className="stage-note" aria-live="polite">
-          {elements && !elements.data && !elements.error ? t("edit.loading") : elements?.error ? elements.error : t("edit.hint")}
-        </p>
+      {isDone && (renderNote || scoreNone || (view === "overlay") || (state.editMode && view === "result")) && (
+        <div className="stage-notes">
+          {view === "overlay" && <p className="stage-note">{t("view.overlayHint")}</p>}
+          {state.editMode && view === "result" && (
+            <p className="stage-note" aria-live="polite">
+              {elements && !elements.data && !elements.error ? t("edit.loading") : elements?.error ? elements.error : t("edit.hint")}
+            </p>
+          )}
+          {renderNote && (
+            <p className="stage-note stage-note--info" data-testid="render-note" data-render={resultInfo?.render ?? ""}>
+              <Info size={16} />
+              <span>{renderNote}</span>
+            </p>
+          )}
+          {scoreNone && (
+            <details className="stage-note stage-note--info stage-note--why" data-testid="score-why">
+              <summary>
+                <Info size={16} />
+                <span>
+                  {t("done.scoreNone")} · {t("done.scoreWhy")}
+                </span>
+              </summary>
+              <p>{t("done.scoreNoneWhy")}</p>
+              {why.length > 0 && (
+                <ul aria-label={t("done.serverNotes")}>
+                  {why.map((n, i) => (
+                    <li key={i}>
+                      <ServerText text={n} />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </details>
+          )}
+        </div>
       )}
 
       {/* Bottom: pages. */}
@@ -405,12 +590,13 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
               ))}
             </div>
           )}
-          <div className="page-nav" role="toolbar" aria-label={t("nav.thumbs")}>
+          <div className="page-nav" role="toolbar" aria-label={t("nav.toolbar")}>
             <button type="button" className="tool-btn" onClick={() => dispatch({ type: "SET_PAGE", index: index - 1 })} disabled={index <= 0} aria-label={t("nav.prev")} title={t("nav.prev")}>
               <ChevronLeft size={18} />
             </button>
-            <span className="page-nav__count" aria-live="polite" aria-label={t("nav.pageLabel", { n: index + 1, total })} data-testid="page-count">
-              {t("nav.pageOf", { n: index + 1, total })}
+            <span className="page-nav__count" aria-live="polite" data-testid="page-count">
+              <span className="visually-hidden">{t("nav.pageLabel", { n: index + 1, total })}</span>
+              <span aria-hidden="true">{t("nav.pageOf", { n: index + 1, total })}</span>
             </span>
             <button type="button" className="tool-btn" onClick={() => dispatch({ type: "SET_PAGE", index: index + 1 })} disabled={index >= total - 1} aria-label={t("nav.next")} title={t("nav.next")}>
               <ChevronRight size={18} />
@@ -431,38 +617,42 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
 
       {/* Converting. */}
       {busy && (
-        <div className="progress-panel" role="status" aria-live="polite" data-testid="progress">
+        <div className="progress-panel" data-testid="progress">
           <div className="progress-panel__box">
-            <p className="progress-panel__pct">{pct}%</p>
-            <p className="progress-panel__title">
-              {state.phase === "uploading"
-                ? t("progress.uploading", { pct: Math.round((state.progress.upload ?? 0) * 100) })
-                : state.progress.rerun
-                  ? t("progress.rerun")
-                  : state.progress.stage
-                    ? t("progress.stage", { n: state.progress.stage, name: t(`stage.${state.progress.stage}` as "stage.1") })
-                    : t("progress.queued")}
+            {/* One short line for screen readers, updated only when the step changes. */}
+            <p className="visually-hidden" role="status" aria-live="polite">
+              {announcement}
             </p>
-            <div className="progress-bar" aria-hidden="true">
+            <p className="progress-panel__pct" aria-hidden="true">
+              {pct}%
+            </p>
+            <p className="progress-panel__title" aria-hidden="true">
+              {uploading
+                ? t("progress.uploading", { pct })
+                : prog.finishing
+                  ? t("progress.finishing")
+                  : prog.rerun && !prog.stage
+                    ? t("progress.rerun")
+                    : announcement}
+            </p>
+            <div className="progress-bar" role="progressbar" aria-label={t("progress.converting")} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
               <span style={{ width: `${pct}%` }} />
             </div>
-            <ol className="steps" aria-label={t("progress.converting")}>
+            <ol className="steps" aria-hidden="true">
               {[1, 2, 3, 4, 5, 6, 7].map((n) => {
-                const cur = state.progress.stage;
+                // Pages go through steps 2–4 one by one; the indicator shows the furthest step reached (never goes back).
+                const cur = prog.finishing ? 8 : prog.maxStage ?? prog.stage;
                 const stateCls = cur == null ? "" : n < cur ? " is-done" : n === cur ? " is-current" : "";
                 return (
-                  <li key={n} className={"steps__item" + stateCls} aria-current={cur === n ? "step" : undefined}>
+                  <li key={n} className={"steps__item" + stateCls}>
                     <span className="steps__n">{n}</span>
                     <span className="steps__name">{t(`stage.${n}` as "stage.1")}</span>
                   </li>
                 );
               })}
             </ol>
-            {state.progress.page != null && (state.progress.pages ?? 0) > 1 && state.progress.stage != null && state.progress.stage <= 4 && (
-              <p className="progress-panel__page">{t("progress.page", { n: state.progress.page, total: state.progress.pages ?? 0 })}</p>
-            )}
             <button type="button" className="btn btn--outline-light" onClick={onCancel}>
-              {t("progress.cancel")}
+              {prog.rerun && state.pages ? t("progress.hide") : t("progress.cancel")}
             </button>
           </div>
         </div>
@@ -475,11 +665,28 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
             <Alert size={36} />
             <p className="progress-panel__title">{t("failed.title")}</p>
             <p className="progress-panel__error" data-testid="job-error">
-              {state.jobError === "network" ? t("err.network") : state.jobError}
+              {state.jobError ? t(state.jobError.key) : t("err.failedUnknown")}
             </p>
-            <button type="button" className="btn btn--light" onClick={onRetry}>
-              {t("failed.retry")}
-            </button>
+            {state.jobError?.detail &&
+              (lang === "zh-Hant" ? (
+                <p className="progress-panel__detail">{state.jobError.detail}</p>
+              ) : (
+                <details className="progress-panel__details">
+                  <summary>{t("err.detail")}</summary>
+                  <p>
+                    <ServerText text={state.jobError.detail} />
+                  </p>
+                </details>
+              ))}
+            {state.jobError?.retry === "none" ? (
+              <button type="button" className="btn btn--light" onClick={onPickFile}>
+                {t("failed.another")}
+              </button>
+            ) : (
+              <button type="button" className="btn btn--light" onClick={onRetry}>
+                {t("failed.retry")}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -503,7 +710,19 @@ export function Stage({ state, dispatch, maxMb, onPickFile, onDropFile, onCancel
       )}
 
       {selected && elements?.data && state.jobId && (
-        <EditDialog elements={elements.data} elementId={selected} page={index + 1} onClose={() => setSelected(null)} onApply={onCorrect} />
+        <EditDialog
+          elements={elements.data}
+          elementId={selected}
+          page={index + 1}
+          onClose={() => {
+            setSelected(null);
+            // Give the focus back to the element box that opened the dialog.
+            const back = editReturnFocus.current;
+            editReturnFocus.current = null;
+            requestAnimationFrame(() => back?.isConnected && back.focus());
+          }}
+          onApply={onCorrect}
+        />
       )}
     </section>
   );

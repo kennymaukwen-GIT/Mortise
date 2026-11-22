@@ -244,8 +244,6 @@ def font_file_info(family: str) -> Optional[dict]:
         return _FONT_FILE_CACHE[family]
     info = None
     try:
-        import subprocess
-
         from fontTools.ttLib import TTFont
 
         from ..tools import fontfind
@@ -300,11 +298,15 @@ def font_category(family: str, verification: Optional[str], east_asian: bool) ->
 
 
 def font_settings(cfg) -> dict:
-    """[export] 裡 docx_ 開頭的字型設定（沒寫的用預設值）。"""
+    """[export] 裡 docx_ 開頭的字型設定（沒寫的用預設值）。
+    docx_font_map 在設定檔裡寫成 [[推論的名稱, 寫入的名稱], ...]（TOML 的行內表格不能跨行），這裡轉成對照表。"""
     out = dict(FONT_DEFAULTS)
     if cfg is not None:
         sec = cfg.section("export")
         out.update({k: sec[k] for k in FONT_DEFAULTS if k in sec})
+    fm = out["docx_font_map"]
+    if not isinstance(fm, dict):
+        out["docx_font_map"] = {str(a): str(b) for a, b in fm}
     return out
 
 
@@ -1324,8 +1326,6 @@ def _advances(family: str, bold: bool) -> Optional[tuple]:
     if key not in _ADVANCE_CACHE:
         val = None
         try:
-            import subprocess
-
             from fontTools.ttLib import TTFont
 
             from ..tools import fontfind
@@ -1358,7 +1358,7 @@ def text_width_pt(text: str, family: str, size_pt: float, bold: bool = False) ->
 
 def worst_case_width_pt(paragraph: StyledParagraph, written: list[str], wide_fallbacks: Iterable[str] = ("DejaVu Sans",)) -> float:
     """一段單行字在「寫入的字型」與「找不到字型時常見的寬字型」之下，最寬會有多寬（pt）。有強制換行（\n）時取最寬的一行。
-    寫入的字型在伺服器上由 fc-match 對到字寬相容的字型（例如 Arial → Liberation Sans）；
+    寫入的字型在伺服器上由 mortise.tools.fontfind 對到字寬相容的字型（例如 Arial → Liberation Sans）；
     寬字型代表使用者裝置上沒有這個字型、被換成別的字型的情況（DejaVu Sans 與 Verdana 同屬最寬的一類無襯線字）。"""
     best = 0.0
     for fam in list(dict.fromkeys(list(written) + list(wide_fallbacks))):
@@ -1412,7 +1412,7 @@ def hard_breaks(sp: StyledParagraph, width_pt: float) -> Optional[StyledParagrap
 def condense_spacing(sp: StyledParagraph, ctx: Ctx, latin: str, max_ratio: float) -> list[int]:
     """版面固定模式：寫入的字型比⑤量測時用的字型寬（例如 Inter Display 寫成 Arial，寬約 3%）時，
     每個字緊縮一點字距，讓整段的寬度回到量測時的寬度，換行位置才會和原圖一樣，框不會因為多一行而往下長、蓋到下一個框。
-    兩個寬度都用伺服器上的字型檔量（寫入的字型由 fc-match 對到字寬相容的字型，例如 Arial → Liberation Sans）。
+    兩個寬度都用伺服器上的字型檔量（寫入的字型由 mortise.tools.fontfind 對到字寬相容的字型，例如 Arial → Liberation Sans）。
     只緊縮、不放寬；每字最多緊縮字級的 max_ratio；中日韓文字不處理。回傳每個文字段的字距（twip，0 表示不改）。"""
     out = []
     for r in sp.runs:
@@ -1445,8 +1445,6 @@ def font_first_baseline_em(family: str) -> Optional[float]:
         return _ASCENT_CACHE[family]
     val = None
     try:
-        import subprocess
-
         from fontTools.ttLib import TTFont
 
         from ..tools import fontfind

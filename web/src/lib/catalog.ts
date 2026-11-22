@@ -56,3 +56,34 @@ export const FALLBACK_PAGE_SIZES: PageSizePreset[] = [
 
 export const DEFAULT_ACCEPTED = ["application/pdf", "image/png", "image/jpeg"];
 export const DEFAULT_MAX_FILE_MB = 100;
+
+/** The application a format is opened in (used to explain whose drawing a preview is). */
+export function targetApp(format: string | null | undefined, lang: "en" | "zh-Hant"): string {
+  const zh = lang === "zh-Hant";
+  switch (format) {
+    case "pptx":
+    case "template":
+      return "PowerPoint";
+    case "google_slides":
+      return zh ? "Google 簡報" : "Google Slides";
+    case "docx_fixed":
+    case "docx_flow":
+      return "Word";
+    case "xlsx":
+      return "Excel";
+    case "idml":
+      return "InDesign";
+    case "ai_pdf":
+      return "Illustrator";
+    default:
+      return zh ? "目標軟體" : "the target application";
+  }
+}
+
+/** Formats whose server-side preview can come from LibreOffice when it is installed (see the API's image endpoint). */
+export const LIBREOFFICE_PREVIEW = new Set(["pptx"]);
+
+/** Short name for the closed format menu: the label without its trailing "(.ext)" (the open list keeps the full name). */
+export function shortFormatLabel(label: string): string {
+  return label.replace(/\s*[（(][^（()）]*[)）]\s*$/, "").trim() || label;
+}
