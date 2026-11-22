@@ -410,7 +410,7 @@ def _stroke_mask(geo: _Geom, P: dict) -> _Mask:
         c0 = c1 = sample.mean(axis=0)
         c1 = c0 + 1.0
     else:
-        _, _, centers = cv2.kmeans(sample, 2, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        _, _, centers = _kmeans(sample, 2, crit)
         c0, c1 = centers[0].astype(np.float64), centers[1].astype(np.float64)
     d = c1 - c0
     dd = float(d @ d) or 1.0
@@ -524,10 +524,35 @@ def _stroke_mask(geo: _Geom, P: dict) -> _Mask:
     return _Mask(cov, binary, ink, bg, g, polarity, level, contrast, rules, sigma_edge, blur, notes, 0.0, geo.f)
 
 
+def _kmeans(sample: np.ndarray, k: int, crit) -> tuple:
+    """k-means 分群（k 為 2 或 3），初始點用固定規則挑，不靠亂數。
+
+    原本用 OpenCV 的 k-means++ 挑初始點，它用的是 OpenCV 每個執行緒共用、會一直往前跑的亂數產生器：
+    同一行字第幾次被量，分群結果就不同（實測同一行字級 32.05 → 31.48 → 32.05 像素，字型分數 0.91 → 0.68），
+    結果取決於之前量過哪些字，測試也會因執行順序而時好時壞；只固定種子則是固定在某個不一定好的結果。
+    現在沿顏色分布的主軸取兩端（第 5 與第 95 百分位；k = 3 時再加中位數）最接近的實際像素當初始中心，
+    再讓 k-means 收斂：墨跡與底色一定落在兩端，結果只取決於輸入。"""
+    x = sample.astype(np.float64)
+    mean = x.mean(axis=0)
+    centered = x - mean
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    proj = centered @ vt[0]
+    qs = (5.0, 95.0) if k == 2 else (5.0, 50.0, 95.0)
+    seeds = np.array([x[int(np.argmin(np.abs(proj - np.percentile(proj, q))))] for q in qs])
+    if k > len(qs):
+        raise ValueError("k 只支援 2 或 3")
+    dist = ((x[:, None, :] - seeds[None, :, :]) ** 2).sum(axis=2)
+    labels = dist.argmin(axis=1).astype(np.int32).reshape(-1, 1)
+    if len(np.unique(labels)) < k:  # 顏色幾乎一樣：初始分群不足 k 群時，退回固定種子的 k-means++
+        cv2.setRNGSeed(0x6D6F7274)
+        return cv2.kmeans(sample, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    return cv2.kmeans(sample, k, labels, crit, 1, cv2.KMEANS_USE_INITIAL_LABELS)
+
+
 def _level3(crop: np.ndarray, sample: np.ndarray, in_band: np.ndarray, crit) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """第 3 級：K=3 分群，挑行框內佔比最高、外擴區佔比最低的一群當筆畫。"""
     try:
-        _, _, centers = cv2.kmeans(sample, 3, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        _, _, centers = _kmeans(sample, 3, crit)
     except cv2.error:
         return None
     centers = centers.astype(np.float64)

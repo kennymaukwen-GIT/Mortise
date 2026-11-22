@@ -480,3 +480,19 @@ if __name__ == "__main__":
     if "--fixtures" in sys.argv:
         for r in fixture_rows():
             print(f"   {r['file']:16s} {r['truth_pt']:6.2f} → {r['meas_pt']:6.2f}±{r['err_pt']:.2f} pt {r['font']:18s} got={r['got']} col={r['color_err']:.1f} {r['text'][:30]!r}")
+
+
+def test_same_input_same_result_regardless_of_history():
+    """同一行字量幾次、之前量過什麼，結果都要一樣。
+
+    以前顏色分群用 OpenCV 的 k-means++，它的亂數產生器是全域、會一直往前跑的：同一行字第幾次被量，
+    字級與字型分數就不同，完整測試因此會依執行順序時好時壞。這裡在兩次量測之間故意推動 OpenCV 的亂數產生器。"""
+    img, line, _ = synth_line("Liberation Sans", "Regular", "Riverside Park, gates open", 30, (40, 40, 40), (250, 245, 235), mode="screen")
+    first = measure_line(img, line, LIB)
+    for seed in (1, 12345, 987654321):
+        cv2.setRNGSeed(seed)
+        cv2.randu(np.zeros((64, 64), np.float32), 0, 1)
+        again = measure_line(img, line, LIB)
+        assert again.runs[0].font_size_px.value == first.runs[0].font_size_px.value
+        assert [f.family for f in again.runs[0].fonts[:3]] == [f.family for f in first.runs[0].fonts[:3]]
+        assert again.runs[0].fonts[0].score == first.runs[0].fonts[0].score
