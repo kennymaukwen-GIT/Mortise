@@ -76,36 +76,36 @@ def two_column_doc() -> StyledDoc:
                                                                          run(" +1 555 0199 Springfield, Exampleland", "Loma", 9.5)],
                                                           align=Align.RIGHT, lines=3, pitch=14.8)]),
         tb("box-sub", 33.9, 66.8, 70.2, 15.3, [para("p-sub", [run("Jordan A.", size=13.0, color=ACCENT)])], wrap=False),
-        tb("box-tag", 33.5, 87.3, 271.6, 16.5, [para("p-tag", [run("Data analysis · Urban research · Web & SEO", size=10.0)])], wrap=False),
+        tb("box-tag", 33.5, 87.3, 271.6, 16.5, [para("p-tag", [run("Quality control · Food science · Lab data", size=10.0)])], wrap=False),
         tb("box-skills", 33.2, 142.2, 36.0, 11.1, [para("p-skills", [run("S K I L L S", "Inter", 9.0, True, ACCENT)])], wrap=False),
         tb("box-main1", 198.3, 141.1, 377.5, 114.9, [
             para("p-profile", [run("P R O F I L E", "Carlito", 10.0, True, ACCENT)], pitch=12.9, after=13.1),
-            para("p-profile-text", [run("Final-year urban planning student with field research experience and two small client websites "
-                                        "built from scratch, including search and generative engine optimisation for a local bakery "
-                                        "and a neighbourhood bike repair shop.")], Align.JUSTIFY, 3, 12.9, 10.8),
+            para("p-profile-text", [run("Food science graduate with two years of laboratory work and a small shelf-life database "
+                                        "built from scratch, including automated weekly reports for a regional dairy cooperative "
+                                        "and a family-run cheese maker in the hills.")], Align.JUSTIFY, 3, 12.9, 10.8),
             para("p-exp", [run("E X P E R I E N C E", "Carlito", 11.0, True, ACCENT)], pitch=12.9, after=13.6),
-            para("p-job1", [run("NORTHWIND LTD — junior data analyst, Springfield", "FreeSans", 10.0, True)], pitch=12.9)]),
+            para("p-job1", [run("NORTHWIND FOODS — quality analyst, Springfield", "FreeSans", 10.0, True)], pitch=12.9)]),
         tb("box-sidebar1", 33.2, 167.9, 126.3, 120.0, [
-            para("p-s1", [run("Research & analysis", size=9.0, bold=True)], pitch=14.2, after=2.6),
-            para("p-s2", [run("Site surveys", "Loma", 9.5)], pitch=14.2),
-            para("p-s3", [run("Market research", "Loma", 9.5)], pitch=14.2),
-            para("p-s4", [run("Database building", size=9.5)], pitch=14.2, after=9.8),
+            para("p-s1", [run("Lab & testing", size=9.0, bold=True)], pitch=14.2, after=2.6),
+            para("p-s2", [run("Sample preparation", "Loma", 9.5)], pitch=14.2),
+            para("p-s3", [run("Shelf-life studies", "Loma", 9.5)], pitch=14.2),
+            para("p-s4", [run("Sensory panels", size=9.5)], pitch=14.2, after=9.8),
             para("p-s5", [run("LA N G U A G ES", "Liberation Mono", 10.0, color=ACCENT)], pitch=14.2, after=4.0),
-            para("p-s6", [run("English (native) · Spanish (B2)", size=9.5)], pitch=14.2)]),
+            para("p-s6", [run("English (native) · French (B2)", size=9.5)], pitch=14.2)]),
         tb("box-date1", 530.1, 243.9, 64.0, 11.8, [para("p-date1", [run("2025 – present", "FreeSans", 10.0)])], wrap=False),
         tb("box-bul1", 200.1, 257.5, 375.9, 54.0, [
-            para("p-b1", [run("• Cleaned and joined three years of footfall counts so the team could compare weekday and weekend "
-                              "demand by street and by month.")], lines=2, pitch=12.7, after=1.6),
-            para("p-b2", [run("• Built a small dashboard that shows vacancy rates per block and updates every Monday from a shared sheet.")],
+            para("p-b1", [run("• Tested incoming milk samples every morning and logged the results so the team could compare "
+                              "suppliers week by week and by season.")], lines=2, pitch=12.7, after=1.6),
+            para("p-b2", [run("• Built a small sheet that shows rejected batches per line and updates every Monday from the lab system.")],
                  lines=2, pitch=12.7)]),
-        tb("box-job2", 198.4, 330.0, 160.8, 13.4, [para("p-job2", [run("Riverside Studio — freelance", "Inter", 11.0, True)])], wrap=False),
+        tb("box-job2", 198.4, 330.0, 160.8, 13.4, [para("p-job2", [run("Riverside Kitchen — part-time", "Inter", 11.0, True)])], wrap=False),
         tb("box-date2", 511.3, 331.9, 82.3, 11.7, [para("p-date2", [run("Jan 2024 · 3 months", "FreeSans", 9.0)])], wrap=False),
-        tb("box-bul2", 198.2, 350.0, 397.0, 26.0, [para("p-b3", [run("• Designed and built a website for a neighbourhood bakery, including an "
-                                                                    "online pre-order form and a simple menu editor.")], lines=2, pitch=12.7)]),
+        tb("box-bul2", 198.2, 350.0, 397.0, 26.0, [para("p-b3", [run("• Designed and ran a shelf-life trial for a small farm shop, including a "
+                                                                    "simple tasting form and a printed results card.")], lines=2, pitch=12.7)]),
         tb("box-code", 33.2, 320.0, 120.0, 12.0, [para("p-code", [run("SELECT * FROM shops", "Liberation Mono", 8.0)])], wrap=False),
         tb("box-edu", 198.5, 400.0, 369.2, 30.0, [
-            para("p-edu", [run("BSc Urban Planning — Example University, 2021 – 2025", size=10.0, bold=True)], pitch=12.7, after=3.3),
-            para("p-edu2", [run("• Dissertation on walking distance and shop rents along a high street.")], pitch=12.7)]),
+            para("p-edu", [run("BSc Food Science — Example University, 2021 – 2025", size=10.0, bold=True)], pitch=12.7, after=3.3),
+            para("p-edu2", [run("• Dissertation on storage temperature and the shelf life of soft cheese.")], pitch=12.7)]),
     ]
     shapes = [
         StyledShape(id="shp-sidebar", box=Box(x=0.0, y=121.8, w=177.0, h=PAGE_H - 121.8), z=0, geometry="rect", fill=Color(r=243, g=242, b=238)),
@@ -195,6 +195,27 @@ def missing_chars(texts: list[str], pages: list[list[dict]]) -> str:
     return "".join(sorted((want - got).elements()))
 
 
+def baseline_drift(doc: StyledDoc, src_pdf: bytes, out_pdf: bytes) -> dict[str, float]:
+    """每個文字框第一段開頭幾個字：輸出（LibreOffice 轉的 PDF）與原圖 PDF 的基線高度差（pt，正值為往下）。
+    只比兩邊都只出現一次的開頭。"""
+    def chars(pdf):
+        d = pdfium.PdfDocument(pdf)
+        r = PageReader(d, 0)
+        H = d[0].get_size()[1]
+        out = [(c.text, H - c.origin[1]) for c in r.chars() if c.text.strip() and not c.generated]
+        r.close()
+        return out
+
+    S, G = chars(src_pdf), chars(out_pdf)
+    st, gt = "".join(c[0] for c in S), "".join(c[0] for c in G)
+    out = {}
+    for t in doc.pages[0].text_boxes:
+        key = norm_text("".join(r.text for r in t.paragraphs[0].runs))[:6]
+        if len(key) >= 3 and st.count(key) == 1 and gt.count(key) == 1:
+            out[key] = G[gt.index(key)][1] - S[st.index(key)][1]
+    return out
+
+
 def outside(lines: list[dict], w: float, h: float) -> list[str]:
     return [ln["text"] for ln in lines if ln["x1"] > w + 0.5 or ln["x0"] < -0.5 or ln["y1"] > h + 0.5]
 
@@ -261,8 +282,8 @@ def test_flow_side_by_side_blocks_are_tables(two_col):
     side, main = _cells(body)
     assert side.find(f"{q('w:tcPr')}/{q('w:shd')}").get(q("w:fill")) == "F3F2EE"  # 側欄底色是儲存格底色
     assert main.find(f"{q('w:tcPr')}/{q('w:shd')}") is None
-    assert "SKILLS" in norm_text(_text(side)) and "Sitesurveys" in norm_text(_text(side))
-    assert "PROFILE" in norm_text(_text(main)) and "NORTHWIND" in _text(main) and "Sitesurveys" not in norm_text(_text(main))
+    assert "SKILLS" in norm_text(_text(side)) and "Samplepreparation" in norm_text(_text(side))
+    assert "PROFILE" in norm_text(_text(main)) and "NORTHWIND" in _text(main) and "Samplepreparation" not in norm_text(_text(main))
     # 側欄底色貼齊紙邊：表格往左伸進邊界（負的縮排），左欄寬到填色矩形的右緣
     ind = int(body.find(f"{q('w:tblPr')}/{q('w:tblInd')}").get(q("w:w")))
     assert ind < 0
@@ -288,7 +309,7 @@ def test_flow_same_line_date_and_nested_row(two_col):
     nested = [t for t in root.iter(q("w:tbl")) if t.getparent().tag == q("w:tc")]
     assert len(nested) == 1 and len(_cells(nested[0])) == 2
     left, right = _cells(nested[0])
-    assert "Riverside Studio" in _text(left) and _text(right) == "Jan 2024 · 3 months"
+    assert "Riverside Kitchen" in _text(left) and _text(right) == "Jan 2024 · 3 months"
     assert right.find(f".//{q('w:jc')}").get(q("w:val")) == "right"
 
 
@@ -298,7 +319,7 @@ def test_flow_text_complete_and_in_order(two_col):
     for t in doc_texts(doc):
         assert norm_text(t).lstrip("•") in allt, t  # 項目符號改成 Word 的自動編號，不在文字裡
     # 閱讀順序：標題列（左→右）、側欄、主欄（上→下）
-    seq = ["JORDANAVERY", "Dataanalysis", "jordan.avery", "SKILLS", "Research&analysis", "SELECT", "PROFILE", "NORTHWIND", "2025–present", "Cleanedandjoined", "RiversideStudio", "Jan2024", "Designedandbuilt", "BScUrban"]
+    seq = ["JORDANAVERY", "Qualitycontrol", "jordan.avery", "SKILLS", "Lab&testing", "SELECT", "PROFILE", "NORTHWIND", "2025–present", "Testedincoming", "RiversideKitchen", "Jan2024", "Designedandran", "BScFood"]
     pos = [allt.index(norm_text(k)) for k in seq]
     assert pos == sorted(pos), list(zip(seq, pos))
 
@@ -449,7 +470,7 @@ def test_fixed_condenses_when_written_font_is_wider(two_col):
     if docx_common.font_file_info("Inter Display") is None or docx_common.text_width_pt("a", "Arial", 10) is None:
         pytest.skip("伺服器上沒有 Inter Display 或 Arial 的相容字型")
     root = xml_of(two_col["data"]["fixed"])
-    r = next(r for r in _anchor(root, "box-bul1").iter(q("w:r")) if "Cleaned" in "".join(t.text or "" for t in r.iter(q("w:t"))))
+    r = next(r for r in _anchor(root, "box-bul1").iter(q("w:r")) if "Tested" in "".join(t.text or "" for t in r.iter(q("w:t"))))
     sp = r.find(f"{q('w:rPr')}/{q('w:spacing')}")
     assert sp is not None and -20 < int(sp.get(q("w:val"))) < 0
 
@@ -499,6 +520,12 @@ def test_fixture_cv_two_column_end_to_end(tmp_path):
         if mode == "fixed":
             assert len(pages) == 1, (mode, fc)
         assert not missing_chars(doc_texts(doc), pages), (mode, fc)
+    # 正常字型下每個文字框開頭的基線位置和原圖比：可重排也要放回原位（空隙從「排出來的」行上下緣算，
+    # 不從貼著字的框算；原本每個框多一兩點，一頁累積 17 pt）
+    src = (FIXTURES / "cv_two_column.pdf").read_bytes()
+    for mode in ("fixed", "flow"):
+        drift = baseline_drift(doc, src, pdfs[(mode, "normal")])
+        assert len(drift) >= 20 and max(abs(d) for d in drift.values()) <= 3.0, (mode, drift)
 
 
 # ---------- 版面固定：行數多於原圖時緊縮字距 ----------
@@ -518,7 +545,7 @@ def test_wrapped_line_count_simulation():
 def test_fit_source_lines_condenses_only_when_needed():
     """原圖一行的字，寫入的字型（Arial ≈ Liberation Sans）量起來比框寬一點點：緊縮字距讓它回到一行；
     寬太多（超過上限）就不硬擠，照實回報行數。"""
-    text = "Produced and edited Facebook ad videos for the dealer and the agency."
+    text = "Presented the weekly test results to the plant manager and the buyers."
     w = docx_common.text_width_pt(text, "Arial", 10.0)
     if w is None:
         pytest.skip("伺服器上沒有與 Arial 字寬相容的字型")
@@ -533,10 +560,10 @@ def test_fit_source_lines_condenses_only_when_needed():
 
 
 def test_fixed_fits_paragraph_back_to_source_lines(tmp_path):
-    """仿照履歷的那一段：⑤配的驗證字型比原圖寬、第二行量起來超過框寬 → 版面固定在那一段緊縮字距，行數回到原圖，
-    框不會往下長、蓋到下面的框（原本「Produced and edited…」蓋到「Restaurant — Zhubei」）。"""
-    line1 = "• The dealer needed more online visibility; as more buyers now ask AI assistants which"
-    line2 = " business to choose, I proposed GEO (generative engine optimisation) alongside SEO."
+    """仿照真實案例的那一段（文字是虛構的）：⑤配的驗證字型比原圖寬、第二行量起來超過框寬 → 版面固定在那一段緊縮字距，行數回到原圖，
+    框不會往下長、蓋到下面的框（原本一段經歷的最後一行蓋到下一個經歷標題）。"""
+    line1 = "• The dairy wanted fewer rejected batches; as more buyers now ask for test results with"
+    line2 = " every order, I proposed a shared results sheet (updated after each test) alongside labels."
     w2 = docx_common.text_width_pt(line2.strip(), "Arial", 10.0)
     if w2 is None:
         pytest.skip("伺服器上沒有與 Arial 字寬相容的字型")

@@ -19,6 +19,8 @@
   | 整頁底圖 background_image  | 整頁浮動圖片，最底層、文字後方                                 | 無損（記一筆非有損的說明） |
   | 文字框（位置、大小、旋轉） | 浮動文字方塊 wps:wsp，相對頁面定位（EMU），a:xfrm rot           | 無損     |
   | 文字框 wrap                | wps:bodyPr wrap="square"／"none"                              | 無損     |
+  | 單行文字框                 | 依最寬的常見字型留足寬度；貼近右側紙邊的改靠右、往左加寬        | 無損（記錄） |
+  | 原圖的行數                 | 寫入的字型會多排出行數時緊縮字距（w:spacing），行數回到原圖      | 字距有損（記錄）；緊縮到上限仍放不下時框會往下長 |
   | 段落與字元格式             | 文字方塊內的段落，全部屬性明寫（並套具名樣式）                  | 見 docx_common |
   | 圖片                       | 浮動圖片 pic:pic，相對頁面定位，可旋轉                          | 無損     |
   | 形狀 rect、ellipse          | wps:wsp 的 prstGeom rect、ellipse                             | 無損     |
@@ -218,7 +220,7 @@ def _single_line_room(item, x: float, w: float, W: float, ctx: Ctx, params: dict
 def _fit_lines(item, paras, spacing, w: float, ctx: Ctx, latin: str, params: dict) -> list:
     """會自動換行的框：逐段用寫入的字型模擬換行，比原圖多出行數的段落再緊縮字距（見 docx_common.fit_source_lines）。
     為什麼需要：⑤選的驗證字型不一定和原圖的字一樣寬（例如履歷的一段被配上較寬的字型、第二行量起來就超過框寬），
-    原樣輸出時目標軟體會多排一行，框往下長，蓋到下面的框（例如「Produced and edited…」那一行蓋到「Restaurant — Zhubei」）。"""
+    原樣輸出時目標軟體會多排一行，框往下長，蓋到下面的框（例如一段經歷的最後一行蓋到下一個經歷的標題）。"""
     out = []
     for sp, sv in zip(paras, spacing):
         if not sp.runs or any("\n" in r.text for r in sp.runs):
@@ -233,6 +235,13 @@ def _fit_lines(item, paras, spacing, w: float, ctx: Ctx, latin: str, params: dic
             ctx.degrade(item.id, "換行", f"原圖 {target} 行，寫入的字型會排成 {before} 行，緊縮字距到上限仍放不下：框會往下長", True)
         out.append(new if any(new) else sv)
     return out
+
+
+def _left_edge_shared(item, page: StyledPage, tol: float = 1.0) -> bool:
+    """單行、被判成置中、左緣和本頁另一個文字框的左緣在 tol（pt）以內的文字框。"""
+    if len(item.paragraphs) != 1 or item.paragraphs[0].align != Align.CENTER or item.paragraphs[0].source_line_count > 1:
+        return False
+    return any(o.id != item.id and abs(o.box.x - item.box.x) <= tol for o in page.text_boxes)
 
 
 def _page_items(page: StyledPage) -> list[tuple[int, int, str, object]]:
@@ -294,6 +303,11 @@ def _add_page(docx_doc, page: StyledPage, ctx: Ctx, styles: dict[str, WordStyle]
                 if all(h is not None for h in hb) and any(h is not sp for h, sp in zip(hb, paras)):
                     paras, wrap = hb, False
                     ctx.degrade(item.id, "斷行", "靠右或置中的多行字：照原圖的斷行位置寫成強制換行，框留足寬度（換了字型也不會改變斷行）", False)
+            if not wrap and not rot and _left_edge_shared(item, page):
+                # 單獨一行看不出是置中還是靠左；左緣和別的文字框對齊（例如經歷標題和上面的段落標題同一條左緣），就是靠左：
+                # 照置中輸出的話，換成較寬的字型時字往兩邊長，左緣就離開那條線
+                paras = [sp.model_copy(update={"align": Align.LEFT}) for sp in paras]
+                ctx.degrade(item.id, "對齊", "單行置中字的左緣與其他文字框對齊：當成靠左（字變寬時往右長，左緣不動）", False)
             if not wrap and not rot:  # 旋轉的框以中心旋轉，加寬會移動中心，不加
                 x, w, align_override = _single_line_room(item, x, w, W, ctx, params, s, paras)
             spacing = [condense_spacing(sp, ctx, latin, params["condense_max_ratio"]) if params["condense_wider_fonts"] and not rot else None

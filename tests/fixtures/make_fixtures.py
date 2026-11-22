@@ -812,15 +812,15 @@ def cv_two_column() -> None:
     # 頁首：姓名在左、聯絡方式靠右
     text(34, 58, "RILEY QUINN", 26, "LSB")
     text(34, 80, "Riley Q.", 12, color=accent)
-    text(34, 99, "Data analysis · Urban research · Web & SEO", 9.5, color=grey)
+    text(34, 99, "Quality control · Food science · Lab data", 9.5, color=grey)
     for top, s in ((68, "riley.quinn@example.com"), (81, "+1 555 0100"), (94, "Springfield, Exampleland")):
         text(562, top, s, 9, color=accent if "@" in s else grey, align="right")
     # 側欄
     y = 150
-    for head, groups in (("SKILLS", [("Research & analysis", ["Site surveys", "Market research", "Database building"]),
-                                      ("Digital", ["Website design", "SEO and GEO", "AI-assisted coding"])]),
-                         ("SOFTWARE", [(None, ["Notion", "QGIS", "AutoCAD", "Rhino", "Office suite"])]),
-                         ("LANGUAGES", [(None, ["English (native)", "Spanish (B2)"])])):
+    for head, groups in (("SKILLS", [("Lab & testing", ["Sample preparation", "Shelf-life studies", "Sensory panels"]),
+                                      ("Digital", ["Spreadsheet models", "Label layout", "Python scripting"])]),
+                         ("SOFTWARE", [(None, ["LabWare", "Minitab", "Excel", "R", "Office suite"])]),
+                         ("LANGUAGES", [(None, ["English (native)", "French (B2)"])])):
         text(33, y, head, 8.5, "LSB", accent, space=1.6)
         rule(33, 160, y + 7)
         y += 26
@@ -852,33 +852,33 @@ def cv_two_column() -> None:
 
     heading(150, "PROFILE")
     top = 176
-    for line in wrap("Final-year urban planning student with field research experience and two small client websites built "
-                     "from scratch, including search and generative engine optimisation for a local bakery.", "LS", 9, x1 - x0):
+    for line in wrap("Food science graduate with two years of laboratory work and a small shelf-life database built "
+                     "from scratch, including automated weekly reports for a regional dairy cooperative.", "LS", 9, x1 - x0):
         text(x0, top, line, 9, color=grey)
         top += 12.5
     heading(top + 12, "EXPERIENCE")
     top += 38
-    jobs = [("NORTHWIND LTD — junior data analyst, Springfield", "2025 – present",
-             ["Cleaned and joined three years of footfall counts so the team could compare weekday and weekend demand by street.",
-              "Built a small dashboard that shows vacancy rates per block and updates every Monday from a shared sheet.",
-              "Wrote a short guide on naming fields consistently, now used by four new colleagues.",
-              "Presented the findings to the client in a twenty-minute review."]),
-            ("Riverside Studio — freelance web projects", "Jan 2024 · 3 months",
-             ["Designed and built a website for a neighbourhood bakery, including an online pre-order form.",
-              "Rewrote page titles and descriptions around the words real customers search for; visits doubled in two months."]),
-            ("Volunteer mapping project", "2023",
-             ["Surveyed street trees with a phone app and checked every record against aerial photos before upload.",
-              "Trained six volunteers to use the same checklist so the data stayed consistent."])]
+    jobs = [("NORTHWIND FOODS — quality analyst, Springfield", "2025 – present",
+             ["Tested incoming milk samples every morning and logged the results so the team could compare suppliers week by week.",
+              "Built a small sheet that shows rejected batches per line and updates every Monday from the lab system.",
+              "Wrote a short guide on labelling samples consistently, now used by four new colleagues.",
+              "Presented the findings to the plant manager in a monthly review."]),
+            ("Riverside Kitchen — part-time lab projects", "Jan 2024 · 3 months",
+             ["Designed and ran a shelf-life trial for a small farm shop, including a simple tasting form.",
+              "Rewrote the allergen labels around the words real customers look for; complaints halved in two months."]),
+            ("Volunteer food bank project", "2023",
+             ["Sorted donated stock with a phone app and checked every expiry date against the label before storage.",
+              "Trained six volunteers to use the same checklist so the records stayed consistent."])]
     for title, date, items in jobs:
         text(x0, top, title, 9.5, "LSB")
         text(x1, top, date, 8.5, color=grey, align="right")
         top = bullets(top + 16, items) + 8
     heading(top + 6, "EDUCATION")
     top += 32
-    text(x0, top, "BSc Urban Planning — Example University", 9.5, "LSB")
+    text(x0, top, "BSc Food Science — Example University", 9.5, "LSB")
     text(x1, top, "2021 – 2025", 8.5, color=grey, align="right")
-    bullets(top + 16, ["Dissertation on how walking distance to a station changes shop rents along a high street.",
-                       "Exchange term at a partner university abroad (urban design studio)."])
+    bullets(top + 16, ["Dissertation on how storage temperature changes the shelf life of soft cheese in small shops.",
+                       "Exchange term at a partner university abroad (dairy technology lab)."])
     c.showPage()
     c.save()
 

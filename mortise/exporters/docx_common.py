@@ -1680,6 +1680,33 @@ def fit_source_lines(sp: StyledParagraph, width_pt: float, ctx: Ctx, latin: str,
     return spacing, before, count(limit)
 
 
+# ---------- 字型量度（基線補償、估計行高用） ----------
+
+_LINE_HEIGHT_CACHE: dict[str, Optional[float]] = {}
+
+
+def font_line_height_em(family: str) -> Optional[float]:
+    """文字引擎（LibreOffice）單倍行距的行高，以 em 為單位：hhea 的上緣 − 下緣 + 行距間隙（例如 Liberation Sans 約 1.15）。
+    用伺服器上實際的字型檔（mortise.tools.fontfind 找到的；寫入的名稱對到字寬相容的字型）；找不到就回傳 None。"""
+    if family in _LINE_HEIGHT_CACHE:
+        return _LINE_HEIGHT_CACHE[family]
+    val = None
+    try:
+        from fontTools.ttLib import TTFont
+
+        from ..tools import fontfind
+
+        m = fontfind.match(family)
+        if m is not None:
+            f = TTFont(m.path, fontNumber=m.index, lazy=True)
+            hhea, upm = f["hhea"], f["head"].unitsPerEm
+            val = (hhea.ascent - hhea.descent + max(0, hhea.lineGap)) / upm
+    except Exception:
+        val = None
+    _LINE_HEIGHT_CACHE[family] = val
+    return val
+
+
 # ---------- 字型量度（基線補償用） ----------
 
 _ASCENT_CACHE: dict[str, Optional[float]] = {}
