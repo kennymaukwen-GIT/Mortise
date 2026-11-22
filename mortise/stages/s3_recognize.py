@@ -376,6 +376,8 @@ def _rect_of(path: pdf.RawPath, tol: float) -> tuple[float, float, float, float]
             pts.append((p[1], p[2]))
     if len(pts) >= 2 and abs(pts[0][0] - pts[-1][0]) <= tol and abs(pts[0][1] - pts[-1][1]) <= tol:
         pts = pts[:-1]
+    if len(pts) > 32:
+        return None  # 矩形不會有這麼多點；幾萬點的長路徑不必往下檢查（下面的迴圈對點數是平方時間）
     changed = True
     while changed and len(pts) > 4:  # 去掉落在邊上的中間點（有些軟體從邊的中點起筆）
         changed = False
@@ -478,7 +480,25 @@ def _rounded_rect_of(segs: list[list], tol: float) -> tuple[tuple[float, float, 
             if abs(prev[0] - end[0]) > tol and abs(prev[1] - end[1]) > tol:
                 return None  # 斜線：不是圓角矩形
         else:
-            radii.append((abs(end[0] - prev[0]) + abs(end[1] - prev[1])) / 2)
+            dx, dy = abs(end[0] - prev[0]), abs(end[1] - prev[1])
+            rad = (dx + dy) / 2
+            slack = max(0.15 * rad, tol)
+            if abs(dx - dy) > slack:
+                return None  # 圓角的橫向與縱向半徑不同（橢圓角）：形狀表示不了
+            # 圓角的兩端必須一個在上下邊、一個在左右邊；圓心是「上下邊那一端的 x、左右邊那一端的 y」
+            on_h = [min(abs(q[1] - b), abs(q[1] - t)) <= tol for q in (prev, end)]
+            on_v = [min(abs(q[0] - l), abs(q[0] - r)) <= tol for q in (prev, end)]
+            if on_h[0] and on_v[1]:
+                cx, cy = prev[0], end[1]
+            elif on_v[0] and on_h[1]:
+                cx, cy = end[0], prev[1]
+            else:
+                return None  # 曲線的端點不在外框的邊上：是不規則的圓弧形（或被旋轉過），不是圓角矩形
+            mx = 0.125 * prev[0] + 0.375 * sg[1] + 0.375 * sg[3] + 0.125 * end[0]
+            my = 0.125 * prev[1] + 0.375 * sg[2] + 0.375 * sg[4] + 0.125 * end[1]
+            if abs(math.hypot(mx - cx, my - cy) - rad) > slack:
+                return None  # 曲線的中點不在圓弧上
+            radii.append(rad)
         prev = end
     rad = sum(radii) / 4
     if rad <= tol or max(radii) - min(radii) > max(0.15 * rad, tol) or rad > min(r - l, t - b) / 2 + tol:
@@ -676,14 +696,14 @@ def _read_paths(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: f
                     region = _clip_region([region, [(SEG_MOVETO, rect[0], rect[1], False), (SEG_LINETO, rect[2], rect[1], False), (SEG_LINETO, rect[2], rect[3], False), (SEG_LINETO, rect[0], rect[3], True)]])
                 elif not (rect[0] <= cl + 1e-3 and rect[1] <= cb + 1e-3 and rect[2] >= cr - 1e-3 and rect[3] >= ct - 1e-3):
                     region = None
-                elif info is None and sum(1 for q in region if q[0] == SEG_MOVETO) != 1:
-                    region = None  # 不知道裁切用哪一種填色規則，而路徑有好幾圈：不猜
+                elif (info is None or info.clip_rule == "mixed") and pdf.convex_polygon(region) is None:
+                    region = None  # 不知道這條裁切路徑用哪一種填色規則，而它不是單純的凸多邊形（規則會影響結果）：不猜
             else:
                 region = None
             if region is None:
                 reason = "clipped"
             else:
-                fill_rule = info.clip_rule if info is not None and pdf.segments_rect(region) is None else "nonzero"
+                fill_rule = info.clip_rule if info is not None and info.clip_rule != "mixed" and pdf.segments_rect(region) is None else "nonzero"
                 p = pdf.RawPath(z=p.z, points=list(region), fill=p.fill, stroke=None, stroke_width=0.0, nested=p.nested, _obj=p._obj, fill_rule=fill_rule, paint=p.paint, forms=p.forms)
                 visual = False
         if reason is None and gradient is not None and not _gradient_covers(gradient, p.points):
@@ -703,6 +723,8 @@ def _read_paths(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: f
             reason = "group" if info.in_group else ("soft_mask" if info.soft_mask else "blend")
         elif region is None:
             reason, detail = ("gradient", "漸層的範圍由好幾條裁切路徑交出來") if sh.clip else ("page_gradient", "")
+        elif info.clip_rule == "mixed" and pdf.convex_polygon(region) is None:
+            reason, detail = "gradient", "漸層的範圍由裁切路徑決定，但無法確認它的填色規則"
         elif not _gradient_covers(info.gradient, region):
             reason, detail = "gradient", "漸層沒有延伸到整個形狀"
         if region is None:
@@ -710,7 +732,7 @@ def _read_paths(reader: pdf.PageReader, spec: PageSpec, m: list[float], src_w: f
             region = [(SEG_MOVETO, l, b, False), (SEG_LINETO, r, b, False), (SEG_LINETO, r, t, False), (SEG_LINETO, l, t, True)]
         gradient = info.gradient if reason is None else None
         fill = _gradient_color(gradient, 1.0) if gradient is not None else Color(r=128, g=128, b=128)
-        rule = info.clip_rule if info is not None and pdf.segments_rect(region) is None else "nonzero"
+        rule = info.clip_rule if info is not None and info.clip_rule != "mixed" and pdf.segments_rect(region) is None else "nonzero"
         fake = pdf.RawPath(z=sh.z, points=list(region), fill=(fill.r, fill.g, fill.b, 255), stroke=None, stroke_width=0.0, nested=sh.nested, _obj=sh._obj, fill_rule=rule, paint=info, forms=sh.forms)
         item = _path_item(fake, m, fill, None, rule, gradient, reason, detail, False)
         if item is not None:
@@ -785,6 +807,7 @@ class GlyphRow:
     owners: list[int]  # 每個字形來自第幾條路徑（傳入清單中的位置）
     baseline: float  # 基線的 y
     height: float  # 主要字形高度的中位數
+    pieces: list[int] = field(default_factory=list)  # 併成字形之前的每一塊各來自第幾條路徑（判斷「這條路徑是不是大多落在行裡」用）
 
 
 @dataclass
@@ -810,22 +833,62 @@ def _contour_boxes(path: list[list[float]]) -> list[tuple[float, float, float, f
     return [tuple(b) for b in out if b[2] >= b[0]]
 
 
+def _merge_overlapping(boxes: list[tuple[float, float, float, float]], owners: list[int] | None = None) -> tuple[list[tuple[float, float, float, float]], list[int]]:
+    """同一行裡，水平位置大幅重疊（重疊超過較窄那個的一半）的外框併成一個字形：i 的點、冒號的兩點、重音符號、上下結構。
+    只是邊緣稍微交疊的不併（AV 這類字距緊的相鄰字母）。回傳（由左到右的外框、每個外框的主人：面積最大那一塊的）。"""
+    order = sorted(range(len(boxes)), key=lambda k: boxes[k][0])
+    merged: list[list[float]] = []
+    owner: list[int] = []
+    biggest: list[float] = []
+    for k in order:
+        b = boxes[k]
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        if merged:
+            last = merged[-1]
+            overlap = min(last[2], b[2]) - max(last[0], b[0])
+            if overlap >= 0.5 * min(last[2] - last[0], b[2] - b[0]) and overlap > 0:
+                last[0], last[1], last[2], last[3] = min(last[0], b[0]), min(last[1], b[1]), max(last[2], b[2]), max(last[3], b[3])
+                if area > biggest[-1]:
+                    biggest[-1] = area
+                    owner[-1] = owners[k] if owners is not None else k
+                continue
+        merged.append(list(b))
+        owner.append(owners[k] if owners is not None else k)
+        biggest.append(area)
+    return [tuple(b) for b in merged], owner
+
+
 def _glyph_blobs(path: list[list[float]]) -> list[tuple[float, float, float, float]]:
-    """把一條路徑拆成「字形」：去掉包在別圈裡面的圈（字的孔），再把水平位置重疊的圈併在一起（i 的點、上下結構）。
-    一條路徑只畫一個字時得到一個外框；整個詞或整行畫成一條路徑時得到好幾個。"""
+    """把一條路徑拆成「字形」的外框。一條路徑可能只畫一個字，也可能畫了整個詞、整行、甚至好幾行：
+      1. 去掉包在別圈裡面的圈（字的孔）；
+      2. 依上下位置分成幾帶（好幾行字畫成一條路徑時，每行一帶），比最高的一帶矮很多的是零件（i 的點、重音符號），併到最近的一帶；
+      3. 每一帶裡，水平位置大幅重疊的圈併成一個字形。"""
     boxes = _contour_boxes(path)
     if len(boxes) <= 1:
         return boxes
     outer = [b for i, b in enumerate(boxes) if not any(j != i and o[0] <= b[0] and o[1] <= b[1] and o[2] >= b[2] and o[3] >= b[3] and (o != b or j < i) for j, o in enumerate(boxes))]
-    outer.sort()
-    merged: list[list[float]] = []
-    for b in outer:
-        if merged and b[0] <= merged[-1][2]:
-            last = merged[-1]
-            last[1], last[2], last[3] = min(last[1], b[1]), max(last[2], b[2]), max(last[3], b[3])
+    bands: list[list] = []  # 每一帶：[上緣, 下緣, 這一帶的外框]
+    for b in sorted(outer, key=lambda q: q[1]):
+        if bands and b[1] <= bands[-1][1]:
+            bands[-1][1] = max(bands[-1][1], b[3])
+            bands[-1][2].append(b)
         else:
-            merged.append(list(b))
-    return [tuple(b) for b in merged]
+            bands.append([b[1], b[3], [b]])
+    while len(bands) > 1:
+        tallest = max(band[1] - band[0] for band in bands)
+        small = next((i for i, band in enumerate(bands) if band[1] - band[0] < 0.5 * tallest), None)
+        if small is None:
+            break
+        above = bands[small][0] - bands[small - 1][1] if small > 0 else math.inf
+        below = bands[small + 1][0] - bands[small][1] if small + 1 < len(bands) else math.inf
+        target = small - 1 if above <= below else small + 1
+        lo, hi = min(small, target), max(small, target)
+        bands[lo] = [bands[lo][0], bands[hi][1], bands[lo][2] + bands[hi][2]]
+        del bands[hi]
+    out: list[tuple[float, float, float, float]] = []
+    for _, _, members in bands:
+        out += _merge_overlapping(members)[0]
+    return out
 
 
 def glyph_rows(paths: list[list[list[float]]], c: dict, suspected: bool = False, free: list[bool] | None = None) -> list[GlyphRow]:
@@ -897,6 +960,8 @@ def glyph_rows(paths: list[list[list[float]]], c: dict, suspected: bool = False,
         overlap = float(np.clip(xs[:-1, 2] - xs[1:, 0], 0, None).sum())
         if overlap > 0.2 * float((xs[:, 2] - xs[:, 0]).sum()):
             continue  # 字是一個接一個排的，不會大量左右重疊
+        if len(np.unique(np.round(widths / (0.05 * hm)))) < (2 if len(main) < 6 else 3):
+            continue  # 字母有寬有窄；一排一模一樣的圖示（箭頭、星星、樹）不是字
         bottoms, centers = arr[main, 3], (arr[main, 1] + arr[main, 3]) / 2
         base = float(np.median(bottoms))
         share = max(float(np.mean(np.abs(bottoms - base) <= 0.15 * hm)), float(np.mean(np.abs(centers - np.median(centers)) <= 0.15 * hm)))
@@ -904,8 +969,9 @@ def glyph_rows(paths: list[list[list[float]]], c: dict, suspected: bool = False,
             continue  # 沒有沿著同一條基線（或同一條中線）排
         if free is not None and sum(1 for k in main if free[owner[order[int(k)]]]) < 0.5 * len(main):
             continue
-        by_x = sorted(members, key=lambda k: arr[k, 0])
-        rows.append(GlyphRow(boxes=[tuple(float(v) for v in arr[k]) for k in by_x], owners=[owner[order[k]] for k in by_x], baseline=base, height=hm))
+        pieces = [owner[order[k]] for k in members]
+        boxes, owners = _merge_overlapping([tuple(float(v) for v in arr[k]) for k in members], pieces)  # 不同路徑的零件（分開畫的點）也併回字形
+        rows.append(GlyphRow(boxes=boxes, owners=owners, baseline=base, height=hm, pieces=pieces))
     return rows
 
 
@@ -929,7 +995,7 @@ def _glyph_blocks(cands: list[_Path], c: dict, suspected: bool) -> list[tuple[li
     total = Counter()
     for i, it in enumerate(pool):
         total[i] = len(_glyph_blobs(it.rel))
-    in_rows = Counter(o for row in rows for o in row.owners)
+    in_rows = Counter(o for row in rows for o in row.pieces)
     texty = {i for i in in_rows if in_rows[i] >= 0.8 * max(total[i], 1)}
     rows = [row for row in rows if sum(1 for o in row.owners if o in texty) >= 0.8 * len(row.owners)]
     if not rows:
@@ -1036,20 +1102,21 @@ def _settle_order(clusters: list[list[_Path]], drawn: _Drawn, taken: set[int], c
             zs = np.array([it.z for it in members], dtype=np.int64)
             boxes = np.array([it.vbox for it in members], dtype=float)
             lo, hi = int(np.searchsorted(drawn.z, zs[0], side="right")), int(np.searchsorted(drawn.z, zs[-1], side="left"))
-            own = set(int(v) for v in zs)
+            l, t, r, b = boxes[:, 0].min(), boxes[:, 1].min(), boxes[:, 2].max(), boxes[:, 3].max()
             conflicts = []
-            for k in range(lo, hi):
-                fz = int(drawn.z[k])
-                if fz in own:
-                    continue
-                fb = drawn.box[k]
-                above = zs > fz
-                if bool(np.any(above & (boxes[:, 0] < fb[2] - eps) & (boxes[:, 2] > fb[0] + eps) & (boxes[:, 1] < fb[3] - eps) & (boxes[:, 3] > fb[1] + eps))):
-                    conflicts.append(k)
+            if hi > lo:
+                # 夾在中間的物件可能有幾萬個：先整批篩掉「不是這一群的、外框碰不到整群外框的」，剩下的才逐一確認
+                between = drawn.box[lo:hi]
+                near = (between[:, 0] < r - eps) & (between[:, 2] > l + eps) & (between[:, 1] < b - eps) & (between[:, 3] > t + eps)
+                near &= ~np.isin(drawn.z[lo:hi], zs)
+                for k in np.nonzero(near)[0] + lo:
+                    fb = drawn.box[k]
+                    later = boxes[int(np.searchsorted(zs, drawn.z[k], side="right")):]  # 這一群裡畫在它後面的路徑
+                    if bool(np.any((later[:, 0] < fb[2] - eps) & (later[:, 2] > fb[0] + eps) & (later[:, 1] < fb[3] - eps) & (later[:, 3] > fb[1] + eps))):
+                        conflicts.append(int(k))
             if not conflicts:
                 done.append(members)
                 break
-            l, t, r, b = boxes[:, 0].min(), boxes[:, 1].min(), boxes[:, 2].max(), boxes[:, 3].max()
             area = max((r - l) * (b - t), 1e-12)
             absorbed = []
             for k in conflicts:
@@ -1090,9 +1157,11 @@ def _group_paths(paths: list[_Path], reader: pdf.PageReader, m: list[float], c: 
          矩形、直線這些基本形狀不會因為靠近就被吸進來，所以表格格線、文字的底線與框、色塊都維持是形狀。
       2. 疑似文字轉外框的路徑先挑出來，自己成群（kind 為 outlined_text），不和插畫混在一起。
       3. 合成一群後前後順序不能錯（見 _settle_order）：中間被文字或圖片隔開的群會被切開。
-      4. 一群至少要有 pdf_vector_min_paths 條路徑、pdf_vector_min_segments 段線段才算向量圖；
-         不夠的（單獨的箭頭、三角形）照舊各自變成形狀。形狀表示不了的路徑（漸層、線段太多）單獨一條也成一個向量圖。
-      5. 零散的自由路徑如果多到超過 max_vector_paths，不各自變成形狀，依繪製順序合成向量圖。"""
+      4. 一群至少要有 pdf_vector_min_paths 條路徑、pdf_vector_min_segments 段線段才算向量圖；全部只有直線的群
+         （箭頭、三角形、折線這類辦公軟體常見的圖形）要更多條（pdf_vector_min_straight_paths）才算。
+         不夠的照舊各自變成形狀。形狀表示不了的路徑（漸層、線段太多）單獨一條也成一個向量圖。
+      5. 零散的自由路徑如果多到超過 max_vector_paths，不各自變成形狀，依繪製順序合成向量圖。
+      6. 分出來的向量圖超過 pdf_vector_max_groups 個時（地圖、工程圖），不再細分，依繪製順序合併成幾層。"""
     cands = [it for it in paths if it.reason is None and it.role == ""]
     if not cands:
         return []
@@ -1116,12 +1185,15 @@ def _group_paths(paths: list[_Path], reader: pdf.PageReader, m: list[float], c: 
     gap_ratio = float(c.get("pdf_vector_join_gap_ratio", 0.1))
     min_paths = int(c.get("pdf_vector_min_paths", 3))
     min_segments = int(c.get("pdf_vector_min_segments", 24))
+    min_straight = int(c.get("pdf_vector_min_straight_paths", 8))
     free = [it for it in cands if it.kind == "free" and not it.glyph]
     clusters = [[free[i] for i in comp] for comp in _components(np.array([it.box for it in free], dtype=float).reshape(-1, 4), gap_abs, gap_ratio)] if free else []
     taken.update(it.z for it in free)
     in_graphic: set[int] = set(it.z for g in groups for it in g.members)
     for members in _settle_order(clusters, drawn, taken, c, recluster=True):
         enough = len(members) >= min_paths and sum(len(it.segs) for it in members) >= min_segments
+        if enough and len(members) < min_straight and not any(sg[0] == 2 for it in members for sg in it.segs):
+            enough = False  # 只有直線、條數又少：是幾個簡單的圖形排在一起，不是插畫
         if enough or any(_needs_vector(it, c) for it in members):
             groups.append(_Group(members=members))
             in_graphic.update(it.z for it in members)
@@ -1130,9 +1202,25 @@ def _group_paths(paths: list[_Path], reader: pdf.PageReader, m: list[float], c: 
             groups.append(_Group(members=[it]))
             in_graphic.add(it.z)
 
+    # 6. 向量圖太多：整頁是一大片插畫（地圖、工程圖、圖示牆），不再細分。所有自由路徑（含零散的）依繪製順序合併，
+    #    只在「被文字、圖片、大色塊隔開」的地方切開；切出來只剩一條的照舊當形狀
+    max_groups = int(c.get("pdf_vector_max_groups", 60))
+    plain = [g for g in groups if g.kind != "outlined_text"]
+    if len(plain) > max_groups:
+        taken = {it.z for g in groups if g.kind == "outlined_text" for it in g.members} | {it.z for it in free}  # 先前被各群吸進去的矩形、圓重新來過
+        merged = [part for part in _settle_order([free], drawn, taken, c, recluster=False) if len(part) >= 2 or _needs_vector(part[0], c)]
+        note = f"這一頁的圖形很多（原本分成 {len(plain)} 群），不再細分，依繪製順序合成 {len(merged)} 個向量圖。"
+        groups = [g for g in groups if g.kind == "outlined_text"] + [_Group(members=part, notes=[note]) for part in merged]
+        in_graphic = set(it.z for g in groups for it in g.members)
+        for it in cands:  # 沒有被併進去的漸層矩形、圓：仍然各自成一個向量圖
+            if it.z not in in_graphic and it.kind != "free" and _needs_vector(it, c):
+                groups.append(_Group(members=[it]))
+                in_graphic.add(it.z)
+
     # 5. 零散的自由路徑太多
     loose = [it for it in free if it.z not in in_graphic]
     if len(loose) > c.get("max_vector_paths", 300):
+        taken = in_graphic | {it.z for it in free}
         for part in _settle_order([loose], drawn, taken, c, recluster=False):
             if len(part) >= 2:
                 groups.append(_Group(members=part, notes=[f"這 {len(part)} 條零散的路徑數量太多，不適合各自變成形狀，依繪製順序合成一個向量圖。"]))
@@ -1343,8 +1431,11 @@ def _vector_graphics(groups: list[_Group], reader: pdf.PageReader, spec: PageSpe
     aspect = spec.aspect_ratio
     base_dpi = float(c.get("pdf_vector_raster_dpi", 300))
     max_pixels = float(c.get("pdf_vector_raster_max_pixels", 8_000_000))
+    page_pixels = float(c.get("pdf_vector_raster_page_pixels", 24_000_000))
+    min_dpi = min(float(c.get("pdf_vector_raster_min_dpi", 100)), base_dpi)
     hairline = 1.0 / max(spec.working_image_size[0], 1)
-    jobs = []
+    base_w, base_h = reader.render_size(base_dpi)
+    spans = []
     for g in groups:
         l = max(min(it.vbox[0] for it in g.members), 0.0)
         t = max(min(it.vbox[1] for it in g.members), 0.0)
@@ -1354,28 +1445,38 @@ def _vector_graphics(groups: list[_Group], reader: pdf.PageReader, spec: PageSpe
             for it in g.members:
                 it.role = "offpage"
             continue
-        dpi = base_dpi
+        area = (r - l) * base_w * (b - t) / aspect * base_h  # 用設定的解析度畫，會是幾個像素
+        spans.append((g, (l, t, r, b), area, min(1.0, math.sqrt(max_pixels / area))))  # 太大的圖降低解析度，免得一張圖幾千萬像素
+    # 整頁所有向量圖的像素總量也有上限（一頁有上百個、或好幾層整頁大小的向量圖時）：超過就一起降低解析度，但不低於下限
+    total = sum(area * k * k for _, _, area, k in spans)
+    shrink = math.sqrt(page_pixels / total) if total > page_pixels else 1.0
+    jobs = []
+    for g, (l, t, r, b), _, k in spans:
+        dpi = min(base_dpi * k, max(base_dpi * k * shrink, min_dpi))
         w, h = reader.render_size(dpi)
-        area = (r - l) * w * (b - t) / aspect * h
-        if area > max_pixels:  # 太大的圖降低解析度，免得一張圖幾千萬像素
-            dpi = dpi * math.sqrt(max_pixels / area)
-            w, h = reader.render_size(dpi)
         box = (max(math.floor(l * w) - 1, 0), max(math.floor(t / aspect * h) - 1, 0), min(math.ceil(r * w) + 1, w), min(math.ceil(b / aspect * h) + 1, h))
         jobs.append((g, dpi, box, (w, h)))
-    rendered = reader.render_only([({it.z for it in g.members}, dpi, box) for g, dpi, box, _ in jobs]) if jobs else []
+    blobs: dict[int, tuple] = {}
+
+    def keep(index: int, bitmap: Image.Image) -> None:  # 畫好一張就存一張，不把上百張圖同時留在記憶體裡
+        if np.asarray(bitmap.getchannel("A")).any():
+            blobs[index] = (store.put_blob(_png(bitmap), "image/png", "png"), bitmap.size)
+
+    if jobs:
+        reader.render_only([({it.z for it in g.members}, dpi, box) for g, dpi, box, _ in jobs], each=keep)
     vectors: list[VectorGraphic] = []
     images: list[ImageElement] = []
     taken: set[int] = set()
     outlined = 0
-    for (g, dpi, box, (w, h)), bitmap in zip(jobs, rendered):
-        if not np.asarray(bitmap)[..., 3].any():  # 畫出來是空的（例如完全透明）：不輸出
+    for index, (g, dpi, box, (w, h)) in enumerate(jobs):
+        if index not in blobs:  # 畫出來是空的（例如完全透明）：不輸出
             for it in g.members:
                 it.role = "offpage"
             continue
+        blob, size = blobs[index]
         quad = Quad.from_rect(box[0] / w, box[1] / h * aspect, box[2] / w, box[3] / h * aspect)
-        blob = store.put_blob(_png(bitmap), "image/png", "png")
         z = g.members[0].z
-        image = ImageElement(id=make_element_id(spec.page_index, "img", quad, blob.sha256[:12]), quad=quad, z=z, image=blob, pixel_size=bitmap.size, kind=exact(ImageKind.ILLUSTRATION, step))
+        image = ImageElement(id=make_element_id(spec.page_index, "img", quad, blob.sha256[:12]), quad=quad, z=z, image=blob, pixel_size=size, kind=exact(ImageKind.ILLUSTRATION, step))
         remarks: Counter = Counter()
         vpaths = [vp for it in g.members for vp in _vector_paths(it, m, src_w, hairline, remarks)]
         vectors.append(VectorGraphic(

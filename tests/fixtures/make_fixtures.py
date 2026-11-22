@@ -232,7 +232,8 @@ def deck() -> None:
 #   vector_logo.pdf     多路徑標誌（帶孔、筆畫樣式、半透明、虛線、夾在中間的矩形）、巢狀表單裡的標誌、
 #                       被文字隔開的圖形、單獨的形狀、三個箭頭、表格、底線與文字框
 #   vector_paint.pdf    漸層（花紋填色、sh 運算子、表單內）、讀不出來的東西（非線性漸層、花紋、混合模式、
-#                       透明遮罩、裁切、透明群組）、被蓋住的路徑、可以化簡的裁切
+#                       透明遮罩、裁切、透明群組）、被蓋住的路徑、可以化簡的裁切、
+#                       畫表單之前的裁切（真的切到的、整個包住所以沒有影響的）
 #   vector_outlined.pdf 文字轉外框（一字一條路徑、整段一條路徑）、緊鄰的插畫、超過數量上限的密集插畫
 
 _SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
@@ -334,8 +335,9 @@ def vector_logo() -> None:
     c.drawPath(p, stroke=1, fill=0)
     c.restoreState()
 
-    # ---- 標誌 B：畫在兩層表單（Form XObject）裡，每層都有旋轉與縮放
-    c.beginForm("mark")
+    # ---- 標誌 B：畫在兩層表單（Form XObject）裡，每層都有旋轉與縮放。
+    # 表單的範圍框（BBox）要包住內容：ReportLab 預設用整頁大小，圍繞原點畫的內容會被切掉四分之三
+    c.beginForm("mark", -45, -45, 45, 45)
     for k, col in enumerate(["#F2C14E", "#E86A33", "#8EC07C", "#2E86AB"]):
         c.saveState()
         c.rotate(90 * k)
@@ -348,7 +350,7 @@ def vector_logo() -> None:
         c.drawPath(p, stroke=0, fill=1)
         c.restoreState()
     c.endForm()
-    c.beginForm("badge")
+    c.beginForm("badge", -60, -60, 60, 60)
     c.setFillColor(HexColor("#141E30"))
     p = c.beginPath()  # 不規則的圓盤（不是正圓，所以是自由路徑）
     p.moveTo(50, 0)
@@ -430,8 +432,13 @@ def vector_logo() -> None:
     c.setStrokeColor(HexColor("#C8553D"))
     c.setLineWidth(1.5)
     c.setLineJoin(1)
-    for y0 in (204, 174):
-        c.drawPath(_poly(c, [(352 + 15 * i, y0 + (6 if i % 2 else 0)) for i in range(9)], close=False), stroke=1, fill=0)
+    for y0 in (207, 177):  # 兩條波浪線（曲線）
+        p = c.beginPath()
+        p.moveTo(352, y0)
+        for i in range(8):
+            x0, dy = 352 + 15 * i, (5 if i % 2 == 0 else -5)
+            p.curveTo(x0 + 5, y0 + dy, x0 + 10, y0 + dy, x0 + 15, y0)
+        c.drawPath(p, stroke=1, fill=0)
     star = [(492 + 22 * math.cos(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45), 190 + 22 * math.sin(math.radians(90 + 36 * i)) * (1 if i % 2 == 0 else 0.45)) for i in range(10)]
     c.setFillColor(HexColor("#F2C14E"))
     c.drawPath(_poly(c, star), stroke=0, fill=1)
@@ -465,6 +472,10 @@ def vector_paint() -> None:
                    Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 600, 400], Group=Dictionary(S=Name.Transparency, CS=Name.DeviceRGB))
     inner = Stream(pdf, b"/Pattern cs /PF scn 0 0 m 0 60 l 40 70 l 80 60 l 80 0 l h f", Type=Name.XObject, Subtype=Name.Form, BBox=[0, 0, 80, 70], Matrix=[1, 0, 0, 1, 320, 70],
                    Resources=Dictionary(Pattern=Dictionary(PF=pattern(axial([0, 0, 80, 0], fn([0.56, 0.75, 0.49], [0.12, 0.23, 0.37])), [1, 0, 0, 1, 0, 0]))))
+    # 兩個一樣的小表單（各畫一片葉子與一個小三角形），差別在畫它之前的裁切：一個真的被三角形切到，一個的裁切框（轉了 30 度的矩形）整個包住它
+    leaf = b"0.18 0.53 0.67 rg 0 0 m 10 25 30 30 40 10 c 30 -5 10 -5 0 0 c h f 0.95 0.76 0.31 rg 12 6 m 28 6 l 20 18 l h f"
+    cut = Stream(pdf, leaf, Type=Name.XObject, Subtype=Name.Form, BBox=[-5, -10, 45, 35])
+    kept = Stream(pdf, leaf, Type=Name.XObject, Subtype=Name.Form, BBox=[-5, -10, 45, 35])
     page.Resources = Dictionary(
         Font=Dictionary(F1=Dictionary(Type=Name.Font, Subtype=Name.Type1, BaseFont=Name.Helvetica)),
         Pattern=Dictionary(
@@ -478,7 +489,7 @@ def vector_paint() -> None:
             Sh2=axial([0, 0, 0, 400], fn([0.96, 0.92, 0.85], [0.85, 0.9, 0.96])),
         ),
         ExtGState=Dictionary(GSm=Dictionary(BM=Name.Multiply), GSs=Dictionary(SMask=Dictionary(Type=Name.Mask, S=Name.Luminosity, G=pdf.make_indirect(mask))), GSa=Dictionary(ca=0.5)),
-        XObject=Dictionary(Grp=pdf.make_indirect(group), Inner=pdf.make_indirect(inner)),
+        XObject=Dictionary(Grp=pdf.make_indirect(group), Inner=pdf.make_indirect(inner), Cut=pdf.make_indirect(cut), Kept=pdf.make_indirect(kept)),
     )
     k = 0.5523 * 40
     circle = f"340 320 m 340 {320 + k:.3f} {300 + k:.3f} 360 300 360 c {300 - k:.3f} 360 260 {320 + k:.3f} 260 320 c 260 {320 - k:.3f} {300 - k:.3f} 280 300 280 c {300 + k:.3f} 280 340 {320 - k:.3f} 340 320 c h"
@@ -506,6 +517,8 @@ q {star_path} W n 0.56 0.75 0.49 rg 500 170 100 80 re f Q
 q 60 80 60 60 re W n 0.18 0.53 0.67 rg 40 100 120 20 re f Q
 q /GSa gs /Grp Do Q
 /Inner Do
+q 430 75 m 470 75 l 450 110 l h W n 1 0 0 1 430 80 cm /Cut Do Q
+q 0.866 0.5 -0.5 0.866 530 70 cm -8 -12 56 50 re W n /Kept Do Q
 0 0 0 rg BT /F1 12 Tf 60 30 Td (Paint fixture) Tj ET
 """
     page.Contents = Stream(pdf, content.encode("ascii"))

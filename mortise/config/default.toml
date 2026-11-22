@@ -38,7 +38,41 @@ join_max_gap_factor = 4.0            # 同一基線上相距不超過幾個字�
 max_vector_paths = 300               # 一頁的複雜向量路徑超過這個數量，整批留在底圖（避免插畫被拆成上千個形狀）
 max_path_segments = 400              # 單一路徑的線段超過這個數量，留在底圖
 # ---- 原生 PDF 的向量圖與扁平化內容（stages/s3_recognize.py、stages/s3_flattened.py）：設定加在這一行下面 ----
+# 註：讀得出來的路徑不再因為數量多而留在底圖。上面兩個上限現在的意思是：
+#   max_path_segments：單一路徑的線段超過這個數量，不當成形狀，自己成為一個向量圖；
+#   max_vector_paths：零散（沒有成群）的自由路徑超過這個數量，不各自變成形狀，依繪製順序合成向量圖。
+pdf_vector_join_gap = 0.002          # 兩條路徑的外框相距不超過這個距離（頁寬比例）就算同一個圖形（初始值）
+pdf_vector_join_gap_ratio = 0.1      # 或相距不超過「兩者中較小者的長邊 × 此值」（初始值）
+pdf_vector_min_paths = 3             # 一群至少幾條路徑才算向量圖；不夠的各自維持是形狀
+pdf_vector_min_segments = 24         # 一群至少幾段線段才算向量圖（三個箭頭、幾個三角形不算）
+pdf_vector_min_straight_paths = 8    # 全部只有直線的群（箭頭、折線這類簡單圖形）至少要幾條才算向量圖（初始值）
+pdf_vector_absorb_max_area = 0.6     # 夾在一群中間的矩形、圓、直線，面積不超過整群外框的這個比例才算進這一群
+pdf_vector_raster_dpi = 300          # 向量圖對應的透明底圖片的解析度（dpi）
+pdf_vector_raster_max_pixels = 8000000  # 那張圖片的像素上限；超過就降低解析度
+pdf_vector_raster_page_pixels = 24000000  # 一頁所有向量圖的圖片像素總量上限；超過就一起降低解析度
+pdf_vector_raster_min_dpi = 100      # 因為總量上限而降低解析度時的下限（dpi）
+pdf_vector_max_groups = 60           # 一頁分出來的向量圖超過這個數量（地圖、工程圖），不再細分，依繪製順序合併成幾層
+pdf_outlined_min_glyphs = 6          # 一行至少幾個字形才認定是「文字轉外框」（頁面有真的文字時）
+pdf_outlined_min_glyphs_suspected = 3  # ①已經懷疑整頁文字轉外框時的門檻
+pdf_outlined_aligned_share = 0.6     # 一行裡至少這個比例的字形要對齊同一條基線（或中線）
+pdf_outlined_max_gap = 1.2           # 同一行相鄰字形的間距上限（字高的倍數）
+pdf_outlined_max_height = 0.08       # 字形高度上限（頁寬比例）；更高的當成圖形
+pdf_outlined_line_pitch = 3.2        # 上下兩行的基線距離不超過字高的幾倍，算同一塊文字
 # ---- 描圖向量化（recognition/vectorize.py）：設定加在這一行下面，名稱以 vector_ 開頭 ----
+vector_enabled = true                # 影像產線：插畫（標誌、圖示、圖表）描成向量路徑；照片不描
+vector_min_size_px = 12              # 寬或高小於此像素的插畫不描
+vector_accept_delta_e = 4.0          # 重畫的平均色差（ΔE）在此值以內才交出向量圖（雜訊大時自動放寬；初始值）
+vector_accept_p95 = 22.0             # 色差第 95 百分位的上限（初始值）
+vector_accept_iou = 0.9              # 重畫的覆蓋範圍與原圖的交集 ÷ 聯集下限（初始值）
+vector_accept_blob_fraction = 0.01   # 成塊對不上的面積比例上限（漏掉細節或有明暗變化；初始值）
+vector_max_refine_rounds = 2         # 誤差成塊時最多放細門檻重描幾輪
+vector_fit_tol_px = 0.25             # 曲線擬合的容許誤差（像素；會依量到的雜訊放寬；初始值）
+vector_prim_tol_px = 0.3             # 認成基本幾何（矩形、圓角矩形、圓、橢圓）的容許誤差（像素；初始值）
+vector_snap_tol_px = 0.3             # 扶正成水平、垂直時容許移動的距離（像素），不超過量測誤差
+vector_stroke_max_width_px = 8.0     # 寬度在此值以內而且等寬的細線還原成「中心線加線寬」（初始值）
+vector_layered = true                # 分層輸出：被上層遮住的部分補成完整形狀；關掉則全部是互相挖洞的拼圖
+vector_gradients = true              # 偵測線性與放射漸層
+vector_max_megapixels = 16.0         # 影像大於此值（百萬像素）先縮小再描
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）
@@ -78,7 +112,28 @@ single_line_no_wrap = true           # 單行文字關閉自動換行
 [export]                             # ⑥ 輸出
 image_format = "png"
 # ---- 可編輯 PDF（exporters/pdf_editable.py）：設定加在這一行下面，名稱以 pdf_ 開頭 ----
+pdf_text_object = "paragraph"        # 文字物件的寫法：paragraph（一段一個，行與行用 T*）或 line（一行一個）
+pdf_font_embed = "subset"            # 字型內嵌方式：subset（只內嵌用到的字形）或 full（整個字型；檔案大，換不到可編輯性）
+pdf_tagged = true                    # 是否寫結構標記（Tagged PDF：標題、段落、表格、圖、閱讀順序、語言）
+pdf_lang = "auto"                    # 文件語言（BCP 47，例如 zh-Hant-TW）；auto 由文字的書寫系統推斷
+pdf_lang_cjk = "zh-Hant"             # 推斷為中文時寫的語言代碼（書寫系統分不出繁簡與地區）
+pdf_lang_latin = "en"                # 推斷為拉丁字母文字時寫的語言代碼
+pdf_justify_word_space = true        # 左右對齊且有空白的行只撐開空白（TJ 位移）；false 則整行一致的字距（Tc），完全不用 TJ
+pdf_line_fit = true                  # 採用⑦開的逐行對位修正單（原生輸入：每一行對回來源的行首位置與字距）
+pdf_layers = false                   # 是否另外寫 OCG 圖層（背景、圖片、形狀、文字）
+pdf_ua_claim = false                 # 是否在 XMP 宣告 PDF/UA-1（沒有用 veraPDF 驗證過，預設不宣告）
+pdf_font_deny_prefixes = ["Unifont"] # 不內嵌的字型（字族名稱的開頭）；GNU Unifont 是 GPL 附字型例外，授權待法務確認前先不內嵌
 # ---- SVG（exporters/svg.py）：設定加在這一行下面，名稱以 svg_ 開頭 ----
+svg_text = "text"                    # 文字的寫法：text（可編輯的文字，一行一個 text）或 outline（轉成外框路徑，不可再編輯）
+svg_size_unit = "pt"                 # 根元素 width、height：pt（帶單位，各軟體實體尺寸一致；Illustrator 未實測）或 none（不帶單位）
+svg_precision = 2                    # 座標與長度的小數位數
+svg_images = "embed"                 # 圖片：embed（data URI 內嵌）或 external（另存在 zip 的 images/ 下，輸出一律是 zip）
+svg_layers = "element"               # element（每個元素的群組標成 Inkscape 圖層並帶名稱）或 none（不寫 inkscape: 屬性）
+svg_primitives = true                # 向量圖的路徑認得出基本圖形時寫成 rect、circle、ellipse、line、polygon
+svg_kerning_aware = true             # 置中、靠右、左右對齊的行，用含字距微調的行寬修正起點與間距（各軟體畫字時都會套用字距微調）
+svg_tspan_y = false                  # 行內片段的 tspan 另寫 y：resvg 這類渲染器才會逐片段選字型；編輯軟體的行為未實測，預設不寫
+svg_hairline_pt = 0.25               # 來源是 PDF 零寬細線的筆畫，在 SVG 裡寫成多寬（pt，初始值）
+svg_outline_slant_deg = 12.0         # 文字轉外框而字型沒有斜體檔時，字形傾斜的角度（初始值）
 
 [verify]                             # ⑦ 驗證
 render_dpi = 100                     # 比對用的渲染解析度（dpi）
@@ -91,7 +146,24 @@ neutral = true                       # 7A 中性驗證（需要 ai_pdf 輸出器
 neutral_similarity_pass = 0.95       # 中性渲染與原圖的相似度合格線（初始值）
 libreoffice_timeout_s = 120          # 目標渲染逾時（秒）
 # ---- 可編輯 PDF 的目標驗證（verify/pdf_target.py）：設定加在這一行下面，名稱以 pdf_ 開頭 ----
+pdf_similarity_pass = 0.95           # 輸出檔重新畫出來與工作影像的相似度合格線（初始值）
+pdf_position_tolerance_pt = 0.5      # 讀回來的每個字與排版預期位置的容許差（pt）
+pdf_size_tolerance_pt = 0.05         # 讀回來的字級與成品文件的容許差（pt）
+pdf_source_position_tolerance_pt = 0.5  # 原生輸入：讀回來的行首與來源文字行的容許差（pt）
+pdf_object_tolerance_pt = 0.1        # 圖片與向量路徑範圍的容許差（pt）
+pdf_check_objects = true             # 檢查圖片數量與位置、向量圖的路徑數與屬性
+pdf_check_structure = true           # 檢查結構標記（輸出器關掉結構標記時自動略過）
+pdf_check_source = true              # 另外與③讀到的來源文字行比對（只報告，不計入文字一致率）
+pdf_fit = true                       # 原生輸入：排版結果與來源文字行的差超過容許差時，開修正單請輸出器逐行對位
+pdf_fit_tolerance_pt = 0.25          # 逐行對位：行首或行內累積的位置差超過此值才修正（pt，初始值）
+pdf_fit_max_gap_ratio = 0.4          # 逐行對位：一行需要的位移點超過字數的此比例，就改用整行一致的字距（初始值）
+pdf_fit_max_width_change = 0.12      # 逐行對位：來源行寬與排版行寬相差超過此比例就不對位（多半是使用者改過字型或字級；初始值）
 # ---- SVG 的目標驗證（verify/svg_target.py）：設定加在這一行下面，名稱以 svg_ 開頭 ----
+svg_render = true                    # 用 resvg 把 SVG 畫出來比相似度；false 只做結構檢查與文字讀回
+svg_similarity_pass = 0.95           # SVG 渲染後與工作影像的相似度合格線（初始值）
+svg_position_tolerance_pt = 0.1      # 讀回來的文字行位置與成品文件排版的容許差（pt）
+svg_emulate_bold = true              # 伺服器上的字型沒有粗體檔時，渲染前補同色描邊模擬粗體（不改輸出檔）
+svg_font_dirs = []                   # 渲染用的字型目錄；空的表示用 fontconfig 列出的字型（與輸出時量行寬用的是同一批）
 
 [ai]                                 # 大型 AI（只回答編號、標籤、或在候選中選擇）
 enabled = true                       # 有憑證才會真的呼叫；沒有憑證時流水線照常跑，全用規則判斷

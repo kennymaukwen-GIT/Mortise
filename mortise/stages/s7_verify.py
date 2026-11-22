@@ -4,16 +4,25 @@
   7A 中性驗證（s7.neutral）：用自家確定性的渲染（ai_pdf 輸出器）把成品文件畫出來，與原圖比相似度，檢查③④⑤對不對。
   7B 目標驗證（s7.target）：用目標軟體或替身引擎渲染輸出檔，檢查轉檔後有沒有跑版。
      目前的替身引擎是 LibreOffice（不是使用者手上的 PowerPoint，報告中會註明）。
+     PowerPoint 以外的格式各有自己的回讀驗證（mortise/verify/ 下各一個模組），結果收在 format_reports。
 其他步驟：
   s7.compare   逐區比對：位置誤差、文字是否一致、斷行是否一致、整頁相似度
   s7.fields    每個元素每個欄位標示 精確擷取／量測吸附／AI 判斷／生成／使用者／無法還原
   s7.propose   開修正單：斷行不一致 → 調整文字框寬度；位置偏移 → 平移。這是目標軟體的渲染差異，送給⑥該格式的輸出器，不改成品文件
+
+整體分數（overall_score）是各頁分數的平均。每一頁的分數依下面的順序取第一個算得出來的：
+  1. 有 PowerPoint 的目標驗證：0.5 × 目標渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、位置在容許差內」的比例。
+  2. 沒有 PowerPoint 的目標驗證、但有其他格式的回讀驗證（例如可編輯 PDF、SVG）：
+     每個格式在這一頁的分數 = 0.5 × 回讀渲染的相似度 ＋ 0.5 × 文字一致率（兩者缺一個就只用另一個），
+     這一頁的分數是各格式分數的平均。
+  3. 都沒有：7A 中性渲染的相似度。
 """
 
 from __future__ import annotations
 
 import math
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -92,6 +101,15 @@ def run(
             format_reports.append(fn(o, specs, elements, layout, styled, cfg, store))
         except Exception as e:  # 單一格式的驗證失敗不影響其他驗證
             notes.append(f"{o.format.value} 的目標驗證沒有執行：{type(e).__name__}: {e}")
+            continue
+        # 驗證模組可以另外提供 propose：回傳要送給⑥該格式輸出器的修正單（欄位名稱以「格式.」開頭）。
+        # 與 PowerPoint 的修正單一樣只影響那個格式的輸出，不改成品文件；要不要保留由執行器看整體分數有沒有進步。
+        propose = getattr(sys.modules.get(fn.__module__), "propose", None)
+        if propose is not None:
+            try:
+                proposals.extend(propose(o, specs, elements, layout, styled, cfg, store, round_no))
+            except Exception as e:
+                notes.append(f"{o.format.value} 的修正單沒有開出來：{type(e).__name__}: {e}")
 
     counts: dict[str, int] = {}
     for p in pages:
@@ -101,7 +119,10 @@ def run(
     scores = []
     for p in pages:
         if p.target_similarity is None:
-            if p.neutral_similarity is not None:
+            readback = _readback_score(format_reports, p.page_index)
+            if readback is not None:
+                scores.append(readback)
+            elif p.neutral_similarity is not None:
                 scores.append(p.neutral_similarity)
             continue
         boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
@@ -117,6 +138,20 @@ def run(
         field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes, target_render=target_render,
         format_reports=format_reports,
     )
+
+
+def _readback_score(format_reports, page_index: int):
+    """沒有 PowerPoint 目標驗證時，這一頁的分數取自各格式的回讀驗證：
+    每個格式 0.5 × 相似度 ＋ 0.5 × 文字一致率（缺一個就只用另一個），再對各格式取平均。沒有任何格式驗到這一頁就回傳 None。"""
+    per_format = []
+    for fr in format_reports:
+        for fp in fr.pages:
+            if fp.page_index != page_index:
+                continue
+            parts = [v for v in (fp.similarity, fp.text_match_ratio) if v is not None]
+            if parts:
+                per_format.append(sum(parts) / len(parts))
+    return (sum(per_format) / len(per_format)) if per_format else None
 
 
 # ---------- s7.fields ----------
@@ -167,6 +202,21 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
         reports.append(ElementReport(element_id=im.id, kind="image", fields={"pixels": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED, "position": FieldStatus.EXACT if el.production_line.value == "extract" else FieldStatus.MEASURED}))
     for s in sp.shapes:
         reports.append(ElementReport(element_id=s.id, kind="shape", fields={"geometry": FieldStatus.EXACT, "fill": FieldStatus.EXACT, "position": FieldStatus.EXACT}))
+    src_vectors = {v.id: v for v in el.vectors}
+    for v in sp.vectors:
+        # 向量圖的來源：原生 PDF 裡本來就是向量（精確擷取），或由像素描圖重建（量測）。以③記的來源類型為準；
+        # ③沒有這個向量圖時（例如使用者修正後新增）退回成品文件記的 origin。
+        src = src_vectors.get(v.id)
+        status = _STATUS[src.origin.source] if src is not None else (FieldStatus.EXACT if v.origin == "pdf_paths" else FieldStatus.MEASURED)
+        fields = {"paths": status, "fill": status, "position": status}
+        if any(vp.stroke is not None for vp in v.paths):
+            fields["stroke"] = status
+        if any(vp.gradient is not None for vp in v.paths):
+            fields["gradient"] = status
+        reports.append(ElementReport(element_id=v.id, kind="vector", fields=fields, confidence=min(v.confidence, src.origin.confidence) if src is not None else v.confidence))
+        if status != FieldStatus.EXACT:
+            detail = f"，重畫後與原圖的平均色差 ΔE {v.render_error:.1f}" if v.render_error is not None else ""
+            issues.append(Issue(severity=Severity.INFO, code="vector_traced", element_id=v.id, message=f"這個向量圖是由像素描圖重建的（{len(v.paths)} 條路徑{detail}），不是原檔裡的向量資料。"))
     if el.background.generated_regions:
         issues.append(Issue(severity=Severity.WARNING, code="background_generated", message=f"底圖有 {len(el.background.generated_regions)} 個區域是生成（修補）出來的。"))
     for n in el.notes + spec.notes:

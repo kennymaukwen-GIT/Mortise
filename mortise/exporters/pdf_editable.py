@@ -22,11 +22,22 @@ fontTools（MIT，字型子集）、PDFium（BSD-3-Clause 加 Apache-2.0，只�
       pdf_justify_word_space = false 時一律用 Tc，完全沒有 TJ（研究筆記的假設：TJ 位移可能讓 Illustrator 把文字拆碎，未實測）。
     - 字與字之間的空白是真的空白字元；顏色與渲染模式在畫第一個字之前設好。
 
+  逐行對位（只有⑦開了修正單才有；pdf_line_fit = false 可關閉）
+    - 成品文件只有段落屬性（行距、對齊、縮排），沒有「來源的每一行實際在哪裡」。原生 PDF 進來時，來源軟體在中英交界
+      加寬的間距、左右對齊的分配方式、每行各自的行高，照段落屬性排不出來（五個測試檔逐字最多差 30 pt）。
+    - ⑦的回讀驗證（verify/pdf_target.py）把排版結果與③讀到的來源文字行逐字比對，開修正單 pdf.line_fit 給本輸出器：
+      每一行的行首位移、行內每一段同字型的字的字距（Tc）、以及少數幾處位移（TJ 裡的一個數字，例如中英交界）。
+      這與 PowerPoint 的 pptx.offset_pt 是同一種修正單：只影響本格式，不改成品文件，數值全部是量出來的。
+    - 套用之後仍然是每行整行一次畫出；多出來的只有行內換字型時的 Tc，與位移所在處把 Tj 換成 TJ。
+      套用了哪些對位記在文件資訊的 MortiseLineFit，回讀驗證靠它算每一行的預期位置。
+
   字型
     - 一律寫成 Type0／Identity-H 的 CID 字型，由 fontTools 做子集、pikepdf 組字型物件（TrueType 外框用 CIDFontType2
       加 FontFile2，CFF 外框用 CIDFontType0 加 FontFile3）。不用 ReportLab 的 TTFont：它把字型寫成 8 位元簡單字型，
       一頁超過 256 個不同的字就拆成多個子集字型、把一行切成好幾段；它也不能內嵌 CFF 外框的 OpenType。
     - 字碼就是原字型的字形編號（子集時保留編號），每個用到的字碼都寫進 ToUnicode。
+      字寬（/W）寫成千分之一字級的整數，排版也用同一個整數：PDFium 讀 /W 只取整數部分，寫小數的話它算的字位置
+      會與我們排的逐字差一點（實測 40 pt 的標題整行累積 0.37 pt）。與字型程式的差不到 0.5 個單位。
       同一個字形對應到兩個不同的字（例如不換行空白與一般空白）、或字型裡沒有這個字時，那一段另外包一層
       Span 並寫 ActualText，複製出來仍是正確的字。
     - BaseFont 用字型檔自己的 PostScript 名稱，子集加六碼前綴（每個字型、每份子集都不同）；
@@ -77,7 +88,7 @@ from ..artifacts.styled_doc import vector_index
 from ..config import Config
 from ..pipeline.store import Store
 from . import ai_pdf
-from .ai_pdf import _Fonts, _Frame, _Layout, _Line, _Match, _Painter, _rl
+from .ai_pdf import PlacedLine, _Fonts, _Frame, _Layout, _Line, _Match, _Painter, _rl
 
 # 這個輸出器自己的預設值（疊在 ai_pdf 的排版參數上）。設定檔 [export] 裡以 pdf_ 開頭的項目會蓋過這裡，
 # 例如 pdf_tagged = false；ai_pdf 的任何參數也可以加上 pdf_ 前綴只對本輸出器生效（例如 pdf_layers = true）。
@@ -96,11 +107,14 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "figure_alt": "圖片",  # 圖片替代文字的開頭（後面接序號）；我們不知道圖片內容，這只是佔位
     "vector_alt": {"logo": "標誌", "icon": "圖示", "chart": "圖表", "illustration": "插畫", "unknown": "向量圖"},
     "ua_claim": False,  # 是否在 XMP 宣告 pdfuaid:part = 1（沒有用 veraPDF 驗證過，預設不宣告）
+    "line_fit": True,  # 是否採用⑦開的逐行對位修正單（pdf.line_fit）
+    "font_deny_prefixes": ["Unifont"],  # 不內嵌的字型（字族名稱的開頭）：授權不合產品底線的字型列在這裡，遇到就改用下一個候選
     "title": "",  # 文件標題；空字串表示用檔名
 }
 
 MIME = "application/pdf"
 PRODUCER = "Mortise pdf_editable (ReportLab + pikepdf + fontTools)"
+LINE_FIT_KEY = "/MortiseLineFit"  # 文件資訊裡記「套用了哪些逐行對位」的鍵
 _FS_RESTRICTED, _FS_NO_SUBSET, _FS_BITMAP_ONLY, _FS_PREVIEW_PRINT = 0x0002, 0x0100, 0x0200, 0x0004
 _HEADING_ROLES = {Role.TITLE: 1, Role.SUBTITLE: 2}
 _ARTIFACT_SUBTYPE = {"header": " /Subtype /Header", "footer": " /Subtype /Footer", "page_number": ""}
@@ -167,11 +181,18 @@ class _CidLoader:
 
     _cache: dict[tuple, tuple[Optional[_CidFace], str]] = {}
 
-    def __init__(self, degradations: list[Degradation]):
+    def __init__(self, degradations: list[Degradation], deny_prefixes: Optional[list[str]] = None):
         self.deg = degradations
+        self.deny = [d.casefold() for d in (deny_prefixes or [])]
         self._noted: set[str] = set()
 
     def __call__(self, m: _Match, metric: str, rename: Optional[str]) -> tuple[Optional[_CidFace], str]:
+        denied = next((f for f in m.families if any(f.casefold().startswith(d) for d in self.deny)), None)
+        if denied is not None:
+            if m.path not in self._noted:
+                self._noted.add(m.path)
+                self.deg.append(Degradation(element_id="doc", concept="字型的嵌入許可", action=f"「{denied}」列在不內嵌的字型清單（pdf_font_deny_prefixes），改用下一個候選字型", lossy=True))
+            return None, "license: 設定檔排除"
         ck = (m.path, m.index, metric)
         if ck not in self._cache:
             try:
@@ -224,8 +245,14 @@ class _CidLoader:
                 return gid
 
             hmtx = ft["hmtx"].metrics
+
+            def advance(name: str) -> float:
+                # 字寬取到千分之一字級的整數：寫進 /W 的就是這個數，排版也用同一個數。
+                # PDFium 讀 /W 時只取整數部分，寫小數的話它算出來的字位置會與我們排的逐字差一點、整行累積起來。
+                return round(hmtx[name][0] * 1000.0 / upm) / 1000.0
+
             best = ft.getBestCmap() or {}
-            glyph_of = {cp: (gid_of[name], code(name, gid_of[name]), hmtx[name][0] / upm) for cp, name in best.items() if name in gid_of and name in hmtx}
+            glyph_of = {cp: (gid_of[name], code(name, gid_of[name]), advance(name)) for cp, name in best.items() if name in gid_of and name in hmtx}
             nd = order[0]
             post = ft["post"] if "post" in ft else None
             face = _CidFace(
@@ -235,7 +262,7 @@ class _CidLoader:
                 italic_angle=float(post.italicAngle) if post is not None else 0.0,
                 bbox=tuple(round(v * 1000.0 / upm) for v in (head.xMin, head.yMin, head.xMax, head.yMax)),
                 cap_height=(getattr(os2, "sCapHeight", 0) or hhea.ascent) / upm if os2 is not None else hhea.ascent / upm,
-                fs_type=fs_type, variable="fvar" in ft, glyph_of=glyph_of, space=glyph_of.get(0x20), notdef=(0, code(nd, 0), hmtx[nd][0] / upm),
+                fs_type=fs_type, variable="fvar" in ft, glyph_of=glyph_of, space=glyph_of.get(0x20), notdef=(0, code(nd, 0), advance(nd)),
             )
             return face, ""
         finally:
@@ -325,7 +352,7 @@ def _to_unicode(codes: dict[int, str]) -> bytes:
 
 
 def _width_array(face: _CidFace, codes: dict[int, str]):
-    """/W：用到的字碼的字寬（1000 單位）。寫到小數三位，與排版用的字寬（hmtx ÷ unitsPerEm）一致。"""
+    """/W：用到的字碼的字寬（1000 單位的整數，與排版用的字寬是同一個數；見 _CidLoader._load 的 advance）。"""
     import pikepdf
 
     width_of = {code: adv for _, code, adv in face.glyph_of.values()}
@@ -334,8 +361,7 @@ def _width_array(face: _CidFace, codes: dict[int, str]):
     run: list = []
     start = prev = None
     for code in sorted(set(codes) | {face.notdef[1]}):
-        w = round(width_of.get(code, face.notdef[2]) * 1000.0, 3)
-        value = int(w) if w == int(w) else Decimal(f"{w:.3f}")
+        value = int(round(width_of.get(code, face.notdef[2]) * 1000.0))
         if prev is not None and code == prev + 1:
             run.append(value)
         else:
@@ -417,23 +443,28 @@ class _Elem:
 
 
 def _script_counts(text: str) -> Counter:
+    """各書寫系統的份量。漢字、假名、諺文以「字」計；拉丁字母以「詞」計（一個中文字的份量大約相當於一個英文詞，
+    用字母數來比的話，中英並列的文件會因為英文字母多而被當成英文）。"""
     c: Counter = Counter()
+    in_word = False
     for ch in text:
         o = ord(ch)
+        latin = ch.isalpha() and o < 0x250
+        if latin and not in_word:
+            c["latin"] += 1
+        in_word = latin
         if 0x3040 <= o <= 0x30FF:
             c["kana"] += 1
         elif 0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF:
             c["hangul"] += 1
         elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0x20000 <= o <= 0x2FA1F:
             c["han"] += 1
-        elif ch.isalpha() and o < 0x250:
-            c["latin"] += 1
     return c
 
 
 def _language(text: str, params: dict) -> Optional[str]:
     """由書寫系統推斷語言代碼。這是演算法的計數，不是語言辨識：有假名當日文、有諺文當韓文、
-    其餘漢字當中文（繁簡與地區分不出來，用設定值）、拉丁字母用設定值。沒有可判斷的字就回傳 None。"""
+    漢字不少於拉丁文字的詞數當中文（繁簡與地區分不出來，用設定值）、其餘用拉丁文字的設定值。沒有可判斷的字就回傳 None。"""
     c = _script_counts(text)
     total = sum(c.values())
     if not total:
@@ -442,7 +473,7 @@ def _language(text: str, params: dict) -> Optional[str]:
         return "ja"
     if c["hangul"] >= 0.3 * total:
         return "ko"
-    if c["han"] >= c["latin"] * 0.5 and c["han"] > 0:
+    if c["han"] > 0 and c["han"] >= c["latin"]:
         return params["lang_cjk"]
     return params["lang_latin"]
 
@@ -742,10 +773,12 @@ class _EditablePainter(_Painter):
                 else:
                     code.append(f"{_n(dx)} {_n(-dy)} Td")
                 prev = ln
-            if abs(ln.char_space - tc) > 5e-5:
-                code.append(f"{_n(ln.char_space)} Tc")
-                tc = ln.char_space
+            done = 0  # 這一行已經寫出幾個字（逐行對位的位移以行內第幾個字為準）
             for sg in ln.segs:
+                space = ln.char_space if sg.char_space is None else sg.char_space
+                if abs(space - tc) > 5e-5:
+                    code.append(f"{_n(space)} Tc")
+                    tc = space
                 res, codes, faithful = self.book.encode(sg.face, sg.text)
                 self.fonts_on_page.add(res)
                 if font != (res, sg.size):
@@ -763,7 +796,9 @@ class _EditablePainter(_Painter):
                     mode = want
                 if not faithful:  # 字形與文字對不上：用 ActualText 記下真正的文字
                     code.append(f"/Span <</ActualText <{(chr(0xFEFF) + sg.text).encode('utf-16-be').hex().upper()}>>> BDC")
-                code.append(self._show(sg.text, codes, ln.word_space / sg.size * 1000.0 if ln.word_space else 0.0))
+                before = {k - done: v for k, v in ln.gaps.items() if done <= k < done + len(sg.text)} if ln.gaps else {}
+                code.append(self._show(sg.text, codes, sg.size, ln.word_space, before))
+                done += len(sg.text)
                 if not faithful:
                     code.append("EMC")
                 self.drawn.append(sg.text)
@@ -775,27 +810,39 @@ class _EditablePainter(_Painter):
         self.c.drawText(t)
 
     @staticmethod
-    def _show(text: str, codes: list[int], space_shift: float) -> str:
-        """一段字的顯示運算。space_shift 不為 0 時（左右對齊、有空白的行）在每個空白之後加位移（TJ），其餘用 Tj。"""
-        if not space_shift or " " not in text:
-            return "<" + "".join(f"{c:04X}" for c in codes) + "> Tj"
+    def _show(text: str, codes: list[int], size: float, word_space: float = 0.0, before: Optional[dict[int, float]] = None) -> str:
+        """一段字的顯示運算。整段一個字串、一次 Tj；只有兩種情況改用 TJ 在字串中間加位移：
+        左右對齊且有空白的行（word_space：每個空白之後多空這麼多 pt）、逐行對位（before：{第幾個字: 在它之前多空多少 pt}）。
+        TJ 的位移單位是千分之一字級，正值往回走，所以要多空就寫負值。"""
+        shift: dict[int, float] = dict(before or {})  # 第幾個字之前 → 位移（pt）
+        if word_space:
+            for i, ch in enumerate(text[:-1]):
+                if ch == " ":
+                    shift[i + 1] = shift.get(i + 1, 0.0) + word_space
+        hexes = [f"{c:04X}" for c in codes]
+        if not shift:
+            return "<" + "".join(hexes) + "> Tj"
+        tail = word_space if (word_space and text.endswith(" ")) else 0.0  # 這段字以空白結尾：位移寫在最後，接到同一行的下一段字之前
         parts, cur = [], []
-        for ch, c in zip(text, codes):
-            cur.append(f"{c:04X}")
-            if ch == " ":
-                parts.append("<" + "".join(cur) + ">" + _n(-space_shift, 3))
-                cur = []
-        if cur:
-            parts.append("<" + "".join(cur) + ">")
-        return "[" + "".join(parts) + "] TJ"
+        for i, h in enumerate(hexes):
+            if i in shift:
+                if cur:
+                    parts.append("<" + "".join(cur) + ">")
+                    cur = []
+                parts.append(_n(-shift[i] / size * 1000.0, 3))
+            cur.append(h)
+        parts.append("<" + "".join(cur) + ">")
+        if tail:
+            parts.append(_n(-tail / size * 1000.0, 3))
+        return "[" + " ".join(parts) + "] TJ"
 
     # ---------- 降級紀錄
     def note_text_box(self, tb: StyledTextBox, lines: list[_Line]) -> None:
         drawn = [ln for ln in lines if ln.segs]
-        if drawn:
-            n_par = len({ln.paragraph for ln in drawn})
-            how = f"{n_par} 個文字物件（一段一個，共 {len(drawn)} 行）" if self.p["text_object"] != "line" else f"{len(drawn)} 個逐行的文字物件"
-            self.deg.append(Degradation(element_id=tb.id, concept="段落與文字框", action=f"PDF 沒有文字框與段落屬性，寫成 {how}；編輯軟體會不會把它們併成一個文字框，由各軟體自己決定", lossy=True))
+        if drawn:  # 每個文字框都一樣的說明不逐一列，整份文件合計成一筆（見 _doc_degradations）
+            self.counters["文字框"] = self.counters.get("文字框", 0) + 1
+            self.counters["段落"] = self.counters.get("段落", 0) + len({ln.paragraph for ln in drawn})
+            self.counters["行"] = self.counters.get("行", 0) + len(drawn)
         if lines and lines[-1].baseline - lines[-1].descent > tb.box.h + 0.5 * lines[-1].size:
             self.deg.append(Degradation(element_id=tb.id, concept="文字框高度", action="排出的文字超出文字框下緣（PDF 沒有文字框，照樣畫出）", lossy=False))
 
@@ -807,7 +854,8 @@ class _EditablePainter(_Painter):
 # ================================================================ 後處理與自檢
 
 
-def _finish(data: bytes, doc: StyledDoc, book: _FontBook, page_fonts: list[set[str]], marks: list[_Mark], params: dict, title: str, lang: Optional[str], inferred: dict[str, str]) -> bytes:
+def _finish(data: bytes, doc: StyledDoc, book: _FontBook, page_fonts: list[set[str]], marks: list[_Mark], params: dict, title: str, lang: Optional[str], inferred: dict[str, str],
+            line_fit: Optional[dict] = None) -> bytes:
     """ReportLab 寫出的 PDF → 補上字型、結構樹、中繼資料。"""
     import pikepdf
     from pikepdf import Dictionary, Name, String
@@ -827,10 +875,21 @@ def _finish(data: bytes, doc: StyledDoc, book: _FontBook, page_fonts: list[set[s
     elif lang:
         pdf.Root.Lang = String(lang)
     pdf.Root.ViewerPreferences = Dictionary(DisplayDocTitle=True)
+    for key in ("/Author", "/Subject", "/Keywords", "/CreationDate", "/ModDate"):
+        # ReportLab 的預設值（anonymous、unspecified、固定的 2000 年日期）不是事實，不寫進檔案；
+        # 不寫真實的時間是為了同一份成品文件每次輸出的位元組都相同（輸出檔以內容雜湊存放）。
+        if key in pdf.docinfo:
+            del pdf.docinfo[key]
+    for page in pdf.pages:
+        if "/Trans" in page.obj and not len(page.obj.Trans.keys()):
+            del page.obj["/Trans"]  # ReportLab 寫的空轉場效果
     pdf.docinfo["/Title"] = String(title)
     pdf.docinfo["/Creator"] = String("Mortise")
     pdf.docinfo["/Producer"] = String(PRODUCER)
     pdf.docinfo["/MortiseFonts"] = String(json.dumps(inferred, ensure_ascii=False, sort_keys=True))
+    if line_fit:
+        # 這份檔案套用了哪些逐行對位（⑦的修正單）：回讀驗證靠它算出每一行應該在的位置
+        pdf.docinfo[LINE_FIT_KEY] = String(json.dumps(line_fit, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as meta:
         meta["dc:title"] = title
         meta["dc:format"] = MIME
@@ -995,12 +1054,42 @@ def selfcheck(data: bytes, doc: StyledDoc, expected_text: list[list[str]], param
 # ================================================================ 進入點
 
 
-def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFile:
+def _typesetter(cfg: Optional[Config], params: dict, degradations: list[Degradation]) -> tuple[_Fonts, _Layout]:
+    """這個輸出器用的字型解析與排版（export 與 placed_lines 共用，兩邊排出來的行才會一模一樣）。"""
+    fonts = _Fonts(params, degradations, loader=_CidLoader(degradations, params.get("font_deny_prefixes")))
+    slack = float(cfg.section("settings").get("box_width_slack_pt", 0.0)) if (cfg is not None and params["wrap_slack_from_settings"]) else 0.0
+    return fonts, _Layout(fonts, params, degradations, slack)
+
+
+def line_fit_of(adjust: Optional[dict], params: dict) -> dict[str, dict]:
+    """從⑦開給本輸出器的修正單（{元素編號: {欄位: 值}}）取出逐行對位：{元素編號: {行的鍵: [dx, dy, 字距, 位移清單]}}。
+    格式與意義見 ai_pdf._Layout.apply_fit。設定關閉（pdf_line_fit = false）時一律回傳空的。"""
+    if not adjust or not params.get("line_fit", True):
+        return {}
+    out: dict[str, dict] = {}
+    for element_id, fields in adjust.items():
+        fit = (fields or {}).get("line_fit")
+        if isinstance(fit, dict) and fit:
+            out[element_id] = fit
+    return out
+
+
+def placed_lines(doc: StyledDoc, cfg: Optional[Config], line_fit: Optional[dict] = None) -> list[list[PlacedLine]]:
+    """成品文件經本輸出器排版後，每一頁每一行文字應該在的位置（逐頁）。
+    回讀驗證（verify/pdf_target.py）拿它當預期值：輸出檔讀回來的每一行都要落在這裡。
+    line_fit 是這份輸出套用的逐行對位（格式同 line_fit_of 的回傳值）；不給就是沒有對位的排版。"""
+    params = params_for(cfg)
+    _, layout = _typesetter(cfg, params, [])
+    layout.fit = line_fit or {}
+    return [ai_pdf.placed_lines(page, layout) for page in doc.pages]
+
+
+def export(doc: StyledDoc, basename: str, cfg: Config, store: Store, adjust: Optional[dict] = None) -> OutputFile:
+    """adjust 是⑦為本格式開的修正單（s6_export.adjustments 的結果）；目前只認 line_fit（逐行對位）。"""
     params = params_for(cfg)
     degradations: list[Degradation] = []
-    fonts = _Fonts(params, degradations, loader=_CidLoader(degradations))
-    slack = float(cfg.section("settings").get("box_width_slack_pt", 0.0)) if (cfg is not None and params["wrap_slack_from_settings"]) else 0.0
-    layout = _Layout(fonts, params, degradations, slack)
+    fonts, layout = _typesetter(cfg, params, degradations)
+    layout.fit = line_fit_of(adjust, params)
     lang = params["lang"] if params["lang"] != "auto" else (_language(_doc_text(doc), params) or params["lang_latin"])
     master_ids = {eid for m in doc.masters for eid in m.member_ids}
     tags = _assign_tags(doc, params, master_ids, lang)
@@ -1027,15 +1116,17 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     data = buf.getvalue()
     notes: list[str] = []
     title = params["title"] or basename
-    data = _finish(data, doc, book, page_fonts, marks, params, title, lang, fonts.inferred)
+    data = _finish(data, doc, book, page_fonts, marks, params, title, lang, fonts.inferred, layout.fit)
     if params["layers"]:
         try:
             data = ai_pdf._add_layers(data, layer_pages, params["layer_names"])
         except Exception as e:  # pragma: no cover
             degradations.append(Degradation(element_id="doc", concept="圖層", action=f"無法寫入 OCG 圖層（{e}），只保留繪製順序", lossy=True))
-    _doc_degradations(doc, params, vectors or {}, book, degradations)
+    _doc_degradations(doc, params, vectors or {}, book, degradations, counters)
     ok, check_notes = selfcheck(data, doc, drawn, params)
     notes += check_notes
+    if layout.fitted:
+        notes.append(f"有 {layout.fitted} 行依⑦的修正單逐行對位（行首位置與字距對回來源的文字行）；對位的內容記在文件資訊的 {LINE_FIT_KEY[1:]}。")
     if fonts.inferred:
         notes.append("推論的字型 → 實際內嵌的字型：" + "、".join(f"{a} → {b}" for a, b in sorted(fonts.inferred.items())) + "。BaseFont 寫的是內嵌字型自己的名稱；這份對照也記在文件資訊的 MortiseFonts。")
     notes.append(f"文件語言寫成「{lang}」：由文字的書寫系統推斷，分不出繁簡、地區與歐洲語言的種類（可用 pdf_lang 指定）。")
@@ -1049,8 +1140,11 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
     )
 
 
-def _doc_degradations(doc: StyledDoc, params: dict, vectors: dict, book: _FontBook, deg: list[Degradation]) -> None:
+def _doc_degradations(doc: StyledDoc, params: dict, vectors: dict, book: _FontBook, deg: list[Degradation], counters: dict) -> None:
     """整份文件層級的降級紀錄：成品文件有、PDF 沒有對應的概念。"""
+    if counters.get("文字框"):
+        how = (f"{counters['段落']} 個文字物件（一段一個，共 {counters['行']} 行）" if params["text_object"] != "line" else f"{counters['行']} 個逐行的文字物件")
+        deg.append(Degradation(element_id="doc", concept="段落與文字框", action=f"PDF 沒有文字框與段落屬性：{counters['文字框']} 個文字框寫成 {how}；編輯軟體會不會把它們併成文字框，由各軟體自己決定", lossy=True))
     if doc.styles:
         deg.append(Degradation(element_id="doc", concept="樣式表", action="PDF 沒有段落與字元樣式，只保留直接設定的外觀", lossy=True))
     if doc.theme_colors:

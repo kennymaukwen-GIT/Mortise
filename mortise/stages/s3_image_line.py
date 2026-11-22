@@ -5,6 +5,7 @@
   s3.text_attr    文字屬性：筆畫遮罩、顏色、字級與字型一起解（檢索加重繪比對）、粗斜體、基線
   s3.regions      扣掉文字後的區域：照片、插畫、形狀（擬合成基本幾何）、表格格線；遮罩可以重疊
   s3.crop         裁出照片與插畫（被文字蓋住的部分先修補再裁）
+  s3.vectorize    插畫（標誌、圖示、圖表）描成向量路徑；重畫驗證過關才交出向量圖，否則只留圖片。照片不描
   s3.background   擦掉所有元素後補回底圖；純色與漸層用擬合，紋理用修補（修補屬於生成，會記錄位置）
 這裡只負責轉換座標與產物格式；量測與感知的細節在各模組。所有數值都是原始量測值，不吸附、不定案。
 """
@@ -20,13 +21,14 @@ from PIL import Image
 
 from ..artifacts import (
     Background, Color, ElementList, FontCandidate, ImageElement, ImageKind, PageSpec, Point, ProductionLine, Provenance, Quad,
-    ShapeElement, ShapeGeometry, TableRegion, TextLine, TextRun, make_element_id, measured,
+    ShapeElement, ShapeGeometry, TableRegion, TextLine, TextRun, VectorGraphic, make_element_id, measured,
 )
 from ..config import Config
 from ..pipeline.store import Store
 
 NAME = "s3"
 STEP = "s3.image@1"
+VECTOR_STEP = "s3.vectorize@1"
 
 _ENGINE = None
 _FONTS = None
@@ -164,6 +166,8 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
     images: list[ImageElement] = []
     shapes: list[ShapeElement] = []
     tables: list[TableRegion] = []
+    vectors: list[VectorGraphic] = []
+    vector_params = {k: v for k, v in c.items() if k.startswith("vector_")}
     for rg in regions:
         x0, y0, x1, y1 = rg.bbox
         q = Quad.from_rect(x0 / W, y0 / W, x1 / W, y1 / W)
@@ -175,6 +179,11 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
                 id=make_element_id(page, "img", q, blob.sha256[:12]), quad=q, z=10 + rg.z, image=blob,
                 pixel_size=(rgba.shape[1], rgba.shape[0]), kind=measured(kind, rg.confidence, Provenance.MEASURED, STEP),
             ))
+            # ---------- s3.vectorize：插畫描成向量（照片不描）；對應的圖片照樣留在 images 裡
+            if rg.kind == "illustration" and c.get("vector_enabled", True):
+                vg = _trace_vector(page, images[-1], rgba, (x0, y0), W, vector_params, notes)
+                if vg is not None:
+                    vectors.append(vg)
         elif rg.kind == "shape" and rg.shape is not None:
             shapes.append(_shape(page, rg, W))
         elif rg.kind == "table" and rg.table is not None:
@@ -195,7 +204,36 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
 
     if not texts and not images and not shapes:
         notes.append("這一頁沒有找到文字或可分離的元素，整頁以底圖輸出。")
-    return ElementList(page_index=page, production_line=ProductionLine.IMAGE, texts=texts, images=images, shapes=shapes, table_regions=tables, background=background, notes=notes)
+    return ElementList(page_index=page, production_line=ProductionLine.IMAGE, texts=texts, images=images, shapes=shapes, table_regions=tables, background=background, notes=notes,
+                       vectors=vectors)
+
+
+def _trace_vector(page: int, img: ImageElement, rgba: np.ndarray, origin_px: tuple[int, int], W: float, params: dict, notes: list[str]) -> Optional[VectorGraphic]:
+    """把一張插畫描成向量圖。輸入是裁好的 RGBA（透明度當遮罩）；重畫驗證過關才回傳，否則只在 notes 說明原因。
+    向量圖與圖片互指（image_id），四角與圖層順序相同；路徑換成頁面相對座標。所有數值都是量測值。"""
+    from ..recognition import vectorize as vz
+
+    h, w = rgba.shape[:2]
+    if min(h, w) < int(params.get("vector_min_size_px", 12)):
+        return None
+    try:
+        res = vz.vectorize(rgba[..., :3], rgba[..., 3] >= 128, params)
+    except Exception as e:  # 描圖失敗不中斷整頁：這張圖照常以圖片輸出
+        notes.append(f"有一張插畫描成向量時出錯（{type(e).__name__}），以圖片輸出。")
+        return None
+    if not res.accepted or not res.paths:
+        why = res.notes[-1] if res.notes else "重畫驗證未通過。"
+        notes.append(f"有一張插畫沒有描成向量，以圖片輸出：{why}")
+        return None
+    paths = vz.to_vector_paths(res, (origin_px[0] / W, origin_px[1] / W), 1.0 / W)
+    n_stroke = sum(1 for p in res.paths if p.stroke is not None)
+    kind = "chart" if n_stroke >= 3 and n_stroke >= 0.5 * len(res.paths) else "illustration"
+    info = [f"描圖：{len(paths)} 條路徑、{res.node_count} 個節點，重畫色差 ΔE {res.render_error:.2f}。"]
+    return VectorGraphic(
+        id=make_element_id(page, "vec", img.quad, img.id), image_id=img.id, quad=img.quad, z=img.z, paths=paths,
+        origin=measured("traced", float(res.confidence), Provenance.MEASURED, VECTOR_STEP), kind=kind,
+        render_error=float(res.render_error), notes=info + [n for n in res.notes if n],
+    )
 
 
 def _text_line(page: int, i: int, ol, attrs, W: float) -> TextLine:

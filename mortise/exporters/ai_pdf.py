@@ -16,6 +16,9 @@
 
 本模組的排版與繪製也給「可編輯 PDF」輸出器（pdf_editable）重用：_Fonts 可換字型載入方式、
 _Painter 在每個元素前後呼叫 begin／end 兩個掛勾（本模組不做事），子類別用它們寫結構標記。
+placed_lines 交出「排好的每一行在頁面上的位置」，回讀驗證拿它當預期值。
+_Layout.apply_fit 是「逐行對位」的入口（把排好的行改放到⑦量出來的位置）；只有 pdf_editable 會給它資料，
+本模組自己的輸出（也就是 7A 中性渲染）永遠是成品文件照段落屬性排出來的樣子，不做對位。
 
 降階對照表（成品文件的概念 → PDF 的物件 → 是否有損）：
   頁面尺寸（每頁可不同）     → 每頁各自的 MediaBox                          → 無損
@@ -363,6 +366,7 @@ class _Seg:
     run: StyledRun
     size: float
     faux_bold: bool
+    char_space: Optional[float] = None  # 逐行對位才有：這一段字自己的字距（pt）；None 表示用整行的字距
 
 
 @dataclass
@@ -381,6 +385,8 @@ class _Line:
     word_space: float = 0.0  # 左右對齊：整行一致的詞距（Tw），用於有空白的行（拉丁文字）
     nspaces: int = 0  # 行內（不含行尾）的空白數
     paragraph: str = ""
+    line_no: int = 0  # 這一行是所屬段落的第幾行（從 0 起）
+    gaps: dict = field(default_factory=dict)  # 逐行對位才有：{行內第幾個字: 在這個字之前多空多少 pt}（見 _Layout.apply_fit）
 
 
 def _can_break(a: str, b: str) -> bool:
@@ -426,6 +432,8 @@ class _Layout:
         self.deg = degradations
         self.slack = slack  # 文字框寬度中⑤多留的餘裕（pt）
         self.votes = {m: 0 for m in _METRICS}  # auto 模式下各量度被文字框選中的次數
+        self.fit: dict[str, dict] = {}  # 逐行對位（見 apply_fit）：{元素編號: {行的鍵: [dx, dy, 字距, [[第幾個字, 位移], …]]}}；空的表示不對位
+        self.fitted = 0  # 實際套用了逐行對位的行數
 
     def _chars(self, sp: StyledParagraph, element_id: str) -> list[tuple[str, float, _Face, StyledRun, float, bool]]:
         out = []
@@ -484,7 +492,7 @@ class _Layout:
             desc_by = {m: min((f.metrics[m][1] * z for f, z in pairs), default=-0.2 * size) for m in _METRICS}
             asc, desc = asc_by["hhea"], desc_by["hhea"]
             nsp = sum(1 for c in seg_chars if c[0] == " ")
-            lines.append(_Line(segs=segs, width=sum(c[1] for c in seg_chars), nchars=len(seg_chars), size=size, ascent=asc, descent=desc, asc_by=asc_by, desc_by=desc_by, nspaces=nsp, paragraph=sp.id))
+            lines.append(_Line(segs=segs, width=sum(c[1] for c in seg_chars), nchars=len(seg_chars), size=size, ascent=asc, descent=desc, asc_by=asc_by, desc_by=desc_by, nspaces=nsp, paragraph=sp.id, line_no=len(lines)))
         # 水平位置
         for i, ln in enumerate(lines):
             ind = indent if i == 0 else 0.0
@@ -549,6 +557,37 @@ class _Layout:
         return out
 
 
+    def apply_fit(self, lines: list[_Line], element_id: str, cell: Optional[tuple[int, int]] = None) -> None:
+        """逐行對位：把排好的行改放到指定的位置。只有呼叫端給了 self.fit 才有作用（本模組自己的輸出不用）。
+
+        用途：原生 PDF 進來時，⑦比對「排版結果」與「來源文字行」，發現行首位置或行內字距與來源不同
+        （來源軟體在中英交界加寬的間距、左右對齊的分配方式、行距取整後的累積誤差），就開修正單給可編輯 PDF 的輸出器。
+        每一行的修正是 [dx, dy, 字距, 位移清單]：行首沿基線方向移 dx、垂直基線方向（向下為正）移 dy；
+        字距是一個清單，行內每一段同字型的字各一個值（中英混排的行，中文與英文的字距可以不同），
+        取代排版原本為了左右對齊加的字距與詞距；位移清單的每一項是 [行內第幾個字, 在它之前多空多少 pt]。
+        行的鍵是「段落編號/段內第幾行」，表格儲存格前面再加「列,欄/」。"""
+        fit = self.fit.get(element_id) if self.fit else None
+        if not fit:
+            return
+        prefix = f"{cell[0]},{cell[1]}/" if cell is not None else ""
+        for ln in lines:
+            item = fit.get(f"{prefix}{ln.paragraph}/{ln.line_no}")
+            if not item or not ln.segs:
+                continue
+            dx, dy, tcs, gaps = item
+            if not isinstance(tcs, (list, tuple)):
+                tcs = [tcs] * len(ln.segs)
+            if len(tcs) != len(ln.segs):
+                continue  # 這張修正單不是照現在的排版開的（成品文件改過）：不套用，等⑦重新開
+            ln.x += float(dx)
+            ln.baseline += float(dy)
+            ln.char_space, ln.word_space = 0.0, 0.0
+            for sg, tc in zip(ln.segs, tcs):
+                sg.char_space = float(tc)
+            ln.gaps = {int(k): float(v) for k, v in gaps if int(k) > 0}
+            self.fitted += 1
+
+
 # ================================================================ 座標
 
 
@@ -582,6 +621,134 @@ class _Frame:
 
 def _rl(color: Color) -> RLColor:
     return RLColor(color.r / 255.0, color.g / 255.0, color.b / 255.0, alpha=float(color.a))
+
+
+def gradient_drawable(g: Any) -> bool:
+    """這個漸層寫不寫得成 PDF 的 shading：要有色標；線性漸層的兩個端點不能重合；放射漸層的半徑要大於 0。
+    寫不成的由呼叫端改用平均色填滿（回讀驗證也用這個函式判斷該不該有漸層物件）。"""
+    if g is None or not g.stops:
+        return False
+    if g.kind == "linear":
+        return len(g.coords) >= 4 and math.hypot(g.coords[2] - g.coords[0], g.coords[3] - g.coords[1]) > 1e-6
+    if g.kind == "radial":
+        return len(g.coords) >= 3 and g.coords[2] > 1e-6
+    return False
+
+
+# ================================================================ 繪製順序、表格幾何、排好的行
+
+
+def _page_order(page: StyledPage) -> list[tuple[str, Any]]:
+    """一頁的元素依繪製順序（圖層由下到上；同一層依文字、圖片、形狀、表格）。回傳（種類、元素）。"""
+    items = [(t.z, 0, "text", t) for t in page.text_boxes] + [(i.z, 1, "image", i) for i in page.images] + [(s.z, 2, "shape", s) for s in page.shapes] + [(t.z, 3, "table", t) for t in page.tables]
+    items.sort(key=lambda x: (x[0], x[1]))
+    return [(kind, item) for _, _, kind, item in items]
+
+
+def _table_rects(tb: StyledTable) -> list[tuple[Any, float, float, float, float]]:
+    """表格每個儲存格的範圍（儲存格、x、y、寬、高），相對於表格左上角（pt）；合併儲存格算整塊。"""
+    cols = [0.0]
+    for w in tb.col_widths_pt:
+        cols.append(cols[-1] + w)
+    rows = [0.0]
+    for h in tb.row_heights_pt:
+        rows.append(rows[-1] + h)
+    nr, nc = len(tb.row_heights_pt), len(tb.col_widths_pt)
+    rects = []
+    for cell in tb.cells:
+        r1, c1 = min(nr, cell.row + cell.row_span), min(nc, cell.col + cell.col_span)
+        rects.append((cell, cols[cell.col], rows[cell.row], cols[c1] - cols[cell.col], rows[r1] - rows[cell.row]))
+    return rects
+
+
+def _cell_lines(layout: "_Layout", tb: StyledTable, cell: Any, w: float, h: float) -> Optional[tuple[list[_Line], float, float]]:
+    """儲存格裡的文字行，以及文字區左上角相對於儲存格左上角的位移（已算入邊距與垂直對齊）。沒有文字回傳 None。"""
+    if not cell.paragraphs:
+        return None
+    t, r, btm, l = cell.margins_pt
+    inner_w, inner_h = max(1.0, w - l - r), h - t - btm
+    lines = layout.block(cell.paragraphs, inner_w, True, tb.id)
+    if not lines:
+        return None
+    content = lines[-1].baseline - lines[-1].descent
+    dy = 0.0
+    if cell.v_align == "middle":
+        dy = (inner_h - content) / 2
+    elif cell.v_align == "bottom":
+        dy = inner_h - content
+    layout.apply_fit(lines, tb.id, (cell.row, cell.col))
+    return lines, l, t + dy
+
+
+def _box_lines(layout: "_Layout", tb: StyledTextBox) -> list[_Line]:
+    """文字框裡的文字行（相對於文字框左上角）。"""
+    lines = layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, layout.slack if tb.wrap else 0.0, tb.box.h, getattr(tb, "first_baseline_pt", None))
+    layout.apply_fit(lines, tb.id)
+    return lines
+
+
+@dataclass
+class PlacedLine:
+    """排好的一行在頁面上的位置：成品文件經本模組排版後，這一行應該出現在哪裡（回讀驗證拿它當「預期」）。"""
+
+    owner: str  # 所屬文字框或表格的編號
+    paragraph: str  # 段落編號
+    cell: Optional[tuple[int, int]]  # 表格儲存格（列、欄）；文字框裡的行是 None
+    text: str
+    x: float  # 基線起點（頁面座標 pt，原點左上、y 向下）
+    y: float
+    angle_deg: float  # 順時針為正（與成品文件的 rotation 相同）
+    size: float  # 這一行最大的字級（pt）
+    chars: list[tuple[str, float, float]]  # 每個字：（字、沿基線方向距基線起點多少 pt、字級 pt）
+    families: list[str]  # 這一行用到的內嵌字族
+    line_no: int = 0  # 所屬段落的第幾行（從 0 起）
+    widths: list[float] = field(default_factory=list)  # 每個字本身的前進寬度（pt），不含字距、詞距與逐行對位的位移
+    seg_starts: list[int] = field(default_factory=list)  # 行內每一段同字型的字，從第幾個字開始
+
+
+def _place(lines: list[_Line], frame: _Frame, ox: float, oy: float, page_h: float, owner: str, cell: Optional[tuple[int, int]], angle: float) -> list[PlacedLine]:
+    out: list[PlacedLine] = []
+    for ln in lines:
+        if not ln.segs:
+            continue
+        px, py = frame.pt(ox + ln.x, oy + ln.baseline)
+        chars: list[tuple[str, float, float]] = []
+        widths: list[float] = []
+        seg_starts: list[int] = []
+        adv = 0.0
+        for sg in ln.segs:
+            seg_starts.append(len(chars))
+            space = ln.char_space if sg.char_space is None else sg.char_space
+            for ch in sg.text:
+                adv += ln.gaps.get(len(chars), 0.0)
+                chars.append((ch, adv, sg.size))
+                widths.append(sg.face.width(ch) * sg.size)
+                adv += widths[-1] + space + (ln.word_space if ch == " " else 0.0)
+        families = []
+        for sg in ln.segs:
+            if sg.face.family not in families:
+                families.append(sg.face.family)
+        out.append(PlacedLine(owner=owner, paragraph=ln.paragraph, cell=cell, text="".join(sg.text for sg in ln.segs), x=px, y=page_h - py,
+                              angle_deg=angle, size=ln.size, chars=chars, families=families, line_no=ln.line_no, widths=widths, seg_starts=seg_starts))
+    return out
+
+
+def placed_lines(page: StyledPage, layout: "_Layout") -> list[PlacedLine]:
+    """這一頁所有文字行排好之後的位置。排版與 _Painter 用的是同一套（_Layout.block、_cell_lines），元素的順序也相同
+    （首行上緣量度的自動選擇會參考先前的文字框，所以要依同樣的順序、逐頁用同一個 layout 呼叫）。"""
+    out: list[PlacedLine] = []
+    H = page.height_pt
+    for kind, item in _page_order(page):
+        if kind == "text":
+            out += _place(_box_lines(layout, item), _Frame(item.box, H), 0.0, 0.0, H, item.id, None, item.box.rotation)
+        elif kind == "table":
+            frame = _Frame(item.box, H)
+            for cell, x, y, w, h in _table_rects(item):
+                placed = _cell_lines(layout, item, cell, w, h)
+                if placed is not None:
+                    lines, dx, dy = placed
+                    out += _place(lines, frame, x + dx, y + dy, H, item.id, (cell.row, cell.col), item.box.rotation)
+    return out
 
 
 # ================================================================ 繪製
@@ -672,7 +839,7 @@ class _Painter:
 
     def text_box(self, tb: StyledTextBox) -> None:
         frame = _Frame(tb.box, self.H)
-        lines = self.layout.block(tb.paragraphs, tb.box.w, tb.wrap, tb.id, self.layout.slack if tb.wrap else 0.0, tb.box.h, getattr(tb, "first_baseline_pt", None))
+        lines = _box_lines(self.layout, tb)
         self.note_text_box(tb, lines)
         self.begin("text_box", tb)
         self.text_lines(lines, frame, 0.0, 0.0)
@@ -686,6 +853,7 @@ class _Painter:
         frame = _Frame(box, self.H)
         c = self.c
         c.saveState()
+        c.setFillAlpha(1.0)  # 影像也吃填色的不透明度：前一個元素若是半透明的字或色塊，不重設的話這張圖會跟著變半透明
         c.transform(*frame.upright(0.0, box.h))
         c.drawImage(str(self.store.blob_path(ref)), 0, 0, box.w, box.h, mask="auto")
         c.restoreState()
@@ -710,9 +878,9 @@ class _Painter:
     def _gradient(self, v: StyledVector, vp: StyledVectorPath) -> bool:
         """在目前的裁切範圍內畫漸層（PDF 的 shading）。畫不出來（色標或座標不合法）回傳 False，由呼叫端改用單色。"""
         g = vp.gradient
-        stops = sorted(g.stops, key=lambda s: s.offset) if g is not None else []
-        if g is None or not stops:
+        if not gradient_drawable(g):
             return False
+        stops = sorted(g.stops, key=lambda s: s.offset)
         c = self.c
         colors = [RLColor(s.color.r / 255.0, s.color.g / 255.0, s.color.b / 255.0) for s in stops]
         positions = [min(1.0, max(0.0, float(s.offset))) for s in stops]
@@ -722,15 +890,12 @@ class _Painter:
         alpha = sum(alphas) / len(alphas)
         if max(alphas) - min(alphas) > 1e-3:
             self.deg.append(Degradation(element_id=v.id, concept="漸層的不透明度", action=f"PDF 的漸層不能逐色標設定不透明度，整個漸層改用平均值 {alpha:.2f}", lossy=True))
-        if g.kind == "linear" and len(g.coords) >= 4 and math.hypot(g.coords[2] - g.coords[0], g.coords[3] - g.coords[1]) > 1e-6:
-            c.setFillAlpha(alpha)
+        c.setFillAlpha(alpha)
+        if g.kind == "linear":
             c.linearGradient(g.coords[0], g.coords[1], g.coords[2], g.coords[3], colors, positions, extend=True)
-            return True
-        if g.kind == "radial" and len(g.coords) >= 3 and g.coords[2] > 1e-6:
-            c.setFillAlpha(alpha)
+        else:
             c.radialGradient(g.coords[0], g.coords[1], g.coords[2], colors, positions, extend=True)
-            return True
-        return False
+        return True
 
     def vector_path(self, v: StyledVector, vp: StyledVectorPath) -> None:
         """向量圖的一條路徑：填色規則、漸層、筆畫寬度與端點接合都照成品文件寫。"""
@@ -822,17 +987,7 @@ class _Painter:
         if any(cell.number_format or cell.formula for cell in tb.cells):
             self.deg.append(Degradation(element_id=tb.id, concept="數字格式與公式", action="只保留顯示的文字", lossy=True))
         frame = _Frame(tb.box, self.H)
-        cols = [0.0]
-        for w in tb.col_widths_pt:
-            cols.append(cols[-1] + w)
-        rows = [0.0]
-        for h in tb.row_heights_pt:
-            rows.append(rows[-1] + h)
-        nr, nc = len(tb.row_heights_pt), len(tb.col_widths_pt)
-        rects = []
-        for cell in tb.cells:
-            r1, c1 = min(nr, cell.row + cell.row_span), min(nc, cell.col + cell.col_span)
-            rects.append((cell, cols[cell.col], rows[cell.row], cols[c1] - cols[cell.col], rows[r1] - rows[cell.row]))
+        rects = _table_rects(tb)
         c = self.c
         # 1. 底色
         self.enter("shape")
@@ -855,21 +1010,12 @@ class _Painter:
         self.end()
         # 3. 文字
         for cell, x, y, w, h in rects:
-            if not cell.paragraphs:
+            placed = _cell_lines(self.layout, tb, cell, w, h)
+            if placed is None:
                 continue
-            t, r, btm, l = cell.margins_pt
-            inner_w, inner_h = max(1.0, w - l - r), h - t - btm
-            lines = self.layout.block(cell.paragraphs, inner_w, True, tb.id)
-            if not lines:
-                continue
-            content = lines[-1].baseline - lines[-1].descent
-            dy = 0.0
-            if cell.v_align == "middle":
-                dy = (inner_h - content) / 2
-            elif cell.v_align == "bottom":
-                dy = inner_h - content
+            lines, dx, dy = placed
             self.begin("cell", tb, cell)
-            self.text_lines(lines, frame, x + l, y + t + dy)
+            self.text_lines(lines, frame, x + dx, y + dy)
             self.end()
 
     # ---------- 整頁
@@ -894,9 +1040,7 @@ class _Painter:
         if page.background_image is not None:
             self.image(page.background_image, Box(x=0, y=0, w=page.width_pt, h=page.height_pt), "background")
             self.deg.append(Degradation(element_id=f"background-{page.page_index + 1}", concept="尚未轉成可編輯物件的內容", action="保留在整頁底圖中", lossy=False))
-        items = [(t.z, 0, "text", t) for t in page.text_boxes] + [(i.z, 1, "image", i) for i in page.images] + [(s.z, 2, "shape", s) for s in page.shapes] + [(t.z, 3, "table", t) for t in page.tables]
-        items.sort(key=lambda x: (x[0], x[1]))
-        for _, _, kind, item in items:
+        for kind, item in _page_order(page):
             if kind == "text":
                 self.text_box(item)
             elif kind == "image":

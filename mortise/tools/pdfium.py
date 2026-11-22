@@ -100,7 +100,7 @@ class PaintInfo:
     blend: bool = False  # 混合模式不是一般（Normal）
     soft_mask: bool = False  # 套了透明遮罩
     in_group: bool = False  # 在「整組一起套透明效果」的表單裡（個別物件的不透明度不足以重現）
-    clip_rule: str = "nonzero"  # 最近一次裁切用的填色規則
+    clip_rule: str = "nonzero"  # 裁切用的填色規則："nonzero"、"evenodd"；先後用過兩種時是 "mixed"（不知道哪一條裁切路徑用哪一種）。四邊形的裁切不列入，因為兩種規則結果相同
 
 
 @dataclass
@@ -213,29 +213,86 @@ def segments_rect(pts: list[Segment], tol: float = 1e-3) -> Optional[tuple[float
     return l, b, r, t
 
 
-def _effective_clip(handle, ctm: tuple[float, ...], page_box: tuple[float, float, float, float]) -> list[list[Segment]]:
-    """真的會切到這個物件的裁切路徑（換到頁面空間）。矩形的裁切只要包住「物件在頁面內的部分」就不算：
-    軟體常常替每個物件都加一個整頁或整個圖框的裁切，那不影響畫面。"""
-    paths = _clip_paths(handle)
-    if not paths:
-        return []
+def convex_polygon(pts: list[Segment]) -> Optional[list[tuple[float, float]]]:
+    """這串線段若是一個凸多邊形（只有直線、只有一圈；矩形經過旋轉或傾斜後仍然是），回傳頂點（逆時針）。"""
+    if any(k == SEG_BEZIERTO for k, *_ in pts) or sum(1 for k, *_ in pts if k == SEG_MOVETO) != 1:
+        return None
+    xy: list[tuple[float, float]] = []
+    for _, x, y, _ in pts:
+        if not xy or abs(xy[-1][0] - x) > 1e-9 or abs(xy[-1][1] - y) > 1e-9:
+            xy.append((x, y))
+    if len(xy) >= 2 and abs(xy[0][0] - xy[-1][0]) <= 1e-9 and abs(xy[0][1] - xy[-1][1]) <= 1e-9:
+        xy.pop()
+    if not 3 <= len(xy) <= 64:
+        return None
+    area = sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(xy, xy[1:] + xy[:1])) / 2
+    if abs(area) < 1e-9:
+        return None
+    if area < 0:
+        xy.reverse()
+    # 每一個頂點都在每一條邊的左邊（或邊上）才是凸的；只看轉彎方向不夠（五角星每個彎都同方向）
+    for (x0, y0), (x1, y1) in zip(xy, xy[1:] + xy[:1]):
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length < 1e-12 or any((x1 - x0) * (y - y0) - (y1 - y0) * (x - x0) < -1e-6 * length for x, y in xy):
+            return None
+    return xy
+
+
+def _inside_convex(poly: list[tuple[float, float]], x: float, y: float, tol: float) -> bool:
+    """點是不是在凸多邊形（頂點逆時針）裡面；在邊外不到 tol 也算。"""
+    for (x0, y0), (x1, y1) in zip(poly, poly[1:] + poly[:1]):
+        if (x1 - x0) * (y - y0) - (y1 - y0) * (x - x0) < -tol * math.hypot(x1 - x0, y1 - y0):
+            return False
+    return True
+
+
+def _cut_to_box(poly: list[tuple[float, float]], box: tuple[float, float, float, float]) -> list[tuple[float, float]]:
+    """凸多邊形與軸對齊矩形（左、下、右、上）的交集（Sutherland–Hodgman）。沒有交集回傳空的清單。"""
+    l, b, r, t = box
+    for axis, limit, keep_greater in ((0, l, True), (0, r, False), (1, b, True), (1, t, False)):
+        out: list[tuple[float, float]] = []
+        for i, cur in enumerate(poly):
+            prev = poly[i - 1]
+            cur_in = cur[axis] >= limit if keep_greater else cur[axis] <= limit
+            prev_in = prev[axis] >= limit if keep_greater else prev[axis] <= limit
+            if cur_in != prev_in:
+                k = (limit - prev[axis]) / (cur[axis] - prev[axis])
+                out.append((prev[0] + k * (cur[0] - prev[0]), prev[1] + k * (cur[1] - prev[1])))
+            if cur_in:
+                out.append(cur)
+        poly = out
+        if not poly:
+            return []
+    return poly
+
+
+def _visible_hull(handle, ctm: tuple[float, ...], page_box: tuple[float, float, float, float]) -> Optional[list[tuple[float, float]]]:
+    """物件的外框（含筆畫寬度）換到頁面空間、再去掉頁面以外的部分。回傳這塊範圍的頂點；
+    讀不到外框回傳 None；整個物件都在頁面外回傳空的清單。"""
     own = _own_bounds(handle)
-    axis = abs(ctm[1]) + abs(ctm[2]) < 1e-9 or abs(ctm[0]) + abs(ctm[3]) < 1e-9  # 表單沒有被斜放：可以在頁面空間比較
+    if own is None:
+        return None
+    l, b, r, t = own
+    return _cut_to_box([affine_apply(ctm, x, y) for x, y in ((l, b), (r, b), (r, t), (l, t))], page_box)
+
+
+def _effective_clip(handle, ctm: tuple[float, ...], containers: list[tuple[object, tuple[float, ...]]], page_box: tuple[float, float, float, float]) -> list[list[Segment]]:
+    """真的會切到這個物件的裁切路徑（換到頁面空間）。
+    來源有兩個：物件自己身上的，以及外層每一個表單物件身上的（containers：表單物件與它所在那一層的矩陣）。
+    表單物件的裁切會套到表單裡的所有內容，但 PDFium 不會把它抄到裡面的物件上，要自己往外找。
+    裁切區若是凸多邊形（矩形，或矩形被旋轉、傾斜之後的樣子），而且包住「物件在頁面內的部分」，就不算：
+    軟體常常替每個物件都加一個整頁或整個圖框的裁切，那不影響畫面。"""
+    hull = _visible_hull(handle, ctm, page_box)
+    if hull is not None and not hull:
+        return []  # 整個物件在頁面外：看不到，有沒有裁切都一樣
     out: list[list[Segment]] = []
-    for pts in paths:
-        rect = segments_rect(pts)
-        if rect is not None and own is not None:
-            if axis:
-                (cx0, cy0), (cx1, cy1) = affine_apply(ctm, rect[0], rect[1]), affine_apply(ctm, rect[2], rect[3])
-                (ox0, oy0), (ox1, oy1) = affine_apply(ctm, own[0], own[1]), affine_apply(ctm, own[2], own[3])
-                c = (min(cx0, cx1), min(cy0, cy1), max(cx0, cx1), max(cy0, cy1))
-                o = (max(min(ox0, ox1), page_box[0]), max(min(oy0, oy1), page_box[1]), min(max(ox0, ox1), page_box[2]), min(max(oy0, oy1), page_box[3]))
-            else:
-                c, o = rect, own
-            tol = CLIP_TOLERANCE
-            if o[2] <= o[0] or o[3] <= o[1] or (c[0] <= o[0] + tol and c[1] <= o[1] + tol and c[2] >= o[2] - tol and c[3] >= o[3] - tol):
+    for owner, matrix in [(handle, ctm)] + list(containers):
+        for pts in _clip_paths(owner):
+            moved = [(k, *affine_apply(matrix, x, y), close) for k, x, y, close in pts]
+            poly = convex_polygon(moved)
+            if poly is not None and hull is not None and all(_inside_convex(poly, x, y, CLIP_TOLERANCE) for x, y in hull):
                 continue
-        out.append([(k, *affine_apply(ctm, x, y), close) for k, x, y, close in pts])
+            out.append(moved)
     return out
 
 
@@ -261,6 +318,7 @@ class PageReader:
             self._textpage = None
             self._objects: Optional[list] = None
             self._forms: dict[int, tuple[int, ...]] = {}
+            self._containers: dict[int, list[tuple]] = {}  # 繪製順序 → 外層的表單物件（由內到外），每項是（表單物件、它所在那一層的矩陣）
             self._paint: Optional[tuple[str, dict[int, PaintInfo]]] = None
             self._paths: Optional[list[RawPath]] = None
 
@@ -301,6 +359,14 @@ class PageReader:
             buf = ctypes.create_string_buffer(512)
             for i in range(n):
                 code = raw.FPDFText_GetUnicode(tp, i)
+                # 基本平面以外的字（數學字母、表情符號）PDFium 會拆成兩個代理碼回報：併回一個字，否則下游無法編碼
+                if 0xDC00 <= code <= 0xDFFF:
+                    if out and len(out[-1].text) == 1 and 0xD800 <= ord(out[-1].text) <= 0xDBFF:
+                        out[-1].text = chr(0x10000 + ((ord(out[-1].text) - 0xD800) << 10) + (code - 0xDC00))
+                        continue
+                    code = 0xFFFD  # 落單的代理碼：換成「無法辨識」的替代字
+                if out and len(out[-1].text) == 1 and 0xD800 <= ord(out[-1].text) <= 0xDBFF:
+                    out[-1].text = "\ufffd"
                 text = chr(code) if code else ""
                 generated = bool(raw.FPDFText_IsGenerated(tp, i))
                 ox, oy = ctypes.c_double(), ctypes.c_double()
@@ -354,6 +420,8 @@ class PageReader:
                         ascent=(ascent * vscale) or size * 0.9, descent=(descent * vscale) or -size * 0.2, hscale=hscale,
                     )
                 )
+            if out and len(out[-1].text) == 1 and 0xD800 <= ord(out[-1].text) <= 0xDBFF:
+                out[-1].text = "\ufffd"
             return out
 
     # ---------- 物件 ----------
@@ -362,6 +430,7 @@ class PageReader:
         if self._objects is None:
             objs = []
             form_z: dict[int, int] = {}  # 表單物件的識別值 → 繪製順序
+            layer: dict[int, tuple] = {}  # 表單物件的繪製順序 →（表單物件、它所在那一層的矩陣）
             for z, obj in enumerate(self.page.get_objects(max_depth=MAX_FORM_DEPTH)):
                 ctm = IDENTITY
                 chain: list[int] = []
@@ -372,7 +441,9 @@ class PageReader:
                     container = container.container
                 if obj.type == raw.FPDF_PAGEOBJ_FORM:
                     form_z[_key(obj.raw)] = z
+                    layer[z] = (obj.raw, ctm)
                 self._forms[z] = tuple(reversed(chain))
+                self._containers[z] = [layer[fz] for fz in chain if fz in layer]
                 objs.append((z, obj, ctm))
             self._objects = objs
         return self._objects
@@ -474,7 +545,7 @@ class PageReader:
                         stroke_cap=_CAPS.get(raw.FPDFPageObj_GetLineCap(obj.raw), "butt"),
                         stroke_join=_JOINS.get(raw.FPDFPageObj_GetLineJoin(obj.raw), "miter"),
                         dash=dash, dash_phase=phase.value * scale, uniform_scale=uniform,
-                        visual_bounds=_page_bounds(obj.raw, ctm), clip=_effective_clip(obj.raw, ctm, page_box),
+                        visual_bounds=_page_bounds(obj.raw, ctm), clip=_effective_clip(obj.raw, ctm, self._containers.get(z, []), page_box),
                         transparent=bool(raw.FPDFPageObj_HasTransparency(obj.raw)),
                         paint=paint.get(z), forms=self._forms.get(z, ()),
                     )
@@ -493,7 +564,8 @@ class PageReader:
                 box = _page_bounds(obj.raw, ctm)
                 if box is None:
                     continue
-                clip = [[(k, *affine_apply(ctm, x, y), c) for k, x, y, c in path] for path in _clip_paths(obj.raw)]
+                clip = [[(k, *affine_apply(matrix, x, y), c) for k, x, y, c in path]
+                        for owner, matrix in [(obj.raw, ctm)] + self._containers.get(z, []) for path in _clip_paths(owner)]  # 外層表單物件的裁切也算
                 out.append(RawShading(z=z, bounds=box, clip=clip, nested=obj.level > 0, paint=paint.get(z), forms=self._forms.get(z, ()), _obj=obj))
             return out
 
@@ -577,10 +649,12 @@ class PageReader:
             scale = dpi / 72.0
             return math.ceil(self.page.get_width() * scale), math.ceil(self.page.get_height() * scale)
 
-    def render_only(self, groups: list[tuple[set[int], float, tuple[int, int, int, int]]]) -> list[Image.Image]:
-        """每一組只畫指定的物件（其餘全部隱藏），透明底，回傳 RGBA 影像（顏色沒有預乘不透明度）。
+    def render_only(self, groups: list[tuple[set[int], float, tuple[int, int, int, int]]], each=None) -> list[Image.Image]:
+        """每一組只畫指定的物件（其餘全部隱藏），透明底，得到 RGBA 影像（顏色沒有預乘不透明度）。
         groups 的每一項是（要畫的物件的繪製順序、解析度 dpi、像素範圍）。像素範圍（左、上、右、下）以「整頁用這個
-        解析度渲染」的像素格為準（見 render_size），只畫這一塊。不畫註解與表單欄位。"""
+        解析度渲染」的像素格為準（見 render_size），只畫這一塊。不畫註解與表單欄位。
+        有給 each 時，每畫好一張就呼叫 each(第幾組, 影像)，不把影像留在記憶體裡（一頁可能有上百組），回傳空的清單；
+        沒給就回傳全部影像。"""
         with LOCK:
             objs = self._walk()
             by_z = {z: obj for z, obj, _ in objs}
@@ -594,7 +668,7 @@ class PageReader:
                     hidden.append(obj)
             out: list[Image.Image] = []
             try:
-                for show, dpi, (x0, y0, x1, y1) in groups:
+                for index, (show, dpi, (x0, y0, x1, y1)) in enumerate(groups):
                     full_w, full_h = self.render_size(dpi)
                     shown = [by_z[z] for z in show if z in by_z]
                     for obj in shown:
@@ -604,10 +678,15 @@ class PageReader:
                         bitmap = pdfium.PdfBitmap.new_native(w, h, raw.FPDFBitmap_BGRA, rev_byteorder=True)
                         bitmap.fill_rect((0, 0, 0, 0), 0, 0, w, h)
                         raw.FPDF_RenderPageBitmap(bitmap, self.page, -x0, -y0, full_w, full_h, 0, raw.FPDF_REVERSE_BYTE_ORDER)
-                        out.append(bitmap.to_pil().convert("RGBA").copy())
+                        image = bitmap.to_pil().convert("RGBA").copy()
+                        bitmap.close()
                     finally:
                         for obj in shown:
                             raw.FPDFPageObj_SetIsActive(obj.raw, False)
+                    if each is not None:
+                        each(index, image)
+                    else:
+                        out.append(image)
             finally:
                 for obj in hidden:
                     raw.FPDFPageObj_SetIsActive(obj.raw, True)
@@ -716,7 +795,7 @@ def _needs_paint_scan(page) -> bool:
 class _ScanState:
     """掃描時跟著 q／Q 存取的繪圖狀態（只留判斷需要的部分）。"""
 
-    __slots__ = ("ctm", "fill_pat", "stroke_pat", "blend", "smask", "ca", "CA", "cap", "clip_rule", "group")
+    __slots__ = ("ctm", "fill_pat", "stroke_pat", "blend", "smask", "ca", "CA", "cap", "clip_rule", "clip_seen", "group")
 
     def __init__(self) -> None:
         self.ctm = IDENTITY
@@ -728,6 +807,7 @@ class _ScanState:
         self.CA = 1.0  # 筆畫的不透明度
         self.cap = 0
         self.clip_rule = "nonzero"
+        self.clip_seen = False  # 有沒有出現過「填色規則會影響結果」的裁切路徑
         self.group = False
 
     def copy(self) -> "_ScanState":
@@ -803,7 +883,6 @@ class _PaintScanner:
             return
         if len(pts) == 1:
             if clip:
-                st.clip_rule = "nonzero"
                 return
             only = pts[0]
             if only[2] != _PT_MOVE or not only[3] or st.cap != 1:
@@ -814,8 +893,13 @@ class _PaintScanner:
             pts.pop()
         if fills or strokes:
             self.records.append(("path", len(pts), self._info(st, base, fills, strokes)))
-        if clip:
-            st.clip_rule = clip
+        corners = len(pts) - (1 if len(pts) >= 2 and pts[-1][:2] == pts[0][:2] else 0)
+        if clip and not (corners <= 4 and all(q[2] != _PT_BEZIER for q in pts)):
+            # 三角形、四邊形的裁切（最常見的是矩形）用哪一種規則結果都一樣，不列入
+            if not st.clip_seen:
+                st.clip_rule, st.clip_seen = clip, True
+            elif st.clip_rule != clip:
+                st.clip_rule = "mixed"
 
     # ---------- 狀態 → PaintInfo ----------
     def _info(self, st: _ScanState, base: tuple[float, ...], fills: bool, strokes: bool) -> PaintInfo:
