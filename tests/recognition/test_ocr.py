@@ -573,3 +573,16 @@ if __name__ == "__main__":
         if "-v" in sys.argv:
             for l in v["lines"]:
                 print("    ", repr(l.text), round(l.score, 3), l.notes)
+
+
+def test_rule_line_above_text_keeps_spaces():
+    """文字上方有一條橫線（海報常見的分隔線）時，橫線不可被當成 i 的點那樣併進這一行：
+    併進來會填滿字間空隙，「12 – 14 JULY 2027」就會讀成「12–14JULY2027」（實際發生過的錯誤）。"""
+    canvas = Image.new("RGB", (1500, 260), (245, 235, 215))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([40, 40, 1460, 50], fill=(40, 45, 70))  # 橫線：離字上緣約 30 像素
+    font = ImageFont.truetype(SANS_B, 150)
+    draw.text((40, 80), "12 – 14 JULY 2027", font=font, fill=(40, 45, 70))
+    lines = engine().read(np.asarray(canvas))
+    texts = [ln.text for ln in lines]
+    assert "12 – 14 JULY 2027" in texts, texts

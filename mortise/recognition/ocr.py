@@ -135,6 +135,7 @@ DEFAULT_PARAMS: dict = {
     "cc_x_tol": 0.1,  # 連通塊中心可超出偵測框左右的距離（× 偵測框高）
     "cc_max_height": 1.3,  # 連通塊高 ÷ 偵測框高超過此值視為框線或圖形，不屬於本行（倍）
     "cc_attach_above": 0.35,  # 不碰核心帶的小塊，中心在行上緣以上此距離內（× 墨跡行高）就併入（i 的點、引號）
+    "cc_attach_max_width": 1.5,  # 併入的小塊寬度上限（× 墨跡行高）：更寬的是文字上下的橫線或底線，不是 i 的點或引號；併進來會填滿字間空隙，空白就判斷不出來
     "clean_dilate_px": 2,  # 塗掉其他行伸進來的筆畫時外擴的像素（攤平影像像素）
     # ---- 辨識
     "rec_height": 48,  # 辨識模型輸入高（像素；PP-OCR 固定 48）
@@ -918,7 +919,8 @@ def _second_pass(img: np.ndarray, c: _Cand, p: dict) -> None:
     # 併入小塊的條件：中心在偵測框上下範圍內（避免吃到上一行斷開的筆畫）、離本行上緣不遠
     above = (cy >= max(top - p["cc_attach_above"] * lh, r0)) & (cy <= bot)
     touch_band = (ys < bot) & (ys + hs > top) & (cy <= r1)  # 逗號、分號下半部會伸出基線
-    attach = (~keep) & in_x & inside & (areas >= 2) & (hs < 0.6 * lh) & (above | touch_band)
+    narrow = ws <= p["cc_attach_max_width"] * lh
+    attach = (~keep) & in_x & inside & (areas >= 2) & (hs < 0.6 * lh) & narrow & (above | touch_band)
     keep = keep | attach
     ids = np.nonzero(keep)[0] + 1
     kept = np.isin(labels, ids)
