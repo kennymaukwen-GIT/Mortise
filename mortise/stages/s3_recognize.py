@@ -10,6 +10,7 @@
     s3.pdf_shapes  沒有成群的路徑：認出矩形、圓角矩形、橢圓、直線；其他簡單的保留成自訂路徑
     s3.tables      由框線找表格區（區域與格線位置；列欄結構在④）
     s3.background  隱藏已擷取的物件後重繪，得到底圖（不是生成）
+    s3.outlined_text、s3.embedded  被扁平化的內容變回可編輯的：外框字轉回文字、內嵌圖片裡的文字與圖形拆開（見 s3_flattened.py）
   影像產線（掃描、截圖、照片）：見 s3_image_line.py（文字辨識、文字屬性、區域、裁圖、底圖修補）。
     失敗時退回 s3.image_stub：整頁當成一張圖片交出，並在備註中說明原因。
 """
@@ -53,7 +54,7 @@ def run(doc: SourceDoc, spec: PageSpec, cfg: Config, corrections: list[Correctio
     ref = doc.pages[spec.page_index]
     kind = ref.input_type.value
     if doc.media_type == "application/pdf" and kind in (InputType.NATIVE_PDF, InputType.MIXED_PDF):
-        elements = _extract_line(doc, spec, cfg, store)
+        elements = _extract_line(doc, spec, cfg, store, ai)
     elif cfg.section("recognize").get("image_line", True):
         try:
             from . import s3_image_line
@@ -86,7 +87,7 @@ def _image_line(spec: PageSpec) -> ElementList:
 # ====================================================================== 擷取產線（原生 PDF）
 
 
-def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> ElementList:
+def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
     c = cfg.section("recognize")
     m = spec.source_to_page
     src_w = math.hypot(spec.source_corners[1].x - spec.source_corners[0].x, spec.source_corners[1].y - spec.source_corners[0].y)
@@ -113,15 +114,18 @@ def _extract_line(doc: SourceDoc, spec: PageSpec, cfg: Config, store: Store) -> 
         background = _background(reader, spec, c, store, image_z | shape_z | vector_z | outlined_z, page_color)
         tables, absorbed = _tables(shapes, [t for t in texts if not t.hidden], spec, c)
         shapes = [sh for sh in shapes if sh.id not in absorbed]
+        if any(t.hidden for t in texts):
+            notes.append("這一頁有不可見文字（多半是 OCR 文字層），已標記為隱藏，不會輸出。")
+        elements = ElementList(
+            page_index=spec.page_index, production_line=ProductionLine.EXTRACT,
+            texts=texts, images=images + vector_images, shapes=shapes, table_regions=tables, background=background, notes=notes, vectors=vectors,
+        )
+        # 內嵌圖片裡的文字與平面圖形（截圖、壓平的圖表）：拆開併進來（向量圖對應的圖片不算；要用到圖片的四角，所以在關檔之前）
+        elements = s3_flattened.embedded_images(elements, {im.id for im in images}, spec, cfg, store, ai, reader)
     finally:
         reader.close()
         pdoc.close()
-    if any(t.hidden for t in texts):
-        notes.append("這一頁有不可見文字（多半是 OCR 文字層），已標記為隱藏，不會輸出。")
-    return ElementList(
-        page_index=spec.page_index, production_line=ProductionLine.EXTRACT,
-        texts=texts, images=images + vector_images, shapes=shapes, table_regions=tables, background=background, notes=notes, vectors=vectors,
-    )
+    return elements
 
 
 # ---------- s3.pdf_text ----------

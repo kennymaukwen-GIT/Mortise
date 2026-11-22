@@ -5,6 +5,9 @@
   2. 核心：二階差分與梯度都小的像素連通成「核心」。純色區、平滑漸層區都會成為核心；邊緣（含反鋸齒的混色帶）不會。
   3. 模型：每個核心擬合成純色、線性漸層或放射漸層；都不合才用分群切成幾個純色塊。
   4. 混色：非核心像素解釋成附近兩個核心顏色的混合，投影在兩色連線上的位置就是覆蓋率（邊界的次像素資訊）。
+     找不到時再看鄰近像素已解釋好的區域（斜的細線只有零星幾段核心）。偵測到 JPEG 的色度縮小取樣時，
+     色度與亮度各有自己的混合比例、覆蓋率取亮度（亮度是全解析度的），並容許邊緣的過衝；
+     貼著邊緣、與相鄰區域只差一點的小塊（振鈴）併回相鄰區域。
   5. 細節：解釋不了的像素（細線、小圖案，兩側都沒有自己的核心）另立區域，顏色取離底色最遠的一群。
   6. 合併：相鄰而顏色相同的區域合成一個。
 結果是「兩標籤覆蓋率圖」：每個像素記主要區域、次要區域、主要區域的覆蓋率（0.5 到 1）。
@@ -50,6 +53,7 @@ class Segmentation:
     blur_px: float  # 邊緣過渡帶的寬度估計（高斯 σ，像素）
     reject: Optional[str] = None  # 不適合向量化的原因
     stats: dict = field(default_factory=dict)
+    clip: Optional[np.ndarray] = None  # float32 (H, W)：有給遮罩時，每個區域的覆蓋率再乘上它（路徑不超出遮罩）
 
 
 def _lap_grad(F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -219,6 +223,30 @@ def _seg_dist(I: np.ndarray, C1: np.ndarray, C2: np.ndarray, over: float = 0.0) 
     return np.sqrt(np.einsum("ij,ij->i", d, d)), np.clip(t, 0.0, 1.0), np.sqrt(vv)
 
 
+def _seg_dist_split(I: np.ndarray, C1: np.ndarray, C2: np.ndarray, over: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """色度被縮小取樣過（JPEG 4:2:0）時的兩色混合：亮度與色度各有自己的混合比例。
+
+    輸入已經換到 _metric 的座標（第 0 軸是亮度，第 1、2 軸是色度）。亮度是全解析度的，混合比例 tY 就是覆蓋率；
+    色度被抹開，混合比例 tC 可以是 0 到 1 之間任何值（靠近邊緣的像素，色度常常是兩色的中間值，亮度卻已經是某一邊）。
+    距離是像素到這個「亮度一條線 × 色度一條線」的平行四邊形的距離。兩色亮度幾乎相同時，覆蓋率改由色度決定。"""
+    v = C2 - C1
+    w = I - C1
+    vv = np.einsum("ij,ij->i", v, v)
+    vY, wY = v[:, 0], w[:, 0]
+    vC, wC = v[:, 1:], w[:, 1:]
+    vcc = np.einsum("ij,ij->i", vC, vC)
+    tY = np.clip(wY / np.where(np.abs(vY) > 1e-6, vY, 1e-6), -over, 1.0 + over)
+    tC = np.clip(np.einsum("ij,ij->i", wC, vC) / np.maximum(vcc, 1e-6), -over, 1.0 + over)
+    luma_ok = np.abs(vY) >= 0.3 * np.sqrt(vv)
+    t_all = np.clip(np.einsum("ij,ij->i", w, v) / np.maximum(vv, 1e-6), -over, 1.0 + over)
+    tY = np.where(luma_ok, tY, t_all)
+    tC = np.where(luma_ok, tC, t_all)
+    dY = wY - tY * vY
+    dC = wC - tC[:, None] * vC
+    d = np.sqrt(dY * dY + np.einsum("ij,ij->i", dC, dC))
+    return d, np.clip(tY, 0.0, 1.0), np.sqrt(vv)
+
+
 def _metric(wc: float) -> np.ndarray:
     """混色判斷用的色彩距離：沿亮度方向不變，垂直於亮度的色度方向乘上 wc。
 
@@ -374,6 +402,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
     stats["chroma_weight"] = wc
     # 過衝：壓縮、雙三次放大、銳化都會讓邊緣旁邊比兩側更亮或更暗。沒量到雜訊時只容許小幅過衝（放大造成的約一成）
     over = float(P["overshoot"]) if wc < 1.0 else float(P["overshoot_clean"])
+    two_dist = _seg_dist_split if subsampled else _seg_dist
     M = _metric(wc)
     Iw = (I.reshape(-1, 3) @ M.T).reshape(H, W, 3)
     predw = (pred.reshape(-1, 3) @ M.T).reshape(H, W, 3)
@@ -398,7 +427,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                 if not diff.any():
                     continue
                 Cj = predw[yy, xx]
-                d, t, vv = _seg_dist(Ip, C1, Cj, over)
+                d, t, vv = two_dist(Ip, C1, Cj, over)
                 d = np.where(diff & (vv > 2.0 * tau0), d - float(P["explain_slack"]) * vv * np.minimum(t, 1 - t) * 2.0, np.inf)
                 better = d < best_d
                 best_d = np.where(better, d, best_d)
@@ -430,7 +459,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
                     if not diff.any():
                         continue
                     Cj = flat_w[np.maximum(j, 0)]
-                    d, t, vv = _seg_dist(Iu, Cu, Cj, over)
+                    d, t, vv = two_dist(Iu, Cu, Cj, over)
                     d = np.where(diff & (vv > 2.0 * tau0), d - float(P["explain_slack"]) * vv * np.minimum(t, 1 - t) * 2.0, np.inf)
                     better = d < bd
                     bd = np.where(better, d, bd)
@@ -594,7 +623,7 @@ def segment(image: np.ndarray, P: dict) -> Segmentation:
         stats["absorbed_px"] = absorbed
         stats["features"] = int(sum(1 for r in regions if r.thin))
     # ---------- 5. 相鄰同色合併
-    labels, second, regions = _merge_same(labels, second, regions, max(float(P["merge_de"]), 2.5 * sigma * 0.6), P)
+    labels, second, regions = _merge_same(labels, second, regions, max(float(P["merge_de"]), 2.5 * sigma * 0.6), P, wc)
     alpha = np.where(second < 0, np.float32(1.0), alpha).astype(np.float32)
     # ---------- 6. 區域統計與邊緣寬度
     n_reg = len(regions)
@@ -658,8 +687,9 @@ def _split_colors(lab_px: np.ndarray, de: float, kmax: int) -> np.ndarray:
     return assign
 
 
-def _merge_same(labels: np.ndarray, second: np.ndarray, regions: list[RegionModel], de: float, P: dict):
-    """相鄰而顏色相同（ΔE 在容許內）的純色區域合併；漸層區域不參與。回傳重新編號後的結果。"""
+def _merge_same(labels: np.ndarray, second: np.ndarray, regions: list[RegionModel], de: float, P: dict, wc: float = 1.0):
+    """相鄰而顏色相同（ΔE 在容許內）的純色區域合併；漸層區域不參與。回傳重新編號後的結果。
+    wc < 1（色度被縮小取樣過）時，色差的 a、b 分量乘上 wc：JPEG 的 8×8 區塊會讓同一塊顏色的色度各差一點。"""
     n = len(regions)
     if n < 2:
         return labels, second, regions
@@ -668,6 +698,7 @@ def _merge_same(labels: np.ndarray, second: np.ndarray, regions: list[RegionMode
     diff = a != b
     pairs = np.unique(np.minimum(a[diff], b[diff]).astype(np.int64) * n + np.maximum(a[diff], b[diff]))
     lab_tab = cv2.cvtColor((np.stack([r.color for r in regions])[None] / 255.0).astype(np.float32), cv2.COLOR_RGB2Lab)[0]
+    lab_tab = lab_tab * np.array([1.0, wc, wc], dtype=np.float32)
     parent = list(range(n))
 
     def find(i):

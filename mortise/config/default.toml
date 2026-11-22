@@ -68,6 +68,19 @@ pdf_outlined_ocr_min_dpi = 72        # 那張影像的解析度範圍（dpi）
 pdf_outlined_ocr_max_dpi = 600
 pdf_outlined_ocr_max_pixels = 16000000  # 那張影像的像素上限
 pdf_outlined_font_probe_lines = 3    # 每群取最長的幾行做字型重繪比對（其餘的行只用幾何在這些候選中挑）
+pdf_embedded_images = true           # 內嵌圖片裡的文字與平面圖形（截圖、壓平的圖表）：用影像產線拆開，併進這一頁
+pdf_embedded_max_per_page = 8        # 一頁最多檢查幾張圖片（由大到小）
+pdf_embedded_page_pixels = 24000000  # 一頁所有圖片的工作影像像素總量上限；用完就不再檢查剩下的圖片
+pdf_embedded_max_pixels = 8000000    # 單張圖片的工作影像像素上限；超過就縮小再處理
+pdf_embedded_min_pixels = 48         # 圖片的短邊不到這麼多像素就不檢查（小圖示）
+pdf_embedded_min_area = 0.003        # 圖片在頁面上的面積不到頁面的這個比例就不檢查
+pdf_embedded_min_flat = 0.5          # 平塗像素（與鄰點幾乎同色）的比例低於這個值當成照片，不拆（初始值）
+pdf_embedded_min_text_confidence = 0.8  # 辨識信心值至少這麼高、而且有兩個以上字母數字或漢字的行，才算「圖裡有字」（初始值）
+pdf_embedded_min_text_lines = 1      # 圖裡至少有幾行這樣的字才拆
+pdf_embedded_min_graphics = 3        # 或至少有幾個平塗圖形（形狀、表格、描成向量的插畫）才拆；只有一兩個色塊的標誌維持圖片（初始值）
+pdf_embedded_min_dpi = 150           # 工作影像的解析度範圍（dpi）：太低的放大（最多 pdf_embedded_max_upscale 倍），太高的縮小
+pdf_embedded_max_dpi = 300
+pdf_embedded_max_upscale = 3.0
 # ---- 描圖向量化（recognition/vectorize.py）：設定加在這一行下面，名稱以 vector_ 開頭 ----
 vector_enabled = true                # 影像產線：插畫（標誌、圖示、圖表）描成向量路徑；照片不描
 vector_min_size_px = 12              # 寬或高小於此像素的插畫不描
@@ -83,6 +96,12 @@ vector_stroke_max_width_px = 8.0     # 寬度在此值以內而且等寬的細�
 vector_layered = true                # 分層輸出：被上層遮住的部分補成完整形狀；關掉則全部是互相挖洞的拼圖
 vector_gradients = true              # 偵測線性與放射漸層
 vector_max_megapixels = 16.0         # 影像大於此值（百萬像素）先縮小再描
+vector_chroma_subsampled_below = 0.7  # 色度邊緣的銳利程度不到亮度的這個比例，判定是 JPEG 4:2:0（量到：JPEG 0.34–0.53，其他 0.96–1.27）
+vector_chroma_weight = 0.4           # 判定 JPEG 或雜訊大時，混色判斷裡色度方向的權重（色度被抹寬，亮度仍準；初始值）
+vector_overshoot = 0.2               # 壓縮過的圖容許邊緣像素超出兩色連線兩端的比例（過衝；初始值）
+vector_overshoot_clean = 0.12        # 沒量到雜訊時容許的過衝比例（雙三次放大約一成；初始值）
+vector_ring_fraction = 0.22          # 貼著邊緣、與相鄰區域色差在「邊緣兩側色差 × 此值」以內的小塊當成振鈴併回去（初始值）
+vector_feature_colors = 6            # 連成一塊的細線（圖表的軸、格線、資料線）最多拆成幾種顏色
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）

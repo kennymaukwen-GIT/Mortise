@@ -917,14 +917,15 @@ def _ellipse_dist(pts: np.ndarray, cx, cy, a, b, th) -> np.ndarray:
 
 
 def _robust_err(d: np.ndarray) -> float:
-    """擬合偏差的穩健上限：第 95 百分位，與最大值的 1/2.5 取大者。
+    """擬合偏差的穩健上限：第 95 百分位，與第 99 百分位的 1/2.5 取大者。
 
     壓縮過或有雜訊的邊緣偶爾有一兩個點偏得特別遠（8×8 區塊交界、三色交會處）；只看最大值會因為一個點就認不出圓或矩形，
-    只看百分位又可能放過真的不是基本幾何的形狀，所以兩個都看：大部分點在容許內，而且沒有任何點超過容許的 2.5 倍。"""
+    只看第 95 百分位又可能放過真的不是基本幾何的形狀（局部的凹口），所以兩個都看：大部分點在容許內，
+    而且除了最遠的百分之一，沒有點超過容許的 2.5 倍。"""
     a = np.abs(np.asarray(d, dtype=np.float64))
     if a.size == 0:
         return 0.0
-    return max(float(np.percentile(a, 95)), float(a.max()) / 2.5)
+    return max(float(np.percentile(a, 95)), float(np.percentile(a, 99)) / 2.5)
 
 
 def fit_primitive(pts: np.ndarray, tol: float, opts: Optional[dict] = None, full: bool = True) -> Optional[PrimFit]:
@@ -1011,16 +1012,23 @@ def _fit_rrect(P: np.ndarray, tol: float, o: dict, full: bool) -> Optional[PrimF
     hi = [mx + mw, my + mh, th0 + 0.6, hx0 * 3 + 2, hy0 * 3 + 2, max(hx0, hy0) * 3 + 2]
     best = None
     for r0 in (0.0 + 1e-3, 0.3 * min(hx0, hy0), 0.9 * min(hx0, hy0)):
-        try:
-            sol = least_squares(lambda p: _rrect_sdf(p, sub), [mx, my, th0, hx0, hy0, r0], bounds=(lo, hi), method="trf", max_nfev=60,
-                                loss="soft_l1", f_scale=max(tol, 0.1))
-        except Exception:
-            continue
-        d = _rrect_sdf(sol.x, P)
-        m = _robust_err(d)
-        if best is None or m < best[1]:
-            best = (sol.x, m, d)
-        if m <= tol * 0.5:
+        # 先用一般的最小平方；不夠好再以穩健損失（soft_l1）從那個解出發微調，讓少數離群點（壓縮的區塊交界）不拉偏整個形狀。
+        # 不能一開始就用穩健損失：圓角只佔輪廓的一小部分，會被當成離群點，收斂成尖角的矩形。
+        x0 = [mx, my, th0, hx0, hy0, r0]
+        for loss in ("linear", "soft_l1"):
+            try:
+                sol = least_squares(lambda p: _rrect_sdf(p, sub), x0, bounds=(lo, hi), method="trf", max_nfev=60,
+                                    loss=loss, f_scale=max(tol, 0.1))
+            except Exception:
+                break
+            d = _rrect_sdf(sol.x, P)
+            m = _robust_err(d)
+            if best is None or m < best[1]:
+                best = (sol.x, m, d)
+            if m <= tol:
+                break
+            x0 = np.clip(sol.x, lo, hi)
+        if best is not None and best[1] <= tol * 0.5:
             break
     if best is None:
         return None

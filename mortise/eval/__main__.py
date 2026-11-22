@@ -8,6 +8,8 @@
   python -m mortise.eval feedback-import 樣本目錄 --store 回饋庫目錄          匯入樣本旁的 .feedback.json
   python -m mortise.eval annotations --store 回饋庫目錄 --out 標註.jsonl [--jobs 評測輸出目錄]
   python -m mortise.eval calibrate 標註.jsonl [--stage 3] [--field font_size]
+  python -m mortise.eval vector --out 輸出目錄 [--samples 真實樣本目錄] [--limit N] [--variants clean,jpeg,...] [--no-vtracer]
+                         [--baseline 基準.json] [--save-baseline 基準.json]      描圖向量化評測
 
 樣本目錄的放法見 mortise/eval/runner.py 開頭的說明。
 """
@@ -59,6 +61,18 @@ def main(argv: list[str] | None = None) -> int:
     ca.add_argument("annotations", type=Path)
     ca.add_argument("--stage", type=int)
     ca.add_argument("--field")
+    vb = sub.add_parser("vector", help="描圖向量化評測（合成真值，對照 VTracer 0.6.15）")
+    vb.add_argument("--out", type=Path, required=True)
+    vb.add_argument("--samples", type=Path, help="真實樣本目錄（PNG、JPEG；沒有真值，只報重繪誤差、節點數、耗時）")
+    vb.add_argument("--limit", type=int, help="只跑前 N 個合成樣本（每一類平均取）")
+    vb.add_argument("--variants", default="clean,down,up,blur,jpeg,noise", help="干擾種類，逗號分隔")
+    vb.add_argument("--categories", default="", help="只跑這些圖形類型（逗號分隔；空字串表示全部）")
+    vb.add_argument("--no-vtracer", action="store_true", help="不跑 VTracer 對照組")
+    vb.add_argument("--no-panels", action="store_true", help="不輸出每個樣本的並排圖")
+    vb.add_argument("--baseline", type=Path, help="與這個基準比較（寬鬆門檻），退步就回傳 1")
+    vb.add_argument("--save-baseline", type=Path, help="把這次的分組數字存成基準檔")
+    vb.add_argument("--seed", type=int)
+    vb.add_argument("--config", type=Path)
     a = ap.parse_args(argv)
     say = lambda s: print(s, file=sys.stderr)  # noqa: E731
 
@@ -120,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
         tab = calibration_from_annotations(read_annotations(a.annotations), a.stage, a.field)
         print(json.dumps(tab.to_dict(), ensure_ascii=False, indent=1))
         return 0 if tab.sufficient else 3
+    if a.cmd == "vector":
+        from . import vector_bench as vbm
+
+        return vbm.main_cli(a, Config.load(a.config), say)
     return 2
 
 

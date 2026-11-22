@@ -222,7 +222,8 @@ def _trace_vector(page: int, img: ImageElement, rgba: np.ndarray, origin_px: tup
         notes.append(f"有一張插畫描成向量時出錯（{type(e).__name__}），以圖片輸出。")
         return None
     if not res.accepted or not res.paths:
-        why = res.notes[-1] if res.notes else "重畫驗證未通過。"
+        # 說明取真正的原因（「放細門檻重描了幾輪」只是過程）
+        why = next((n for n in res.notes if "未通過" in n or "不適合" in n), res.notes[0] if res.notes else "重畫驗證未通過。")
         notes.append(f"有一張插畫沒有描成向量，以圖片輸出：{why}")
         return None
     paths = vz.to_vector_paths(res, (origin_px[0] / W, origin_px[1] / W), 1.0 / W)

@@ -14,6 +14,7 @@
      直線、圓弧、三次貝茲的一般擬合。
   4. 驗證：用 render 畫回來與原圖比色差（ΔE）與覆蓋範圍（IoU）；成塊的誤差表示漏了東西，就放細門檻重描，
      直到達標或到上限。照片之類不適合的內容回報 accepted=False 並說明原因。
+     原圖與重畫兩邊都有邊緣的地方不算成塊誤差（模糊、縮放過的原圖邊緣比向量寬）；有遮罩時，路徑裁在遮罩內。
 整個過程不使用大型 AI，也不用隨機；同樣的輸入一定得到同樣的輸出。所有數值都是量出來的。
 """
 
@@ -79,7 +80,7 @@ DEFAULTS: dict = {
     "layered": True,  # 分層輸出（關掉則全部是互相挖洞的拼圖）
     "trap_px": 1.0,  # 下層在上層底下多墊的寬度（像素）
     "close_px": 4.0,  # 被細線切開的同一個形狀，縫寬在此值兩倍以內就接回去
-    "see_through_de": 4.0,  # 洞裡的顏色與外面相同（ΔE 在此值內）就當成真的洞
+    "see_through_de": 1.5,  # 洞裡的顏色與外面相同（ΔE 在此值內，雜訊大時放寬成 2σ）就當成真的洞；近白的形狀（250）與白底仍分得開
     "background_border_fraction": 0.5,  # 沒給遮罩時：佔影像邊框此比例以上的純色區域當成底色（透明）
     "completion": True,  # 被遮住的基本幾何補全
     "completion_max_tries": 60,
@@ -284,6 +285,8 @@ def _own_field(seg: Segmentation, rid: int, pad: int = 4) -> tuple[np.ndarray, i
     sec = seg.second[Y0:Y1, X0:X1]
     al = seg.alpha[Y0:Y1, X0:X1]
     c = np.where(lab == rid, al, np.where(sec == rid, 1.0 - al, 0.0)).astype(np.float32)
+    if seg.clip is not None:
+        c = c * seg.clip[Y0:Y1, X0:X1]
     return c, X0, Y0
 
 
@@ -364,6 +367,9 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
     timing: dict = {}
     t0 = time.perf_counter()
     seg = segment(img, P)
+    if mask is not None:
+        # 遮罩外不屬於這個圖形：每個區域的覆蓋率都乘上遮罩（邊緣稍微柔化，等值線才不會是階梯狀）
+        seg.clip = np.clip(cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 0.5) * 2.0 - 0.5, 0.0, 1.0) if mask.any() else mask.astype(np.float32)
     timing["segment"] = round(time.perf_counter() - t0, 4)
     stats = dict(seg.stats)
     stats["timing"] = timing
@@ -406,6 +412,7 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
     # ---------- 每個區域自己的次像素輪廓、鄰居、洞
     t1 = time.perf_counter()
     sat_eps = float(np.clip(0.02 + seg.sigma / 40.0 + 0.05 * min(seg.blur_px, 1.0), 0.02, 0.15))
+    hole_min = max(4, 2 * int(P["min_region_px"]))
     for k in live:
         r = regs[k]
         c, X0, Y0 = _own_field(seg, k)
@@ -424,6 +431,8 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
             lab_c = seg.labels[Y0 : Y0 + c.shape[0], X0 : X0 + c.shape[1]]
             for h in range(1, nh):
                 hm = hcc == h
+                if int(hm.sum()) < hole_min:
+                    continue  # 一兩個像素的洞是壓縮或雜訊的斑點，不拿來決定上下（排序預設就是小的在上）
                 inner = set(int(v) for v in np.unique(lab_c[hm])) - {k}
                 r.holes.append(((np.nonzero(hm)[0] + Y0, np.nonzero(hm)[1] + X0), inner))
     timing["contours"] = round(time.perf_counter() - t1, 4)
@@ -591,8 +600,9 @@ def _completion_evidence(regs: dict[int, _Reg], fg: list[int], below: dict[int, 
         r = regs[k]
         if r.model.thin or r.model.area < 60:
             continue
-        outer = [c for c in r.contours if c.area > 0]
-        if len(outer) != 1:
+        outer = sorted([c for c in r.contours if c.area > 0], key=lambda c: -c.area)
+        # 只有一塊（壓縮雜訊造成的零星小點不算：面積不到主體的 2%）
+        if not outer or sum(c.area for c in outer[1:]) > 0.02 * outer[0].area:
             continue
         pts_all = outer[0].points
         if len(pts_all) < 24:
@@ -867,8 +877,11 @@ def _verify(res: VectorResult, img: np.ndarray, mask: Optional[np.ndarray], fg_t
     de = np.sqrt(((_lab(comp) - _lab(img.astype(np.float32))) ** 2).sum(axis=2))
     region = np.ones((H, W), dtype=bool) if mask is None else mask
     if res.background is None and mask is not None:
-        # 遮罩內沒畫到的像素：算成漏畫（色差以黑白間的距離計）
-        de = np.where(region & (rgba[..., 3] < 128), 100.0, de)
+        # 遮罩內沒畫到的像素：算成漏畫（色差以黑白間的距離計）。遮罩最外一圈不算：遮罩本身是逐像素的，
+        # 描出來的平滑邊界只蓋住那一圈的一部分，沒蓋到的地方本來就該是透明
+        # 遮罩內被判成底色（大部分在遮罩外的區域，例如裁切時多帶到的白紙）的像素本來就不畫，也不算
+        solid = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        de = np.where(solid & (fg_true >= 0.5) & (rgba[..., 3] < 128), 100.0, de)
     vals = de[region]
     if vals.size == 0:
         res.render_error, res.error_p95, res.iou = float("inf"), float("inf"), 0.0

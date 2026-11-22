@@ -464,6 +464,11 @@ def fit_strokes(c: np.ndarray, offset: tuple[int, int], color, tol: float, fit_o
     # 用覆蓋率本身算重疊率（不取門檻：半像素寬的邊緣剛好落在 0.5 上，取門檻會忽大忽小）
     inter = float(np.minimum(total_cov, c).sum())
     union = float(np.maximum(total_cov, c).sum())
-    if union <= 0 or inter / union < float(P["stroke_min_iou"]):
+    soft = inter / union if union > 0 else 0.0
+    # 模糊過的細線，覆蓋率場是一道寬而淡的山丘，與銳利的筆畫逐像素比一定偏低；另外比「過半」的範圍，兩者取較好的
+    dh, th = total_cov >= 0.5, c >= 0.5
+    un_h = int((dh | th).sum())
+    hard = float((dh & th).sum()) / un_h if un_h > 0 else 0.0
+    if max(soft, hard) < float(P["stroke_min_iou"]):
         return None
     return out

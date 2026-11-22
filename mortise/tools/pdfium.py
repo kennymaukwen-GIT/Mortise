@@ -498,6 +498,15 @@ class PageReader:
                 bitmap = image._obj.get_bitmap(render=False)
             return bitmap.to_pil().copy()
 
+    def image_natural_bitmap(self, image: RawImage) -> Optional[Image.Image]:
+        """取出影像原本的像素（影像自己的方向與長寬比，還沒套上擺放的矩陣；不含透明遮罩）。
+        影像被旋轉、翻轉或非等比縮放時，在這個座標上分析比較準。取不出來回傳 None。"""
+        with LOCK:
+            try:
+                return image._obj.get_bitmap(render=False).to_pil().copy()
+            except Exception:  # 特殊的色彩空間或壓縮方式：呼叫端改用 image_bitmap 轉回去
+                return None
+
     def paths(self) -> list[RawPath]:
         """所有路徑物件（含表單內的），座標已換到頁面空間。能從 PDFium 讀到的屬性都讀出來；
         讀不到的（花紋、漸層、混合模式、透明遮罩）放在 paint，來自內容串流掃描（見 paint_status）。"""

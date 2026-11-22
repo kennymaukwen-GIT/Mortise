@@ -726,7 +726,10 @@ def run_bench(out_dir: Optional[Path], samples_dir: Optional[Path] = None, varia
         summary["vtracer"] = {"overall": _aggregate(vr_rows, "vtracer_"),
                               "by_variant": {v: _aggregate([r for r in vr_rows if r["variant"] == v], "vtracer_") for v in variants},
                               "by_category": {c: _aggregate([r for r in vr_rows if r["category"] == c], "vtracer_") for c in CATEGORIES if any(r["category"] == c for r in vr_rows)}}
-    failures = [f"{r['sample']}／{r['variant']}：" + (r["notes"][-1] if r["notes"] else "未通過") for r in rows if not r["accepted"]]
+    def _why(notes: list) -> str:  # 取真正的原因（「放細門檻重描了幾輪」只是過程）
+        return next((n for n in notes if "未通過" in n or "不適合" in n), notes[0] if notes else "未通過")
+
+    failures = [f"{r['sample']}／{r['variant']}：" + _why(r["notes"]) for r in rows if not r["accepted"]]
     summary["not_accepted"] = failures
     if samples_dir is not None:
         summary["real"] = run_real(samples_dir, out_dir, params, say)
@@ -838,3 +841,33 @@ def compare_with_baseline(summary: dict, baseline: dict, tol: Optional[dict] = N
         if key not in higher_better and a > b + slack:
             out.append(f"{key} 由 {b:.3f} 升到 {a:.3f}（容許 {slack}）")
     return out
+
+
+def main_cli(a, cfg, say: Callable[[str], None]) -> int:
+    """python -m mortise.eval vector 的進入點（參數見 mortise/eval/__main__.py）。"""
+    params = {k: v for k, v in cfg.section("recognize").items() if k.startswith("vector_")}
+    variants = [v.strip() for v in a.variants.split(",") if v.strip()]
+    cats = [c.strip() for c in (a.categories or "").split(",") if c.strip()] or None
+    s = run_bench(a.out, a.samples, variants, a.limit, with_vtracer=not a.no_vtracer, params=params, say=say,
+                  seed=a.seed if a.seed is not None else SEED, categories=cats, panels=not a.no_panels)
+    o = s["overall"]
+    print(f"合成樣本 {s['n_samples']} 個、描圖 {s['n_runs']} 次；通過自我驗證 {_fmt(o.get('accepted_rate'))}；"
+          f"對真值色差 {_fmt(o.get('de_truth'))}、IoU {_fmt(o.get('iou'))}、邊界距離 {_fmt(o.get('chamfer'))} px、節點數比 {_fmt(o.get('node_ratio'))}、"
+          f"每張 {_fmt(o.get('seconds'))} 秒")
+    if "vtracer" in s:
+        v = s["vtracer"]["overall"]
+        print(f"VTracer 0.6.15：對真值色差 {_fmt(v.get('de_truth'))}、IoU {_fmt(v.get('iou'))}、邊界距離 {_fmt(v.get('chamfer'))} px、節點數比 {_fmt(v.get('node_ratio'))}")
+    print(f"結果：{a.out / 'summary.md'}")
+    if a.save_baseline:
+        a.save_baseline.parent.mkdir(parents=True, exist_ok=True)
+        a.save_baseline.write_text(json.dumps(baseline_view(s), ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"基準檔：{a.save_baseline}")
+    if a.baseline:
+        regs = compare_with_baseline(s, json.loads(a.baseline.read_text(encoding="utf-8")))
+        if regs:
+            print(f"有 {len(regs)} 項退步超過容許範圍：")
+            for r in regs:
+                print(f"  {r}")
+            return 1
+        print("與基準相比沒有退步。")
+    return 0
