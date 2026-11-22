@@ -258,11 +258,20 @@ def _text_line(page: int, i: int, ol, attrs, W: float) -> TextLine:
     nonspace = [k for k, ch in enumerate(text) if ch.strip()]
     xs = list(attrs.char_x)
     runs: list[TextRun] = []
-    for r in attrs.runs:
-        seg = text[r.start:r.end]
+    # 各段的文字範圍要連起來蓋住整行：量測交出的段落不含段與段之間的空白（例如「12 – 14」與「JULY 2027」之間），
+    # 只取 text[start:end] 會把那個空白丟掉（實際發生過：「12 – 14 JULY 2027」變成「12 – 14JULY 2027」）。
+    # 所以每段從自己的起點延伸到下一段的起點，第一段從行首開始、最後一段到行尾。
+    ordered = sorted((r for r in attrs.runs if r.end > r.start), key=lambda r: r.start)
+    spans = []
+    for n, r in enumerate(ordered):
+        a = 0 if n == 0 else r.start
+        b = ordered[n + 1].start if n + 1 < len(ordered) else len(text)
+        spans.append((r, a, b))
+    for r, a, b in spans:
+        seg = text[a:b]
         if not seg:
             continue
-        idx = [n for n, k in enumerate(nonspace) if r.start <= k < r.end]
+        idx = [n for n, k in enumerate(nonspace) if a <= k < b]
         char_x = [xs[n] / W for n in idx if n < len(xs)]
         # 這一段的四角：沿基線取這段字的範圍
         if idx and len(xs) > max(idx):

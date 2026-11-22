@@ -57,3 +57,28 @@ def test_screenshot_verifies(dark):
     _, report = dark
     assert report.overall_score > 0.95
     assert report.pages[0].neutral_similarity > 0.95 and report.pages[0].target_similarity > 0.95
+
+
+def test_spaces_between_styled_runs_are_kept():
+    """量測把一行切成好幾段時，段與段之間的空白不屬於任何一段；組回文字行時不可丟掉。
+    實際發生過：海報日期「12 – 14 JULY 2027」被切成「12 – 14」與「JULY 2027」，輸出變成「12 – 14JULY 2027」。"""
+    from types import SimpleNamespace as NS
+
+    import numpy as np
+
+    from mortise.recognition.types import Estimate
+    from mortise.stages.s3_image_line import _text_line
+
+    text = "12 – 14 JULY 2027"
+
+    def run(start, end):
+        return NS(start=start, end=end, font_size_px=Estimate(38.0, 1.0, 0.9), fonts=[], bold=(True, 0.9), italic=(False, 0.9),
+                  color=(43, 45, 66), color_confidence=0.9, char_spacing_px=None, notes=[], stroke_width_px=None)
+
+    n_ink = sum(1 for ch in text if ch.strip())
+    attrs = NS(quad=[[0, 0], [700, 0], [700, 50], [0, 50]], baseline=[[0, 40], [700, 40]],
+               char_x=list(np.linspace(0, 650, n_ink)), runs=[run(0, 7), run(8, 17)], notes=[])
+    ol = NS(text=text, quad=attrs.quad, score=0.99, chars=[])
+    line = _text_line(0, 0, ol, attrs, 1000.0)
+    assert "".join(r.text for r in line.runs) == text
+    assert [r.text for r in line.runs] == ["12 – 14 ", "JULY 2027"]
