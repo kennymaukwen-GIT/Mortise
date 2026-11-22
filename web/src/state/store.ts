@@ -110,6 +110,7 @@ export type Action =
   | { type: "RERUN_START" }
   | { type: "CONVERT_AGAIN" }
   | { type: "OPEN_JOB_START"; jobId: string; filename: string; format: string }
+  | { type: "JOB_META"; hadOriginSize: boolean }
   | { type: "RESET" };
 
 function clampPage(index: number, count: number): number {
@@ -228,6 +229,8 @@ export function reducer(s: State, a: Action): State {
         jobFormat: a.format,
         jobHadOriginSize: true,
       };
+    case "JOB_META":
+      return { ...s, jobHadOriginSize: a.hadOriginSize };
     case "RESET":
       return { ...initialState, settings: { ...s.settings, originW: "", originH: "", orientation: null } };
     default:

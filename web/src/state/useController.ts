@@ -207,6 +207,7 @@ export function useController(state: State, dispatch: Dispatch<Action>, deps: Co
     try {
       const st = await api.getJob(job.jobId);
       if (stateRef.current.jobId !== job.jobId) return;
+      dispatch({ type: "JOB_META", hadOriginSize: !!st.intent?.known_size });
       if (st.status === "done") await finishJob(job.jobId);
       else if (st.status === "failed") dispatch({ type: "JOB_FAILED", message: st.error || "failed" });
       else follow(job.jobId);

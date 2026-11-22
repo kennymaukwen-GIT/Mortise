@@ -225,6 +225,12 @@ test("choose a multi-page PDF and page through it", async () => {
 
 test("drag and drop a file into the frame", async () => {
   const page = await newPage();
+  // Both ways of opening the file picker work.
+  const [fc1] = await Promise.all([page.waitForEvent("filechooser"), page.getByRole("button", { name: "Choose a file" }).click()]);
+  assert(!fc1.isMultiple(), "single file picker");
+  await page.getByRole("button", { name: /File menu/ }).click();
+  const [fc2] = await Promise.all([page.waitForEvent("filechooser"), page.getByRole("menuitem", { name: "Open file…" }).click()]);
+  assert(fc2, "File → Open file… opens the picker");
   const b64 = readFileSync(resolve(fixtures, "slide_basic.pdf")).toString("base64");
   const dt = await page.evaluateHandle((b64) => {
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
