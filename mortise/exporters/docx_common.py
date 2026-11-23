@@ -1516,10 +1516,14 @@ def text_width_pt(text: str, family: str, size_pt: float, bold: bool = False) ->
     return w * size_pt
 
 
-def worst_case_width_pt(paragraph: StyledParagraph, written: list[str], wide_fallbacks: Iterable[str] = ("DejaVu Sans",)) -> float:
-    """一段單行字在「寫入的字型」與「找不到字型時常見的寬字型」之下，最寬會有多寬（pt）。有強制換行（\n）時取最寬的一行。
+WIDE_FALLBACKS = ("DejaVu Sans", "Times New Roman")
+
+
+def worst_case_width_pt(paragraph: StyledParagraph, written: list[str], wide_fallbacks: Iterable[str] = WIDE_FALLBACKS) -> float:
+    """一段單行字在「寫入的字型」與「找不到字型時常見的退回字型」之下，最寬會有多寬（pt）。有強制換行（\n）時取最寬的一行。
     寫入的字型在伺服器上由 mortise.tools.fontfind 對到字寬相容的字型（例如 Arial → Liberation Sans）；
-    寬字型代表使用者裝置上沒有這個字型、被換成別的字型的情況（DejaVu Sans 與 Verdana 同屬最寬的一類無襯線字）。"""
+    退回字型代表使用者裝置上沒有這個字型、被換成別的字型的情況：DejaVu Sans（與 Verdana 同屬最寬的一類無襯線字），
+    以及 Times New Roman（找不到字型時常見的預設；小寫比 Arial 窄，但粗體大寫比 Arial 寬，例如「HOLLOWAY」寬約 4%）。"""
     best = 0.0
     for fam in list(dict.fromkeys(list(written) + list(wide_fallbacks))):
         lines = [0.0]
@@ -1569,6 +1573,136 @@ def hard_breaks(sp: StyledParagraph, width_pt: float) -> Optional[StyledParagrap
     return sp.model_copy(update={"runs": [r.model_copy(update={"text": t}) for r, t in zip(sp.runs, runs)]})
 
 
+def wrap_points(sp: StyledParagraph, width_pt: float) -> Optional[StyledParagraph]:
+    """用量測時的字型（驗證字型）在原框寬裡逐字排一次（已有的強制換行照斷），排出來的行數等於原圖行數（source_line_count）時，
+    把自動換行的位置也寫成強制換行（\n）；推不出來（行數不同、斷在字的中間）回傳 None。用在版面固定模式的窄框（側欄）：
+    每一行都固定以後，框可以留足寬度、不再自動換行，較寬的字型只會往右長一點，不會多排出行把框往下撐。"""
+    if sp.source_line_count < 2 or not sp.runs:
+        return None
+    pieces = []  # （文字段序號, 起點, 終點, 寬度, 種類 w／s／n）
+    for k, r in enumerate(sp.runs):
+        fam = r.font.verification_family or r.font.family.value
+        for m in re.finditer(r"\n|[^\S\n]+|\S+", r.text):
+            g = m.group(0)
+            if g == "\n":
+                pieces.append((k, m.start(), m.end(), 0.0, "n"))
+                continue
+            w = text_width_pt(g, fam, r.size_pt.value, r.bold)
+            if w is None:
+                return None
+            pieces.append((k, m.start(), m.end(), w, "s" if g.isspace() else "w"))
+    lines, cur, breaks = 1, 0.0, []
+    for i, (k, a, b, w, kind) in enumerate(pieces):
+        if kind == "n":
+            lines, cur = lines + 1, 0.0
+        elif kind == "s":
+            cur += w
+        elif cur > 0 and cur + w > width_pt + 0.5:
+            if i == 0 or pieces[i - 1][4] != "s":
+                return None
+            breaks.append(pieces[i - 1])
+            lines, cur = lines + 1, w
+        else:
+            cur += w
+    if lines != sp.source_line_count:
+        return None
+    if not breaks:
+        return sp
+    runs = [r.text for r in sp.runs]
+    for k, a, b, w, _ in reversed(breaks):
+        runs[k] = runs[k][:a] + "\n" + runs[k][b:]
+    return sp.model_copy(update={"runs": [r.model_copy(update={"text": t}) for r, t in zip(sp.runs, runs)]})
+
+
+_LIST_STOP_WORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "with", "&", "+", "/", "-", "–", "—", "vs", "via"}
+_SENTENCE_PUNCT = re.compile(r"(?:[,;:!?]|[a-z]{2}\.)[\"'”’)]*$")
+
+
+def list_breaks(sp: StyledParagraph, width_pt: float, fit_tolerance: float = 0.03, min_fill: float = 0.0,
+                max_tries: int = 4000) -> Optional[StyledParagraph]:
+    """靠左、多行、像清單的段落（例如側欄的技能清單「Soil sampling GPS survey Report writing」）：原圖每個項目從新的一行開始，
+    ④把連續的短行併成一段後就沒有項目的界線；換了較寬的字型時項目會接在一起（「Vendor follow- / up Budget sheets」）。
+    成品文件沒有每一行的位置，只有原圖行數（source_line_count）與框寬（最寬一行的寬度），所以用推的：
+      1. 候選的項目開頭：大寫字母開頭的字（不在括號裡、前一個字不是 and、of、& 這類連接詞）。
+      2. 試每一組候選（從項目最多的試起，最多試 max_tries 組）：在每個項目開頭強制換行，項目裡面照框寬（量測時的驗證字型）
+         自動換行；排出來的行數要等於原圖行數。框裡只有這一段時，框寬就是原圖最寬一行的寬度，
+         呼叫端可以給 min_fill（最寬一行至少要有框寬的這個比例）多一個條件；框裡有別的段落時框寬可能來自別段，不能用。
+      3. 取符合條件、而且項目最多的那一組；最多的有兩組以上（推不出唯一答案）就回傳 None。
+    只處理像清單的段落：靠左對齊（不含左右對齊）、開頭不是項目符號（那是一個項目自己換行）、沒有中日韓文字、
+    沒有句子的標點（逗號、分號、句點結尾的字：那是一般的句子）。項目之間寫成強制換行（\\n），項目裡面仍然自動換行。"""
+    if sp.source_line_count < 2 or sp.align != Align.LEFT or not sp.runs:
+        return None
+    text = "".join(r.text for r in sp.runs)
+    if re.match(r"^\s*[•‧·●○■□▪◆◇▶➤\-–—*]", text) or re.search(r"[⺀-鿿豈-﫿＀-￯\n]", text):
+        return None
+    words = []  # （文字段序號, 起點, 終點, 字寬, 前面的空白寬）
+    pending_space = 0.0
+    for k, r in enumerate(sp.runs):
+        fam = r.font.verification_family or r.font.family.value
+        for m in re.finditer(r"\s+|\S+", r.text):
+            w = text_width_pt(m.group(0), fam, r.size_pt.value, r.bold)
+            if w is None:
+                return None
+            if m.group(0).isspace():
+                pending_space += w
+            else:
+                words.append((k, m.start(), m.end(), w, pending_space if words else 0.0, m.group(0)))
+                pending_space = 0.0
+    if len(words) < 2 or any(_SENTENCE_PUNCT.search(wd[5]) for wd in words):
+        return None
+    cands = []
+    depth = 0
+    for i, wd in enumerate(words):
+        tok = wd[5]
+        if i > 0 and depth == 0 and tok[0].isupper() and words[i - 1][5].lower() not in _LIST_STOP_WORDS:
+            cands.append(i)
+        depth = max(0, depth + tok.count("(") - tok.count(")"))
+    if not cands:
+        return None
+    limit = width_pt * (1 + fit_tolerance) + 0.5
+
+    def layout(starts: tuple[int, ...]) -> tuple[int, float]:
+        lines, cur, widest = 0, 0.0, 0.0
+        bounds = set(starts)
+        for i, (_, _, _, w, space, _) in enumerate(words):
+            if i == 0 or i in bounds or cur + space + w > limit:
+                widest = max(widest, cur)
+                lines, cur = lines + 1, w
+            else:
+                cur += space + w
+        return lines, max(widest, cur)
+
+    from itertools import combinations
+
+    target = sp.source_line_count
+    tries = 0
+    for size in range(len(cands), 0, -1):
+        ok = []
+        for combo in combinations(cands, size):
+            tries += 1
+            if tries > max_tries:
+                return None
+            lines, widest = layout(combo)
+            if lines == target and widest >= min_fill * width_pt:
+                ok.append(combo)
+                if len(ok) > 1:
+                    break
+        if len(ok) == 1:
+            runs = [r.text for r in sp.runs]
+            for i in sorted(ok[0], reverse=True):  # 把項目開頭前面的空白換成強制換行
+                k, a = words[i][0], words[i][1]
+                pk, _, pb = words[i - 1][0], words[i - 1][1], words[i - 1][2]
+                if pk == k:
+                    runs[k] = runs[k][:pb] + "\n" + runs[k][a:]
+                else:  # 空白跨文字段：前一段去掉尾端空白、這一段去掉開頭空白
+                    runs[pk] = runs[pk][:pb] + "\n" + runs[pk][pb:].lstrip()
+                    runs[k] = runs[k][a:] if not runs[k][:a].strip() else runs[k]
+            return sp.model_copy(update={"runs": [r.model_copy(update={"text": t}) for r, t in zip(sp.runs, runs)]})
+        if len(ok) > 1:
+            return None
+    return None
+
+
 def condense_spacing(sp: StyledParagraph, ctx: Ctx, latin: str, max_ratio: float) -> list[int]:
     """版面固定模式：寫入的字型比⑤量測時用的字型寬（例如 Inter Display 寫成 Arial，寬約 3%）時，
     每個字緊縮一點字距，讓整段的寬度回到量測時的寬度，換行位置才會和原圖一樣，框不會因為多一行而往下長、蓋到下一個框。
@@ -1608,7 +1742,8 @@ def _char_advances(text: str, family: str, size_pt: float, bold: bool) -> Option
 
 def wrapped_line_count(chars: list[tuple[str, float, float]], width_pt: float, first_indent_pt: float = 0.0) -> int:
     """逐字（字, 前進寬度, 字距）模擬文字引擎的自動換行，回傳行數：只在空白處斷行（中日韓文字每個字前後都可以斷），
-    行尾的空白不算寬度；一個字比整行還寬時才在字中間斷。強制換行（\n）另起一行。"""
+    行尾的空白不算寬度；一個字比整行還寬時才在字中間斷。強制換行（\n）另起一行。
+    first_indent_pt：正值是首行縮排（第一行較窄）；負值是懸掛縮排（第二行起較窄，例如項目符號後面對齊的折行）。"""
     tokens: list[tuple[str, float]] = []
     word = 0.0
     for ch, w, sp in chars:
@@ -1622,16 +1757,17 @@ def wrapped_line_count(chars: list[tuple[str, float, float]], width_pt: float, f
     if word:
         tokens.append(("w", word))
     lines, x, pend = 1, 0.0, 0.0
+    rest = width_pt - max(0.0, -first_indent_pt)  # 負的首行縮排是懸掛縮排：第二行起從左縮排開始，比第一行窄
     avail = width_pt - max(0.0, first_indent_pt)
     for kind, w in tokens:
         if kind == "n":
-            lines, x, pend, avail = lines + 1, 0.0, 0.0, width_pt
+            lines, x, pend, avail = lines + 1, 0.0, 0.0, rest
         elif kind == "s":
             if x > 0:
                 pend += w
         else:
             if x > 0 and x + pend + w > avail:
-                lines, x, avail = lines + 1, 0.0, width_pt
+                lines, x, avail = lines + 1, 0.0, rest
             if x == 0 and w > avail > 0:
                 extra = int(w // avail)
                 lines += extra
@@ -1640,6 +1776,24 @@ def wrapped_line_count(chars: list[tuple[str, float, float]], width_pt: float, f
                 x += w if x == 0 else pend + w
             pend = 0.0
     return lines
+
+
+def simulated_lines(sp: StyledParagraph, width_pt: float, ctx: Ctx, latin: str, family: Optional[str] = None,
+                    spacing: Optional[list[int]] = None, margin_pt: float = 0.75) -> Optional[int]:
+    """這段在框寬裡會排成幾行（模擬自動換行，見 wrapped_line_count）。family 為空時用寫入的字型；給了就把拉丁字換成這個字型
+    （例如 DejaVu Sans：使用者裝置上沒有寫入的字型、被換成較寬的字型時）。spacing 是每個文字段的字距（twip）。"""
+    chars = []
+    for k, r in enumerate(sp.runs):
+        if r.font.east_asian:
+            fam = r.font.verification_family or r.font.family.value
+        else:
+            fam = family or ctx.font_name(r.font, context_latin=latin, record=False)
+        adv = _char_advances(r.text, fam, r.size_pt.value * ctx.scale, r.bold)
+        if adv is None:
+            return None
+        tw = (spacing[k] if spacing and k < len(spacing) else 0) / 20.0
+        chars.extend((ch, a, tw) for ch, a in zip(r.text, adv))
+    return wrapped_line_count(chars, width_pt - margin_pt, sp.first_line_indent_pt * ctx.scale)
 
 
 def fit_source_lines(sp: StyledParagraph, width_pt: float, ctx: Ctx, latin: str, spacing: list[int], max_ratio: float,

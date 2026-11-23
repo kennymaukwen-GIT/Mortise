@@ -11,6 +11,7 @@
   3. 渲染比對：用 resvg（resvg-py，MIT；resvg 本體 Apache-2.0 或 MIT）把 SVG 畫成影像，與工作影像比相似度
      （算法沿用 stages/s7_verify.similarity；有指定輸出尺寸時只比 placement 那一塊，留白不算）。resvg 不是瀏覽器，也不是 Illustrator、Inkscape、Figma，engine 欄會寫明。
      resvg-py 裝不上或執行失敗時，退回只做前兩項，並在 notes 寫明。
+     畫好的每一頁也經 on_render 交給⑦做逐行文字對照（verify/lines.py），問題併進這份報告、計入整體分數。
 
 字型：resvg 找不到字型時不報錯、直接換後備字型，所以這裡自己建立伺服器字型的清單（家族名稱、字重、斜體），
 逐一核對 SVG 用到的組合；對不上的寫進 issues，不靠渲染結果發現。

@@ -191,7 +191,7 @@ def _flat_map(arr, k: int):
     import numpy as np
 
     ker = np.ones((k, k), np.uint8)
-    spread = cv2.dilate(arr, ker).astype(np.int16) - cv2.erode(arr, ker).astype(np.int16)
+    spread = cv2.subtract(cv2.dilate(arr, ker), cv2.erode(arr, ker))  # 鄰域內最大減最小（uint8，不會是負的）
     return spread.max(axis=2) == 0
 
 
@@ -209,7 +209,8 @@ def image_features(im: Image.Image, c: dict) -> ImageFeatures:
     sub = np.ascontiguousarray(arr[::step, ::step])
     flat = float(_flat_map(sub, 3).mean())
     big = _flat_map(sub, int(c.get("classify_flat_window", 9)))
-    noise = float(pg._noise_sigma(cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)))
+    cy, cx, r = H // 2, W // 2, 512  # 雜訊只量影像中央（與②相同），先切一塊再轉灰階，大影像才不必整張轉
+    noise = float(pg._noise_sigma(cv2.cvtColor(np.ascontiguousarray(arr[max(0, cy - r):cy + r, max(0, cx - r):cx + r]), cv2.COLOR_RGB2GRAY)))
     # 紙張四邊：與②同一個模組，但在縮圖上找、不指定類型（只看有沒有透視變形的紙張）
     side = float(c.get("classify_max_side", 1200))
     s = min(1.0, side / max(H, W))

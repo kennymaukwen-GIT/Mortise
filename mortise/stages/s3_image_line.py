@@ -167,7 +167,7 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
     # 被上層的形狀或插畫（例如從照片裡拆出來的平塗圖形）蓋住的地方也先補掉，否則移動形狀會露出殘影。
     # 補出來的像素屬於生成，記在 notes（圖片元素本身沒有生成範圍的欄位）。
     # 補好的影像只給這張照片自己裁圖用：疊在上面的插畫要從沒補過的影像裁，不然裁到的是補出來的照片。
-    covered_px: dict[int, tuple[int, int]] = {}
+    covered_px: dict[int, tuple[int, int, Optional[float]]] = {}
     filled_src: dict[int, np.ndarray] = {}
     for rg in photos:
         cover = np.zeros((H, W), dtype=bool)
@@ -185,7 +185,7 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
         n_gen = int(gen_mask.sum())
         if n_gen:
             filled_src[id(rg)] = filled
-            covered_px[id(rg)] = (n_gen, int(rg.mask.sum()))
+            covered_px[id(rg)] = (n_gen, int(rg.mask.sum()), regmod.fill_quality(filled, gen_mask, rg))
 
     images: list[ImageElement] = []
     shapes: list[ShapeElement] = []
@@ -204,10 +204,13 @@ def run(spec: PageSpec, cfg: Config, store: Store, ai=None) -> ElementList:
                 pixel_size=(rgba.shape[1], rgba.shape[0]), kind=measured(kind, rg.confidence, Provenance.MEASURED, STEP),
             ))
             if id(rg) in covered_px:
-                n_gen, n_all = covered_px[id(rg)]
+                n_gen, n_all, fq = covered_px[id(rg)]
                 what = "照片" if rg.kind == "photo" else "插畫"
                 notes.append(f"{what}（{images[-1].id}）有 {n_gen} 個像素（約 {n_gen / max(n_all, 1):.0%}）原本被疊在上面的圖形蓋住，"
                              "已補成周圍的內容（平滑內插加上照片本身的顆粒）；這部分是生成的，不是原圖。")
+                if fq is not None and fq < float(region_params.get("overlay_fill_quality_warn", regmod.DEFAULT_PARAMS["overlay_fill_quality_warn"])):
+                    notes.append(f"{what}（{images[-1].id}）補出來的地方比周圍平滑（中尺度的紋理只有周圍的 {fq:.0%}），"
+                                 "移動或刪掉上面的圖形時，看得出那裡是補的。")
             # ---------- s3.vectorize：插畫描成向量（照片不描）；對應的圖片照樣留在 images 裡
             if rg.kind == "illustration" and c.get("vector_enabled", True):
                 trace_in = rgba

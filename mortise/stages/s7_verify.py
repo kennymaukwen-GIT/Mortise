@@ -38,9 +38,12 @@
         但長文件少一行也必須看得出來，所以「找不到、疊在一起」這類內容問題每個再多扣 2%（最多多扣 10%：
         問題很多時第一項已經反映嚴重程度，不必再加重）。
         嚴重程度：找不到 1（內容不見了，最嚴重）；疊在一起 0.6（字還在，但讀不清楚）；一部分找不到 = 不見的比例；
-        位置偏移 0.15 到 0.35（字在、讀得懂，只是位置不對；偏得越多越重）。
+        位置偏移 0.15 到 0.35 × 偏掉的部分佔這一行的比例（字在、讀得懂，只是位置不對；偏得越多、偏掉的部分越多越重）。
       例：80 行的履歷有 20 行找不到、3 行疊在一起 → 逐行分數約 1 − (20 + 1.8) ÷ 80 − 10% ≈ 0.63，
           畫面相似度 0.95 的整體分數就是 0.60，而不是 0.95。
+    - LibreOffice（代替 PowerPoint）與中性渲染（代替 Word 等）是自己重新排字的替身引擎，字距本來就和目標軟體不同，
+      水平偏移放寬到 0.35 個字高才算；可編輯 PDF 與 SVG 的每一行位置寫死在檔案裡，不放寬。驗證用的這台電腦沒有字型
+      畫得出來的字，在不內嵌字型的格式裡不判斷（摘要會註明有幾行沒有驗證到），可編輯 PDF 照常判斷。
     - 每一行找不到、疊在一起、錯位，都開成一條問題（代碼 line_missing、line_partial、line_overlap、line_offset），
       element_id 指到那一行所屬的文字框或表格，網頁的 Overlay 依它畫紅框。PowerPoint 與中性渲染的問題放在各頁的 issues；
       其他格式的放在該格式的 format_reports。
@@ -75,6 +78,8 @@ VERSION = "5"
 # 逐行文字對照的問題說明前面加的渲染來源
 _WHERE = {OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.PPTX: "PowerPoint 經 LibreOffice 渲染"}
 _NEUTRAL_WHERE = "成品自行渲染"
+# 會把字型內嵌進檔案的格式：驗證時畫不出來的字，使用者那裡也畫不出來（照常判斷）；其他格式只寫字型名稱
+_EMBEDS_FONTS = {OutputFormat.PDF, OutputFormat.AI_PDF}
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -139,16 +144,21 @@ def run(
     doc: SourceDoc, specs: list[PageSpec], elements: list[ElementList], layout: Layout, styled: StyledDoc,
     outputs: list[OutputFile], cfg: Config, store: Store, round_no: int = 0,
 ) -> FidelityReport:
+    from .. import verify as targets  # 其他格式的目標驗證（mortise/verify/ 下各格式一個模組）
+
     c = cfg.section("verify")
     notes: list[str] = []
     lines_on = bool(line_check.params(cfg)["line_check"])
     checker = _LineChecker(specs, elements, layout, styled, cfg, store, notes) if lines_on else None
+    pptx = next((o for o in outputs if o.format == OutputFormat.PPTX), None)
+    # 中性渲染只在沒有別的渲染可以評分時才用來評分；那時才需要逐行比對它（省下每一頁的比對時間）
+    neutral_scores = not ((pptx is not None and libreoffice.available()) or any(targets.verifier(o.format) for o in outputs))
     pages = [_field_report(spec, el, layout, styled) for spec, el in zip(specs, elements)]
     neutral_engine = None
     neutral_lines: dict[int, line_check.PageLines] = {}
     if c.get("neutral", True):
         try:
-            pages, neutral_engine, neutral_lines = _neutral_verify(specs, elements, layout, styled, pages, cfg, store, checker)
+            pages, neutral_engine, neutral_lines = _neutral_verify(specs, elements, layout, styled, pages, cfg, store, checker if neutral_scores else None, checker)
         except Exception as e:  # 中性渲染失敗不影響其他驗證
             notes.append(f"7A 中性驗證沒有執行：{type(e).__name__}: {e}")
     target_engine = None
@@ -156,7 +166,6 @@ def run(
     proposals: list[Correction] = []
     target_lines: dict[int, line_check.PageLines] = {}
 
-    pptx = next((o for o in outputs if o.format == OutputFormat.PPTX), None)
     if pptx is not None and libreoffice.available():
         try:
             rendered = libreoffice.to_pdf(store.blob_path(pptx.file), c["libreoffice_timeout_s"])
@@ -168,9 +177,7 @@ def run(
     elif pptx is not None:
         notes.append("7B 目標驗證沒有執行：這台機器沒有安裝 LibreOffice。")
 
-    # 其他格式的目標驗證（mortise/verify/ 下各格式一個模組）
-    from .. import verify as targets
-
+    # 其他格式的目標驗證
     format_reports = []
     format_lines: dict[tuple[OutputFormat, int], line_check.PageLines] = {}
     for o in outputs:
@@ -181,7 +188,7 @@ def run(
         if checker is not None and "on_render" in inspect.signature(fn).parameters:
             # 驗證模組每畫好一頁就交給逐行文字對照（只保留比對結果，不必把每一頁的影像都留在記憶體裡）
             def on_render(page_index: int, image: Image.Image, _fmt: OutputFormat = o.format) -> None:
-                found = checker.check(page_index, image, _WHERE.get(_fmt, _fmt.value))
+                found = checker.check(page_index, image, _WHERE.get(_fmt, _fmt.value), embeds_fonts=_fmt in _EMBEDS_FONTS)
                 if found is not None:
                     format_lines[(_fmt, page_index)] = found
 
@@ -280,13 +287,18 @@ class _LineChecker:
         self.store = store
         self.notes = notes
 
-    def check(self, page_index: int, rendered: Image.Image, where: str):
+    unrenderable: frozenset[str] = frozenset()  # 驗證用的這台電腦沒有字型畫得出來的字（由中性渲染的缺字紀錄得知）
+
+    def check(self, page_index: int, rendered: Image.Image, where: str, relayout: bool = False, embeds_fonts: bool = False):
+        """relayout：渲染結果是替身引擎自己重新排字的（LibreOffice 代替 PowerPoint、中性渲染代替 Word）。
+        embeds_fonts：輸出檔內嵌字型（可編輯 PDF）；沒有內嵌時，驗證用的電腦畫不出來的字所在的行不判斷。"""
         spec, el, sp = self.specs.get(page_index), self.elements.get(page_index), self.styled.get(page_index)
         if spec is None or el is None or sp is None:
             return None
         try:
             working = Image.open(self.store.blob_path(spec.working_image))
-            return line_check.check_page(working, rendered, el, self.layout.get(page_index), sp, source_frame(sp), self.p, where)
+            return line_check.check_page(working, rendered, el, self.layout.get(page_index), sp, source_frame(sp), self.p, where,
+                                         relayout=relayout, unrenderable=frozenset() if embeds_fonts else self.unrenderable)
         except Exception as e:  # 逐行比對失敗：這一頁只看畫面分數
             self.notes.append(f"第 {page_index + 1} 頁（{where}）的逐行文字對照沒有執行：{type(e).__name__}: {e}")
             return None
@@ -380,11 +392,12 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
 # ---------- s7.neutral（7A）----------
 
 
-def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store, checker=None):
+def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store, checker=None, line_checker=None):
     """7A 中性驗證：用自家確定性的渲染（給 Illustrator 的 PDF 輸出器，ReportLab 加開放字型）把成品文件畫出來，
     與工作影像比對。它不依賴任何辦公軟體，所以檢查的是③④⑤的結果本身：位置、字級、字型寬度、斷行。
     不能檢查目標軟體的重新斷行（那是 7B 的工作）。
-    有 checker 時也做逐行文字對照，結果另外回傳（只有在沒有其他渲染可以評分時，run 才把它的問題列進報告）。"""
+    有 checker 時也做逐行文字對照，結果另外回傳（run 只在沒有其他渲染可以評分時才傳 checker，並把它的問題列進報告）。
+    line_checker（與 checker 是同一個物件、但一律傳入）用來記下中性渲染的缺字，供其他格式的逐行比對參考。"""
     from . import s6_export
     from ..artifacts import OutputFormat
 
@@ -393,6 +406,8 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
     engine = "Mortise 中性渲染（ReportLab，開放授權字型）"
     new_pages = []
     found_lines: dict[int, line_check.PageLines] = {}
+    if line_checker is not None:  # 中性渲染記下的缺字（所有候選字型都沒有的字）：驗證用的這台電腦畫不出來
+        line_checker.unrenderable = frozenset(chr(int(h, 16)) for d in out.degradations if d.concept == "缺字" for h in re.findall(r"U\+([0-9A-F]{4,6})", d.action))
     pdoc = pdf.open_document(str(store.blob_path(out.file)))
     try:
         for spec, report in zip(specs, pages):
@@ -409,7 +424,7 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
             region = content_region(image, sp)
             sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
             if checker is not None:
-                found = checker.check(spec.page_index, region, _NEUTRAL_WHERE)
+                found = checker.check(spec.page_index, region, _NEUTRAL_WHERE, relayout=True)
                 if found is not None:
                     found_lines[spec.page_index] = found
             issues = list(report.issues)
@@ -451,7 +466,7 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                 working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
                 region = content_region(image, sp)
                 sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
-                found = checker.check(spec.page_index, region, _WHERE[OutputFormat.PPTX]) if checker is not None else None
+                found = checker.check(spec.page_index, region, _WHERE[OutputFormat.PPTX], relayout=True) if checker is not None else None
                 if found is not None:
                     found_lines[spec.page_index] = found
                 w = sp.width_pt

@@ -206,7 +206,17 @@ DEFAULT_PARAMS: dict = {
     "ls_uniform_em": 0.08,  # 字母間距與其中位數的差在此之內才算「一致」：字形表與實際字型的留白差約 0.03 em、字界誤差約 0.04 em、字距調整（AV、LT）約 −0.08 em
     "ls_uniform_frac": 0.75,  # 至少這個比例的字母間距要「一致」，才算字距拉開的行
     "ls_space_like_em": 0.19,  # 每個字母間都被讀成空白（沒有同一詞內的字母可對照）時，字母間距要小於此值才拿掉空白：真正的空白寬至少約 0.22 em（Calibri、Arial Narrow），「U S A」這類本來就有空白的字會落在此值之上
-    "ls_long_run": 5,  # 但連續至少這麼多個字母的間距都一致時，即使接近空白寬也視為字距拉開（真正以空白隔開的單字母幾乎不會連續 5 個以上）
+    # 審查實測：真正以空白隔開的單字母（「A B C D E F G H」「F B I C I A」「a b c d e」）間距 0.24 到 0.31 em，連續 5 到 8 個字母也一樣一致，
+    # 所以「連續夠多個字母就當成字距」的舊規則拿掉；間距接近空白寬、每個字母間都讀成空白的行只靠同一頁的旁證（見下）才拿掉空白
+    "ls_max_tight_frac": 0.2,  # 沒有讀成空白的字母對裡，間距像正常字距（小於 ls_min_track_em）的最多佔字母對的這個比例：斜體、襯線字的留白和字形表差得多，
+    # 字距拉開的「P R O F IL E」會有一對量起來很近；「I am a cat」這種一般文字夾單字母的行，正常字距的字母對佔一半以上
+    "ls_word_gap_min_em": 0.18,  # 詞間距比字母間距大出這麼多（約一個空白寬）以上、不超過 ls_word_gap_max_em，就是「字距拉開的兩個詞」的證據
+    "ls_word_gap_max_em": 0.7,  # （真正以空白隔開的單字母間距處處一樣；大到超過此值的是分開擺放的欄位，不算）
+    "ls_page_evidence": True,  # 每個字母間都讀成空白、間距又接近空白寬（≥ ls_space_like_em）的行：同一頁有確定是字距拉開、間距相近、字級相近的行時才拿掉空白
+    "ls_page_track_tol_em": 0.03,  # 「間距相近」：兩行的字母間距相差不超過此值（同一份文件的標題通常用同一個字距；量測誤差約 ±0.02 em）
+    "ls_page_em_ratio": 1.2,  # 「字級相近」：兩行的 em 比不超過此值
+    "ls_page_min_letters": 5,  # 靠旁證併的行至少要有這麼多個字母：「A B C D」這種四個字母的序列即使旁邊有字距拉開的標題也不併（太常是真的單字母）
+    "ls_punct_bearing_em": 0.05,  # 字母之間的連字號、&、/ 這類符號的左右留白（em）：符號兩側的間距扣掉它後也和字母間距一樣時，符號兩側的空白一起拿掉（「E - M A I L」→「E-MAIL」）
     # ---- 誤差與信心
     "low_res_px": 10.0,  # 墨跡行高低於此值（像素）時標低解析度並降信心
     "low_res_factor": 0.7,  # 低解析度時信心值乘上此係數
@@ -533,7 +543,7 @@ class OcrEngine:
             if line is not None:
                 lines.append(line)
         lines = _merge_collinear(lines, p)
-        lines = [(_letter_spacing(l, e, p), e) for l, e in lines]
+        lines = _page_letter_spacing(lines, p)
         out = _dedup([l for l, _ in lines], p)
         out = _reading_order(out)
         t4 = time.perf_counter()
@@ -1489,8 +1499,114 @@ def _letter_gaps(line: OcrLine, em: float, p: dict):
     return ns, pairs
 
 
+_JOINERS = "-‐‑–—&/+·'’"
+
+
+def _case_consistent(line: OcrLine, ns: list[int], word_breaks: set[int]) -> bool:
+    """字距拉開的字母（不含詞與詞之間）大小寫要一致：整詞大寫、整詞小寫、或首字大寫其餘小寫。
+    「a I o u e」這種大小寫交錯的單字母，是一個一個分開的字，不是一個拉開的詞。word_breaks 是詞與詞之間的字對序號。"""
+    words, cur = [], ""
+    for k, i in enumerate(ns):
+        ch = line.chars[i].text
+        if not _is_letter(ch):
+            if cur:
+                words.append(cur)
+            cur = ""
+            continue
+        cur += ch
+        if k in word_breaks:
+            words.append(cur)
+            cur = ""
+    if cur:
+        words.append(cur)
+    return all(w.isupper() or w.islower() or (w[0].isupper() and (len(w) == 1 or w[1:].islower())) for w in words)
+
+
+def _letter_spacing_plan(line: OcrLine, em: float, p: dict) -> Optional[dict]:
+    """判斷一行是不是字距拉開（見 _letter_spacing）。回傳 None（不是）或
+    {"status": "merge"（確定）或 "candidate"（只差同一頁的旁證）, "t": 字母間距, "drop": 要拿掉空白的字對, "word": 詞間距}。"""
+    got = _letter_gaps(line, em, p)
+    if got is None:
+        return None
+    ns, pairs = got
+    if len(pairs) < p["ls_min_letters"] - 1:
+        return None
+    cs = np.array([q[1] for q in pairs])
+    jump, tol = p["ls_word_jump_em"], p["ls_uniform_em"]
+    t = float(np.percentile(cs, 30))
+    for _ in range(4):
+        t = float(np.median(cs[cs <= t + jump]))
+    letter = cs <= t + jump
+    if int(letter.sum()) < p["ls_min_letters"] - 1:
+        return None
+    if not (p["ls_min_track_em"] <= t <= p["ls_max_track_em"]):
+        return None
+    close = np.abs(cs - t) <= tol
+    if float(close[letter].mean()) < p["ls_uniform_frac"]:
+        return None
+    drop = [q[0] for q, m in zip(pairs, letter) if m and q[2]]
+    if not drop:
+        return None
+    word = {q[0]: q[1] for q, m in zip(pairs, letter) if not m}
+    status = "merge"
+    inner = any(m and c and not q[2] for q, m, c in zip(pairs, letter, close))
+    if not inner:
+        n_letter = int(letter.sum())
+        tight = int(((cs < p["ls_min_track_em"]) & letter).sum())
+        if tight > int(p["ls_max_tight_frac"] * n_letter):  # 行內有好幾對正常字距的字母：是一般文字夾著單字母，不是字距拉開
+            return None
+        if not _case_consistent(line, ns, set(word)):
+            return None
+        # 一行裡有「字母間距 + 一個空白寬」大小的詞間距（例如「W O R K   E X P E R I E N C E」）：字母之間的空白如果是真的，
+        # 詞與詞之間就不會多出一個空白寬；這種行本身就證明了字母間距是字距
+        words_ok = any(p["ls_word_gap_min_em"] <= c - t <= p["ls_word_gap_max_em"] for c in word.values())
+        if t >= p["ls_space_like_em"] and not words_ok:
+            status = "candidate"  # 間距接近真正的空白寬：一行本身分不出來，要同一頁的旁證（見 _page_letter_spacing）
+    return {"status": status, "t": t, "drop": drop, "word": word, "ns": ns}
+
+
+def _apply_letter_spacing(line: OcrLine, plan: dict, p: dict, why: str = "") -> OcrLine:
+    """照判斷結果拿掉字母之間的空白、詞與詞之間補一個空白；字母之間的連字號、& 這類符號，兩側間距也和字母間距一樣時一起拿掉兩側的空白。"""
+    t, drop_set, word, ns = plan["t"], set(plan["drop"]), plan["word"], plan["ns"]
+    jump = p["ls_word_jump_em"]
+    chars = line.chars
+    em = plan.get("em", 0.0)
+    # 字母—符號—字母：符號兩側的間距（扣掉字母與符號的留白）都落在字母間距那一群時，符號兩側也拿掉空白
+    joined: set[int] = set()
+    if em > 0:
+        for k in range(1, len(ns) - 1):
+            a, b, c = chars[ns[k - 1]], chars[ns[k]], chars[ns[k + 1]]
+            if b.text not in _JOINERS or not (_is_letter(a.text) and _is_letter(c.text)):
+                continue
+            pb = p["ls_punct_bearing_em"]
+            g1 = (b.x0 - a.x1) / em - _bearings(a.text)[1] - pb
+            g2 = (c.x0 - b.x1) / em - pb - _bearings(c.text)[0]
+            if g1 <= t + jump and g2 <= t + jump:
+                joined.update({k - 1, k})
+    out: list[OcrChar] = list(chars[: ns[0] + 1])
+    n_drop = 0
+    for k in range(len(ns) - 1):
+        i, j = ns[k], ns[k + 1]
+        between = chars[i + 1 : j]
+        if (k in drop_set or k in joined) and between:
+            between = []
+            n_drop += 1
+        elif k in word and not between:
+            conf = 1.0 / (1.0 + math.exp(-(word[k] - t - jump) / p["space_soft_em"]))
+            err = max(chars[i].x_error, chars[j].x_error)
+            between = [OcrChar(" ", conf, chars[i].x1, chars[j].x0, [CharCandidate(" ", conf), CharCandidate("", 1.0 - conf)], x_error=err)]
+        out.extend(between)
+        out.append(chars[j])
+    out.extend(chars[ns[-1] + 1 :])
+    note = f"字距拉開的一行：拿掉 {n_drop} 個字母間的空白（扣掉字形留白後，字母間距約 {t:.2f} em）{why}"
+    return OcrLine(
+        quad=line.quad, text="".join(c.text for c in out), score=line.score, chars=out, vertical=line.vertical,
+        quad_error=line.quad_error, angle_error_deg=line.angle_error_deg, notes=list(line.notes) + [note],
+    )
+
+
 def _letter_spacing(line: OcrLine, em: float, p: dict) -> OcrLine:
-    """字距拉開的一行（「S K I L L S」）：拿掉字母之間多讀的空白，詞與詞之間保留一個空白。
+    """字距拉開的一行（「S K I L L S」）：拿掉字母之間多讀的空白，詞與詞之間保留一個空白。只看這一行（同一頁的旁證見 _page_letter_spacing）。
 
     用量到的墨跡間隙判斷，不看字串樣子：
     1. 每對相鄰字母的墨跡間隙扣掉兩個字母本身的左右留白，得到「額外的字距」c（em）。
@@ -1499,67 +1615,49 @@ def _letter_spacing(line: OcrLine, em: float, p: dict) -> OcrLine:
     3. 字母間距大致一致（ls_uniform_em、ls_uniform_frac）、明顯大於正常字距（ls_min_track_em）、
        而且模型讀成空白的間距也落在字母間距這一群裡時，就把這些空白拿掉。
     4. 證據要夠：同一行中有模型「沒」讀成空白、間距卻和 t 差不多的字母對（例如「S O FT WA R E」的 FT、WA），
-       就足以說明那些空白只是字距；每個字母間都讀成空白時（「S K I L L S」），另外要求整行沒有正常字距的字母對，
-       而且 t 小於一般的空白寬（ls_space_like_em），或至少連續 ls_long_run 個字母。
+       就足以說明那些空白只是字距。每個字母間都讀成空白時（「S K I L L S」），另外要求：
+       a. 正常字距的字母對不超過字母對的 ls_max_tight_frac（「I am a cat」不併）；
+       b. 每個詞的大小寫一致（全大寫、全小寫或首字大寫；「a I o u e」不併）；
+       c. t 小於一般的空白寬（ls_space_like_em），或行裡有大出約一個空白寬的詞間距（「W O R K   E X P E R I E N C E」：
+          字母之間的空白如果是真的，詞與詞之間不會多出一個空白寬）。間距接近空白寬、又只有一個詞的
+          （「A B C D E F G H」與字距 0.3 em 的「C O N T A C T」量起來一樣）一行本身分不出來，只有同一頁有旁證時才併（_page_letter_spacing）。
        所以「U S A」這種本來就有空白的縮寫、句子中的單字母詞（「a」「I」）都不會被併。
+    5. 字母之間的連字號、&、/：兩側的間距也和字母間距一樣時，兩側的空白一起拿掉（「E - M A I L」→「E-MAIL」）；
+       兩側是詞間距時保留（「SKILLS & TOOLS」）。
     """
     if not p["ls_enable"]:
         return line
-    got = _letter_gaps(line, em, p)
-    if got is None:
+    plan = _letter_spacing_plan(line, em, p)
+    if plan is None or plan["status"] != "merge":
         return line
-    ns, pairs = got
-    if len(pairs) < p["ls_min_letters"] - 1:
-        return line
-    cs = np.array([q[1] for q in pairs])
-    jump, tol = p["ls_word_jump_em"], p["ls_uniform_em"]
-    t = float(np.percentile(cs, 30))
-    for _ in range(4):
-        t = float(np.median(cs[cs <= t + jump]))
-    letter = cs <= t + jump
-    if int(letter.sum()) < p["ls_min_letters"] - 1:
-        return line
-    if not (p["ls_min_track_em"] <= t <= p["ls_max_track_em"]):
-        return line
-    close = np.abs(cs - t) <= tol
-    if float(close[letter].mean()) < p["ls_uniform_frac"]:
-        return line
-    drop = [q[0] for q, m in zip(pairs, letter) if m and q[2]]
-    if not drop:
-        return line
-    inner = any(m and c and not q[2] for q, m, c in zip(pairs, letter, close))
-    if not inner:
-        if float(cs.min()) < p["ls_min_track_em"]:  # 行內有正常字距的字母對：是一般文字夾著單字母，不是字距拉開
-            return line
-        run = best = 1
-        ks = [q[0] for q, m in zip(pairs, letter) if m]
-        for a, b in zip(ks, ks[1:]):
-            run = run + 1 if b == a + 1 else 1
-            best = max(best, run)
-        n_run = (best + 1) if ks else 0
-        if t >= p["ls_space_like_em"] and n_run < p["ls_long_run"]:
-            return line
-    drop_set = set(drop)
-    word = {q[0]: q[1] for q, m in zip(pairs, letter) if not m}
-    chars = line.chars
-    out: list[OcrChar] = list(chars[: ns[0] + 1])
-    for k in range(len(ns) - 1):
-        i, j = ns[k], ns[k + 1]
-        between = chars[i + 1 : j]
-        if k in drop_set:
-            between = []
-        elif k in word and not between:
-            conf = 1.0 / (1.0 + math.exp(-(word[k] - t - jump) / p["space_soft_em"]))
-            err = max(chars[i].x_error, chars[j].x_error)
-            between = [OcrChar(" ", conf, chars[i].x1, chars[j].x0, [CharCandidate(" ", conf), CharCandidate("", 1.0 - conf)], x_error=err)]
-        out.extend(between)
-        out.append(chars[j])
-    out.extend(chars[ns[-1] + 1 :])
-    note = f"字距拉開的一行：拿掉 {len(drop)} 個字母間的空白（扣掉字形留白後，字母間距約 {t:.2f} em）"
-    return OcrLine(
-        quad=line.quad, text="".join(c.text for c in out), score=line.score, chars=out, vertical=line.vertical,
-        quad_error=line.quad_error, angle_error_deg=line.angle_error_deg, notes=list(line.notes) + [note],
-    )
+    return _apply_letter_spacing(line, {**plan, "em": em}, p)
+
+
+def _page_letter_spacing(lines: list[tuple[OcrLine, float]], p: dict) -> list[tuple[OcrLine, float]]:
+    """整頁的字距判斷：先逐行判斷（_letter_spacing_plan）；「只差旁證」的行（每個字母間都讀成空白、間距接近空白寬），
+    同一頁有確定是字距拉開、字母間距相差不超過 ls_page_track_tol_em、字級比不超過 ls_page_em_ratio 的行時才拿掉空白。
+    為什麼：同一份文件的標題通常用同一個字距；一行本身分不出「字距 0.25 em 的 T E A M」和「真正以空白隔開的 T E A M」，
+    但同一頁另一個標題（例如「C O N T AC T」，AC 沒讀成空白）已經證明這種間距是字距。"""
+    if not p["ls_enable"]:
+        return lines
+    plans = [_letter_spacing_plan(l, e, p) for l, e in lines]
+    sure = [(pl["t"], e) for pl, (_, e) in zip(plans, lines) if pl is not None and pl["status"] == "merge"]
+    out = []
+    for pl, (l, e) in zip(plans, lines):
+        if pl is None:
+            out.append((l, e))
+            continue
+        why = ""
+        if pl["status"] == "candidate":
+            n_letters = sum(1 for i in pl["ns"] if _is_letter(l.chars[i].text))
+            ok = p["ls_page_evidence"] and n_letters >= p["ls_page_min_letters"] and any(
+                abs(t2 - pl["t"]) <= p["ls_page_track_tol_em"] and max(e2, e) / max(min(e2, e), 1e-6) <= p["ls_page_em_ratio"] for t2, e2 in sure)
+            if not ok:
+                out.append((l, e))
+                continue
+            why = "；同一頁有字距相近、確定拉開的標題"
+        out.append((_apply_letter_spacing(l, {**pl, "em": e}, p, why), e))
+    return out
 
 
 def _dedup(lines: list[OcrLine], p: dict) -> list[OcrLine]:

@@ -15,6 +15,7 @@ from mortise.artifacts import ElementList, FidelityReport, Intent, OutputFile, O
 from mortise.config import Config
 from mortise.pipeline import Pipeline
 from mortise.tools import pdfium as mp
+from mortise.verify import lines as line_check
 from mortise.verify import pdf_target
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -54,6 +55,11 @@ def test_native_fixture_reads_back_exactly(job):
 def test_overall_score_uses_readback_when_no_powerpoint(job):
     _, _, report = job
     fr = _pdf_report(report)
+    # 每一頁 =（0.5 × 相似度 ＋ 0.5 × 文字一致率）× 逐行分數（stages/s7_verify.py 開頭）。原生 PDF 輸出成可編輯 PDF
+    # （套用逐行對位後）每一行都在原位置，逐行比對沒有任何問題，逐行分數是 1。
+    line_issues = [(i.code, i.message) for pg in fr.pages for i in pg.issues if i.code in line_check.CODES]
+    assert not line_issues, line_issues
+    assert all(f"第 {pg.page_index + 1} 頁逐行文字對照" in " ".join(fr.notes) for pg in fr.pages)  # 每一頁都做了逐行比對
     want = sum(0.5 * pg.similarity + 0.5 * pg.text_match_ratio for pg in fr.pages) / len(fr.pages)
     assert report.target_engine is None  # 沒有要求 PowerPoint，就沒有 PowerPoint 的目標驗證
     assert report.overall_score == pytest.approx(want, abs=1e-9)

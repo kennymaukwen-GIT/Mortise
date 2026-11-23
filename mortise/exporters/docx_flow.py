@@ -8,7 +8,8 @@
   - 頁面尺寸取第一頁；邊界由主文字流內容的最左、最右、最上、最下推算。
   - 表格輸出成正常表格（固定欄寬、列高「至少」、表頭列跨頁重複）；圖片輸出成行內圖片
     （依原比例，不超過版心或欄寬）。
-  - 分欄：由文字框的水平分布偵測；偵測到時用連續分節符號切出分欄的節，欄與欄之間寫分欄符號。
+  - 分欄：由文字框的水平分布偵測；只有報紙式分欄（見 _newspaper_columns）才用連續分節符號切出分欄的節，
+    欄與欄之間寫分欄符號；側欄＋主欄、三欄履歷這類並排的版面一律寫成看不見框線的表格（見「並排的版面」一節）。
   - 清單：段落開頭的編號或項目符號（1.、(1)、一、、（一）、a.、•…）連續出現時，改成 Word 的自動編號。
   - 每個來源頁從新頁開始（page_break="source_page"，預設）；"none" 則完全交給 Word 分頁。
 
@@ -25,7 +26,9 @@
   | 頁首、頁尾、頁碼             | 頁首頁尾部件；頁碼為 PAGE 功能變數；對齊依原位置推算           | 各頁內容不同時只保留第一種（有損，記錄） |
   | 頁面尺寸                     | 分節的 w:pgSz，取第一頁                                      | 其他頁尺寸不同時有損，記錄 |
   | 邊界                         | w:pgMar，由內容外框推算                                       | 近似     |
-  | 分欄                         | 分節的 w:cols（欄寬、欄距）、連續分節、分欄符號               | 偵測不到的欄當成單欄（不記錄：成品文件沒有欄的資訊） |
+  | 分欄                         | 只有報紙式分欄（同寬、上緣對齊、全是同一種內文、沒有底色）用 w:cols；其他並排一律是表格 | 偵測不到的欄當成單欄（不記錄：成品文件沒有欄的資訊） |
+  | 被併成一段的清單項目         | 項目之間強制換行（w:br），項目裡面仍自動換行                   | 無損（記錄） |
+  | 單行段落的右邊界             | 不寫右縮排（框寬是墨跡寬度）；格子裡的單行字依最寬的常見字型縮小格子右內距 | 無損；仍放不下時記錄 |
   | 清單標記                     | 編號定義 w:abstractNum／w:num，段落 w:numPr                   | 對不上格式或只出現一次時保留為文字（記錄） |
   | 表格                         | 原生表格，列高「至少」、表頭列重複                            | 寬度超過版心時等比縮小（有損，記錄） |
   | 圖片                         | 行內圖片，依原比例，不超過版心或欄寬                          | 位置不保留；縮小時記錄；旋轉有損 |
@@ -71,6 +74,7 @@ from .docx_common import (
     finish_package,
     hard_breaks,
     image_descriptor,
+    list_breaks,
     make_ctx,
     picture_pic,
     q,
@@ -83,6 +87,7 @@ from .docx_common import (
     table_texts,
     textbox_wsp,
     twip,
+    worst_case_width_pt,
 )
 from .docx_fixed import MIME, params_from
 
@@ -91,6 +96,10 @@ DEFAULT_PARAMS = {
     "preserve_block_gaps": True,  # 文字框之間的垂直空隙寫成段前距離
     "auto_numbering": True,  # 連續的清單標記改成 Word 自動編號
     "detect_columns": True,  # 由文字框的水平分布偵測分欄
+    # 用並排表格時（side_by_side_tables），只有「報紙式分欄」才改用 Word 分欄（見 _newspaper_columns）：
+    "newspaper_width_tolerance": 0.1,  # 各欄寬度相差不超過最寬一欄的這個比例
+    "newspaper_top_tolerance_lines": 1.5,  # 各欄上緣相差不超過內文行高的這麼多倍
+    "newspaper_size_tolerance": 0.1,  # 欄裡每段字級和中位數相差不超過這個比例（標題字級不同）
     "builtin_headings": True,  # 標題角色對到內建「標題 N」樣式
     "min_margin_pt": 18.0,  # 推算出的邊界下限（pt）
     "max_margin_ratio": 0.4,  # 推算出的邊界上限（頁寬或頁高的比例）
@@ -113,8 +122,14 @@ DEFAULT_PARAMS = {
     "overlay_min_ratio": 0.3,  # 與另一個元素的交集超過自身面積的這個比例，才算「蓋在上面」而用浮動物件
     "fit_page_gaps": True,  # 原圖內容貼到紙邊、放不進 Word 頁面的文字區時，等比壓縮元素之間與段落前後的空隙
     "min_gap_scale": 0.6,  # 空隙最多壓縮到原來的這個比例
+    "fit_wide_font": True,  # 頁面快滿時，也替「換成較寬的退回字型」留位置（見 _write_layout_page）
+    "wide_font": "DejaVu Sans",  # 較寬的退回字型的代表（比 Arial 寬約 12%）
     "rules_as_borders": True,  # 段落正下方的水平線改成段落下框線（例如履歷標題下的線）
     "rule_max_gap_pt": 10.0,  # 線與段落字的下緣距離不超過這麼多（pt）才算「段落正下方」
+    "single_line_margin_ratio": 0.02,  # 格子裡的單行字依最寬的常見字型量出寬度後，再多留這個比例（見 _FlowLayout._fit_single_lines）
+    "wrap_right_slack_em": 0.3,  # 會換行的段落在格子裡的右縮排少這麼多個字（框寬是墨跡寬度，比排字的前進寬度窄一點）
+    "list_line_breaks": True,  # 像清單、被④併成一段的短行（例如側欄的技能）：項目之間寫強制換行（見 docx_common.list_breaks）
+    "list_min_fill": 0.8,  # 框裡只有這一段時，推出來的最寬一行至少要有框寬的這個比例（框寬就是原圖最寬一行）
     "bottom_room": True,  # 每頁從新頁開始時，下邊界只留到頁尾為止（不貼著內容），讓目標軟體多出來的行高有地方放
 }
 
@@ -357,6 +372,51 @@ def _detect_columns(page: StyledPage, blocks: list[Block], left: float, right_x:
     spec = [(w * f, g) for w, g in zip(widths, gaps + [0.0])]
     member = {m.elem_id: i for i, c in enumerate(clusters) for m in c[2]}
     return spec, member
+
+
+def _newspaper_columns(page: StyledPage, blocks: list[Block], col_info, params: dict, s: float) -> bool:
+    """_detect_columns 找到的欄是不是「報紙式分欄」（同一篇內文從一欄底部接到下一欄頂端）。
+    只有這種才值得用 Word 的分欄：改字時文字會從一欄流到下一欄。其他並排（側欄＋主欄、三欄履歷、標題列）
+    用 Word 分欄時，不在欄裡的元素只能變成錨在段落上的浮動方塊，在別的裝置上會錯位、蓋住別的字（iPhone 的截圖就是這樣），
+    所以一律交給看不見框線的表格（_write_layout_page）。
+    條件（全部成立）：
+      1. 各欄寬度相差不超過 newspaper_width_tolerance（4:6 的側欄與主欄不是）。
+      2. 各欄上緣對齊（相差不超過 newspaper_top_tolerance_lines 行）。
+      3. 欄裡全是內文：角色都是 body、只用一種段落樣式、字級相近（沒有標題）。
+      4. 欄的範圍裡沒有填色矩形（側欄的底色）。
+    成品文件沒有記錄「文字從哪一欄接到哪一欄」，第 5 個條件（同一段跨欄）量不到，所以前四條都要成立才算。"""
+    spec, member = col_info
+    widths = [w for w, _ in spec]
+    if max(widths) - min(widths) > params["newspaper_width_tolerance"] * max(widths):
+        return False
+    in_cols = [b for b in blocks if b.elem_id in member]
+    paras = [b for b in in_cols if b.kind == "para"]
+    if not paras or any(b.kind == "table" for b in in_cols):
+        return False
+    if any(b.item.role not in (Role.BODY, Role.UNKNOWN) for b in paras) or len({b.item.style_id for b in paras}) > 1:
+        return False
+    sizes = sorted(r.size_pt.value for b in paras for r in b.item.runs if r.text.strip())
+    if not sizes:
+        return False
+    med = sizes[len(sizes) // 2]
+    for b in paras:
+        ps = [r.size_pt.value for r in b.item.runs if r.text.strip()]
+        if ps and max(abs(v - med) for v in ps) > params["newspaper_size_tolerance"] * med:
+            return False
+    tops: dict[int, float] = {}
+    for b in in_cols:
+        k = member[b.elem_id]
+        tops[k] = min(tops.get(k, float("inf")), b.box.y * s)
+    if max(tops.values()) - min(tops.values()) > params["newspaper_top_tolerance_lines"] * 1.2 * med * s:
+        return False
+    x0 = min(b.box.x for b in in_cols) * s
+    x1 = max(b.box.x + b.box.w for b in in_cols) * s
+    y0 = min(b.box.y for b in in_cols) * s
+    y1 = max(b.box.y + b.box.h for b in in_cols) * s
+    for fx0, fy0, fx1, fy1, _ in _fill_shapes(page, s):
+        if min(fx1, x1) - max(fx0, x0) > 1.0 and min(fy1, y1) - max(fy0, y0) > 1.0:
+            return False
+    return True
 
 
 # ---------- 本文寫入器 ----------
@@ -733,6 +793,12 @@ def _flush_left(it: _Item, tl: float, tr: float) -> bool:
             and it.blocks[0].item.source_line_count <= 1 and it.x0 <= tl + 1.5 and it.x1 < tr - 2.0)
 
 
+def _fixed_lines(sp: StyledParagraph) -> bool:
+    """原圖只有一行、或每一行都已經用強制換行分開（見 docx_common.list_breaks、hard_breaks）的段落。"""
+    n = sum(r.text.count("\n") for r in sp.runs) + 1
+    return n >= max(1, sp.source_line_count)
+
+
 def _fill_shapes(page: StyledPage, s: float) -> list:
     """可以當儲存格底色的形狀：有填色、不旋轉的矩形，而且不是整頁的底色。"""
     W, H = page.width_pt * s, page.height_pt * s
@@ -781,8 +847,9 @@ def _inner_gaps(it: _Item) -> float:
     return sum(b.item.space_before_pt + (b.item.space_after_pt if k < len(it.blocks) - 1 else 0.0) for k, b in enumerate(it.blocks))
 
 
-def _measure(nodes: list, start: float) -> tuple[float, float]:
-    """一串節點由 start 往下排的（內容高度, 空隙高度）：空隙可以等比壓縮，內容不行。列取最高的那一格。"""
+def _measure(nodes: list, start: float, extra: Optional[dict] = None) -> tuple[float, float]:
+    """一串節點由 start 往下排的（內容高度, 空隙高度）：空隙可以等比壓縮，內容不行。列取最高的那一格。
+    extra：元素編號 → 多出來的內容高度（例如換成較寬的字型時多排的行，見 _wide_font_extra）。"""
     content = gaps = 0.0
     y = start
     for kind, node in nodes:
@@ -790,7 +857,7 @@ def _measure(nodes: list, start: float) -> tuple[float, float]:
             best = (0.0, 0.0)
             top = max(node.top, y)  # 列的上緣比上一個內容的下緣還高時，只能從上一個內容的下緣開始（見 emit）
             for kids in node.children:
-                c, g = _measure(kids, top)
+                c, g = _measure(kids, top, extra)
                 if c + g > sum(best):
                     best = (c, g)
             content += best[0]
@@ -801,9 +868,39 @@ def _measure(nodes: list, start: float) -> tuple[float, float]:
         for it in its:
             g = _inner_gaps(it)
             gaps += max(0.0, it.top - y) + g
-            content += max(0.0, it.bottom - it.top - g)
+            content += max(0.0, it.bottom - it.top - g) + (extra or {}).get(it.id, 0.0)
             y = max(y, it.bottom)
     return content, gaps
+
+
+def _wide_font_extra(items: list, ctx: Ctx, s: float, params: dict, family: str) -> dict:
+    """每個文字框在較寬的退回字型（例如 DejaVu Sans：使用者的裝置上沒有寫入的字型時）下多排出幾行、多出多少高度（輸出 pt）。
+    用框寬模擬自動換行（docx_common.simulated_lines），和原圖行數比；清單照 list_breaks 先在項目之間斷行。"""
+    from .docx_common import simulated_lines
+
+    out = {}
+    for it in items:
+        if it.kind != "text" or not it.obj.wrap:
+            continue
+        latin, _ = context_fonts(it.blocks[0].box_paras, ctx)
+        width = it.x1 - it.x0
+        add = 0.0
+        for b in it.blocks:
+            sp = b.item
+            if not sp.runs:
+                continue
+            if params["list_line_breaks"] and not _fixed_lines(sp) and b.numpr is None:
+                sp = list_breaks(sp, width / s, min_fill=params["list_min_fill"] if len(it.blocks) == 1 else 0.0) or sp
+            n = simulated_lines(sp, width, ctx, latin, family)
+            if n is None:
+                continue
+            ls = sp.line_spacing.value if sp.line_spacing else None
+            size = max(r.size_pt.value for r in sp.runs)
+            lh = ls.value if (ls is not None and ls.mode.value == "exact") else (ls.value if ls is not None else 1.0) * 1.15 * size
+            add += max(0, n - max(1, sp.source_line_count)) * lh * s
+        if add > 0:
+            out[it.id] = add
+    return out
 
 
 class _FlowLayout:
@@ -849,7 +946,14 @@ class _FlowLayout:
                 tails.setdefault(k, []).append(b)
             else:
                 floats.append(b)
-        aligns = {b.item.align for b in it.blocks}
+        # 開頭是項目符號、原圖兩行以上、卻被⑤判成靠右或置中的段落：當成靠左（見 docx_fixed._bullets_left）
+        relign = set()
+        for k, b in enumerate(it.blocks):
+            m = detect_marker("".join(r.text for r in b.item.runs))
+            if m is not None and m.kind == "bullet" and b.item.source_line_count >= 2 and b.item.align in (Align.RIGHT, Align.CENTER):
+                relign.add(k)
+                self.ctx.degrade(it.id, "對齊", "開頭是項目符號的多行段落被判成靠右或置中：當成靠左", False)
+        aligns = {Align.LEFT if k in relign else b.item.align for k, b in enumerate(it.blocks)}
         left = max(0.0, it.x0 - tl)
         right = 0.0
         align_override = None
@@ -876,7 +980,7 @@ class _FlowLayout:
         out = []
         spans = _para_spans(it)
         for k, b in enumerate(it.blocks):
-            sp = b.item
+            sp = b.item if k not in relign else b.item.model_copy(update={"align": Align.LEFT})
             border = None
             if self.params["rules_as_borders"] and self.rules:
                 nxt = spans[k + 1][0] if k + 1 < len(spans) else float("inf")
@@ -893,8 +997,22 @@ class _FlowLayout:
             if aligns <= {Align.RIGHT, Align.CENTER} and (hb := hard_breaks(sp, (it.x1 - it.x0) / self.s)) is not None:
                 sp = hb
                 self.ctx.degrade(it.id, "斷行", "靠右或置中的多行字：照原圖的斷行位置寫成強制換行（換了字型也不會改變斷行）", False)
+            elif self.params["list_line_breaks"] and b.numpr is None and (
+                    lb := list_breaks(sp, (it.x1 - it.x0) / self.s, min_fill=self.params["list_min_fill"] if len(it.blocks) == 1 else 0.0)) is not None:
+                sp = lb
+                self.ctx.degrade(it.id, "清單項目", "原圖每個項目各自從新的一行開始、但被併成一段：項目之間寫成強制換行"
+                                 "（字變寬時項目不會接在一起；項目裡面仍然自動換行）", False)
             tail = []
-            r_tw = twip(right) if right > 1.0 else 0
+            rp = right
+            if it.obj.wrap and sp.align in (Align.LEFT, Align.JUSTIFY) and rp > 0.0:
+                if _fixed_lines(sp):
+                    # 原圖只有一行（或每一行都已經強制換行）：不寫右縮排。框寬是墨跡的寬度，比文字引擎排字用的前進寬度窄一點，
+                    # 照框寬寫右縮排的話，原圖剛好一整行的字在同一個字型下也會把最後一個字擠到下一行
+                    rp = 0.0
+                else:  # 會換行的段落：右縮排少一點（約 0.3 個字），換行位置才和原圖一樣
+                    size = max((r.size_pt.value for r in sp.runs), default=10.0) * self.s
+                    rp = max(0.0, rp - self.params["wrap_right_slack_em"] * size)
+            r_tw = twip(rp) if rp > 1.0 else 0
             for t in sorted(tails.get(k, []), key=lambda t: t.x0):
                 tsp = t.blocks[0].item
                 if tsp.align == Align.RIGHT or t.x1 >= it.x1 - 1.0:
@@ -908,7 +1026,8 @@ class _FlowLayout:
                                 extra_before_tw=twip(gap * self.f) if (k == 0 and gap > self.params["min_gap_pt"]) else 0,
                                 page_break_before=(brk == "page" and k == 0), numpr=b.numpr, strip_chars=b.strip,
                                 left_tw=twip(left) if left > 1.0 else 0, hanging_tw=b.hanging_tw, right_tw=r_tw,
-                                gap_scale=self.f, tail=tail or None, align_override=align_override, border_bottom=border)
+                                gap_scale=self.f, tail=tail or None, align_override=align_override or ("left" if k in relign else None),
+                                border_bottom=border)
             self.expect.append("".join(r.text for r in b.item.runs)[b.strip:])
             out.append(p)
         for fl in floats:
@@ -1002,8 +1121,11 @@ class _FlowLayout:
                     else:
                         out.insert(0, empty_paragraph(1.0, page_break_before=True))
                     brk = None
-                row_top_out = node.top - shrink
-                out.append(self._row(node, tl, tr, limit_bottom - row_top_out if limit_bottom is not None else None, start=max(node.top, y)))
+                # 列實際開始的位置：列的上緣（例如從紙張上緣開始的側欄底色）比上一個內容的下緣、或頁面文字區的上緣還高時，
+                # 列只能從那裡開始。最小高度要從這裡量，不然列比文字區還高，整列被擠到下一頁（多出一頁空白）
+                row_start = max(node.top, y)
+                row_top_out = row_start - shrink
+                out.append(self._row(node, tl, tr, limit_bottom - row_top_out if limit_bottom is not None else None, start=row_start))
                 c, g = _measure([("row", node)], y)
                 shrink += (1 - self.f) * g
                 y = max(node.bottom, y + c + g)  # 列被上面的內容往下推時，下緣也跟著往下
@@ -1053,7 +1175,7 @@ class _FlowLayout:
             sub(grid, "w:gridCol", {"w:w": twip(w)})
         tr_el = sub(t, "w:tr")
         trpr = sub(tr_el, "w:trPr")
-        height = row.bottom - row.top
+        height = row.bottom - max(row.top, start)  # 從列實際開始的位置量（見 emit）
         if any(row.fills):
             if max_h is not None:
                 # 留一段安全距離：目標軟體排出來的列上緣比估計的低一點時，最小高度仍放得進這一頁；放不進的話
@@ -1080,6 +1202,7 @@ class _FlowLayout:
                 ml = min(ml, 1.0)
             elif aligns == {Align.RIGHT} and all(i.kind == "text" for i in cell_items):
                 ml = max(0.0, ml - self.params["nowrap_slack_ratio"] * (cx1 - cx0))
+            mr = self._fit_single_lines(cell_items, x1, mr)
             # 格子裡第一個元素與列上緣的距離寫成第一段的段前距離，不寫儲存格上邊距：
             # 實測 LibreOffice 24.2 把一列裡最大的儲存格上邊距套到同一列的每一格，其他格的字因此往下掉
             mt = 0.0
@@ -1103,6 +1226,39 @@ class _FlowLayout:
             for e in els:
                 tc.append(e)
         return t
+
+
+    def _fit_single_lines(self, cell_items: list, x1: float, mr: float) -> float:
+        """格子裡靠左的單行字（或每一行都強制換行的清單、姓名）：用寫入的字型與常見的退回字型（DejaVu Sans、Times New Roman）
+        量最寬會有多寬，放不下時先縮小格子右邊的內距（字可以伸進側欄底色的右側留白），不要讓一個字（例如 24 pt 粗體的姓名）
+        在較寬的字型下從中間折斷。內距縮到 0 仍放不下時記一筆降級（只有更寬的字型才會折斷）。回傳新的右內距。"""
+        need_x = 0.0
+        culprit = None
+        for i in cell_items:
+            if i.kind != "text":
+                continue
+            latin, _ = context_fonts(i.blocks[0].box_paras, self.ctx)
+            for b in i.blocks:
+                sp = b.item
+                if sp.align not in (Align.LEFT, Align.JUSTIFY) or not sp.runs:
+                    continue
+                if not _fixed_lines(sp):
+                    lb = list_breaks(sp, (i.x1 - i.x0) / self.s, min_fill=self.params["list_min_fill"] if len(i.blocks) == 1 else 0.0) \
+                        if self.params["list_line_breaks"] and b.numpr is None else None
+                    if lb is None or not _fixed_lines(lb):
+                        continue
+                    sp = lb
+                written = sorted({self.ctx.font_name(r.font, record=False, context_latin=latin) for r in sp.runs})
+                w = worst_case_width_pt(sp, written) * self.s * (1 + self.params["single_line_margin_ratio"])
+                if i.x0 + w > need_x:
+                    need_x, culprit = i.x0 + w, i.id
+        if need_x <= x1 - mr:
+            return mr
+        if need_x > x1 + 0.5:
+            self.ctx.degrade(culprit, "單行文字的寬度", f"換成較寬的常見字型（DejaVu Sans、Times New Roman）時這一行比格子寬約 {need_x - x1:.0f} pt："
+                             "只有那種字型下會折行", True)
+        return max(0.0, x1 - need_x)
+
 
 
 def _text_extent(it: _Item, ctx: Ctx, s: float) -> tuple[float, float]:
@@ -1198,6 +1354,19 @@ def _write_layout_page(writer: "BodyWriter", docx_doc, page: StyledPage, blocks:
             f = max(params["min_gap_scale"], min(1.0, (avail - c) / g))
             ctx.degrade(f"page-{page.page_index + 1}", "垂直空隙",
                         f"原圖的內容貼到紙邊，放不進 Word 頁面的文字區：元素之間與段落前後的空隙等比壓縮為 {f:.0%}", True)
+        if params["fit_wide_font"] and g > 0 and c + g > 0.85 * avail:
+            # 頁面本來就快滿了：換成較寬的退回字型時多排出的行會把最後幾行擠到下一頁（只剩側欄底色和幾行字）。
+            # 空隙還能再壓縮（不低於 min_gap_scale）就壓到較寬的字型也放得下；壓到下限也放不下就不壓（只會讓正常字型更擠，仍然多一頁）
+            ec, eg = _measure(nodes, top, _wide_font_extra(items, ctx, s, params, params["wide_font"]))
+            if ec + eg * f > avail:
+                f2 = (avail - ec) / eg
+                if params["min_gap_scale"] <= f2 < f:
+                    f = f2
+                    ctx.degrade(f"page-{page.page_index + 1}", "垂直空隙",
+                                f"換成較寬的字型（{params['wide_font']}）時會多排幾行、擠到下一頁：空隙再壓縮為 {f:.0%}", True)
+                elif f2 < params["min_gap_scale"]:
+                    ctx.degrade(f"page-{page.page_index + 1}", "頁數",
+                                f"換成較寬的字型（{params['wide_font']}）時，最後幾行可能擠到下一頁（空隙壓到下限也放不下）", True)
     lay = _FlowLayout(docx_doc, ctx, styles, store, params, expect, s, page, attached, shapes, W, f)
     brk = writer.pop_break() if writer.pending == "page" else None
     els = lay.emit(nodes, left, right_x, top, in_cell=False, brk=brk, limit_bottom=H - bottom - 2.0)
@@ -1296,6 +1465,10 @@ def export(doc: StyledDoc, basename: str, cfg: Config, store: Store) -> OutputFi
         _write_numbering(docx_doc, _assign_lists([b for blocks in page_blocks for b in blocks], ctx), ctx)
     for page, blocks in zip(doc.pages, page_blocks):
         col_info = _detect_columns(page, blocks, left, right_x, params, s) if params["detect_columns"] else None
+        if col_info and params["side_by_side_tables"] and not _newspaper_columns(page, blocks, col_info, params, s):
+            ctx.degrade(f"page-{page.page_index + 1}", "分欄",
+                        f"看起來有 {len(col_info[0])} 欄，但不是報紙式分欄（欄寬不同、有標題或底色）：用看不見框線的表格並排，不用 Word 分欄", False)
+            col_info = None
         if col_info:
             for b in blocks:
                 b.col = col_info[1].get(b.elem_id)

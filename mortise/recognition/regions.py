@@ -104,6 +104,9 @@ __all__ = [
     "find_regions",
     "crop_region",
     "fit_shape",
+    "fill_covered",
+    "fill_quality",
+    "isolate_overlay",
 ]
 
 DEFAULT_PARAMS: dict = {
@@ -211,6 +214,13 @@ DEFAULT_PARAMS: dict = {
     "overlay_floor_pct": 25.0,  # 照片的顆粒下限：取各格顆粒的第幾百分位（最平坦的地方也有的顆粒）
     "overlay_min_texture": 1.5,  # 照片的顆粒下限至少要這麼大（色階）才比得出「形狀比照片乾淨」；照片太乾淨就不拆
     "overlay_noise_ratio": 0.35,  # 形狀內部的顆粒 ÷ 照片的顆粒下限，不超過此值才算後來疊上去的（倍）
+    "overlay_noise_ratio_textured": 0.08,  # 照片沒有本身平坦的地方（整張是紋理）時改用這個更嚴的比值：下限只能取自紋理處，偏高
+    "overlay_flat_tile_k": 1.5,  # 「本身平坦」的格子：低頻起伏（σ3 平滑後扣掉平面）不超過此倍數的顆粒（倍）
+    "overlay_hp_sigma_thin": 1.0,  # 細長的形狀內縮後量不到顆粒時，改用這個較小的高通 σ（像素）再量
+    "overlay_clip_low": 2.0,  # 三個色版都不超過此值的色塊（純黑）可能是照片欠曝截平的地方，不拆（色階）
+    "overlay_clip_high": 253.0,  # 三個色版都至少此值的色塊（純白）可能是照片過曝截平的地方，不拆（色階）
+    "overlay_translucent_ratio": 0.05,  # 頁面底色完全乾淨時，形狀內部的顆粒比超過此值就當成半透明（透出照片），不拆（倍）
+    "overlay_translucent_page_max": 0.5,  # 上一項只在頁面底色的顆粒不超過此值（乾淨的數位畫面）時才用（色階）
     "overlay_page_grain_k": 2.0,  # 形狀內部的顆粒也不能比頁面底色多太多：上限＝此倍數 × 底色顆粒＋下一項（量得到底色時才用）
     "overlay_page_grain_abs": 1.0,  # 同上的絕對容許（色階）
     "overlay_max_gradient": 10.0,  # 形狀內部跨區的顏色變化上限（色階）；有明暗或漸層的（天空、牆面）不拆
@@ -219,8 +229,17 @@ DEFAULT_PARAMS: dict = {
     "overlay_edge_continuity": 0.85,  # 沒被遮住的邊界中，銳利而且有對比的比例下限
     "overlay_edge_visible": 0.4,  # 邊界至少要有這個比例沒被文字或其他物件遮住，才有足夠證據
     "overlay_trace": True,  # 擬合不成基本幾何時改試描圖；描圖過關才拆成向量圖，否則留在照片裡
+    "overlay_full_bleed": True,  # 滿版照片（沒有頁面底色）也找疊在上面的圖形；找不到就照原本的讀法
+    "overlay_full_bleed_border_flat": 0.6,  # 影像外框一圈的格子裡平坦格子不超過此比例，才可能是滿版照片（JPEG 會把照片邊緣壓平一些：量到 0.41）
+    "overlay_full_bleed_touch": 0.05,  # 選出來的「底色」佔外框格子不超過此比例（幾乎沒碰到外框），才不是真的頁面底色
+    "overlay_full_bleed_coverage": 0.3,  # 而且「底色」只佔全部格子的這個比例以下（大片的是真的底色，例如有花邊框的頁面）
     "overlay_clean_grain": 1.0,  # 「完全沒有顆粒」的上限（色階；另與 2 倍頁面雜訊取大者）：照片紋理連到形狀時，靠它把形狀挖出來
+    "overlay_tip_chamfer": 0.2,  # 疊在照片上的多邊形：比相鄰長邊短到此比例以下的邊，當成被 JPEG 削掉的尖角試著補回（倍）
+    "overlay_tip_color_frac": 0.6,  # 補回的尖角裡，顏色比較接近形狀（而不是周圍照片）的像素至少要這個比例
     "overlay_fill_block_px": 24,  # 補照片時複製顆粒的方塊邊長（像素）
+    "overlay_fill_pad_px": 64,  # 補照片時，要補的範圍外擴這麼多像素（另與下一項取大者）當成依據，不必整張照片交給背景補全
+    "overlay_fill_pad_rel": 0.25,  # 外擴的比例（佔要補範圍的長邊）
+    "overlay_fill_quality_warn": 0.5,  # 補出來的地方的中尺度紋理不到周圍的此比例時，在 notes 提醒看得出是補的（fill_quality；影像產線用）
     "overlay_fill_grain_sigma": 4.0,  # 複製的顆粒＝原圖減去這個 σ 的高斯平滑（像素）；比量顆粒用的大，連較粗的顆粒一起帶過去
 }
 
@@ -345,6 +364,8 @@ class BackgroundModel:
     coverage: float  # 背景格子佔全部格子的比例
     confidence: float
     notes: list[str] = field(default_factory=list)
+    border_flat: float = 1.0  # 影像外框一圈的格子裡，平坦格子的比例（滿版照片的外框幾乎都是紋理）
+    border_touch: float = 1.0  # 影像外框一圈的格子裡，屬於選中的底色那一片的比例（0 表示底色完全沒碰到外框）
 
     def predict(self, height: int, width: int) -> np.ndarray:
         S = float(max(height, width))
@@ -390,6 +411,9 @@ def _estimate_background_filled(filled: np.ndarray, unknown: np.ndarray, lap_abs
     cy, cx = np.mgrid[0:ny, 0:nx]
     xc = ((cx + 0.5) * t / S).astype(np.float64)
     yc = ((cy + 0.5) * t / S).astype(np.float64)
+    edge_t = (cy == 0) | (cy == ny - 1) | (cx == 0) | (cx == nx - 1)
+    n_edge = max(int((valid & edge_t).sum()), 1)
+    border_flat = float((flat & edge_t).sum()) / n_edge
 
     def _fallback(kind: str) -> BackgroundModel:
         ring = np.zeros((H, W), bool)
@@ -400,7 +424,8 @@ def _estimate_background_filled(filled: np.ndarray, unknown: np.ndarray, lap_abs
         col = np.median(filled[ring], axis=0) if ring.any() else np.median(filled.reshape(-1, 3), axis=0)
         coeffs = np.zeros((6, 3))
         coeffs[0] = col
-        return BackgroundModel(kind, _to_rgb(col), coeffs, sigma, 99.0, 0.0, 0.1, notes + ["找不到平坦背景，以影像邊緣中位色代替；前景判斷不可靠"])
+        return BackgroundModel(kind, _to_rgb(col), coeffs, sigma, 99.0, 0.0, 0.1, notes + ["找不到平坦背景，以影像邊緣中位色代替；前景判斷不可靠"],
+                               border_flat=border_flat, border_touch=0.0)
 
     if flat.sum() < 2:
         return _fallback("none")
@@ -464,7 +489,8 @@ def _estimate_background_filled(filled: np.ndarray, unknown: np.ndarray, lap_abs
     coverage = float(sel.sum()) / max(n_valid, 1)
     conf = float(np.clip(0.4 + coverage, 0.0, 0.95)) * (0.5 if kind == "complex" else 1.0)
     color = _to_rgb(np.median(meds[sel], axis=0))
-    return BackgroundModel(kind, color, coeffs, sigma, residual, coverage, conf, notes)
+    on_edge = edge_t[fl_y, fl_x]
+    return BackgroundModel(kind, color, coeffs, sigma, residual, coverage, conf, notes, border_flat=border_flat, border_touch=float((sel & on_edge).sum()) / n_edge)
 
 
 def estimate_background(image: np.ndarray, text_mask: np.ndarray | None = None, params: dict | None = None) -> BackgroundModel:
@@ -531,9 +557,14 @@ def fill_covered(image: np.ndarray, region: Region, cover: np.ndarray, params: d
         return img, gen  # 幾乎整張都被蓋住：沒有依據可補，照原樣
     crop = img[y0:y1, x0:x1]
     bgmod.register_inpainter("membrane", _membrane_inpaint)  # 背景補全的替換點；重複註冊只是覆蓋同一個名稱
-    res = bgmod.reconstruct_background(crop, ~known, {"noise_match": False, "inpaint_method": "membrane"})
+    # 只把「要補的範圍外擴一圈」交給背景補全：大張照片整張交進去，光是量雜訊就要好幾秒（4000×3000 實測 6.9 秒）
+    fb = _bbox_of(fill)
+    pad = max(int(P["overlay_fill_pad_px"]), int(math.ceil(float(P["overlay_fill_pad_rel"]) * max(fb[2] - fb[0], fb[3] - fb[1]))))
+    wx0, wy0, wx1, wy1 = _expand_box(fb, pad, y1 - y0, x1 - x0)
+    res = bgmod.reconstruct_background(crop[wy0:wy1, wx0:wx1], ~known[wy0:wy1, wx0:wx1], {"noise_match": False, "inpaint_method": "membrane"})
     out = crop.astype(np.float32)
-    out[fill] = res.image[fill].astype(np.float32)
+    fw = fill[wy0:wy1, wx0:wx1]
+    out[wy0:wy1, wx0:wx1][fw] = res.image[fw].astype(np.float32)
     grain = _grain_fill(crop.astype(np.float32), known, fill, P)
     if grain is not None:
         out[fill] += grain[fill]
@@ -541,6 +572,27 @@ def fill_covered(image: np.ndarray, region: Region, cover: np.ndarray, params: d
     result[y0:y1, x0:x1] = np.clip(np.rint(out), 0, 255).astype(np.uint8)
     gen[y0:y1, x0:x1] = fill
     return result, gen
+
+
+def fill_quality(filled: np.ndarray, gen: np.ndarray, region: Region) -> Optional[float]:
+    """補出來的地方像不像周圍：中尺度起伏（亮度的 σ2 減 σ8 高斯平滑，大約 4 到 16 像素的紋理）的標準差，
+    補出來的地方 ÷ 周圍一圈（外擴 24 像素、屬於這張照片、不是補的）。接近 1 表示看不出來；
+    遠小於 1 表示補出來的是一團平滑的色塊（多尺度紋理的照片），移動上層的圖形就看得出是補的。量不到時回傳 None。"""
+    x0, y0, x1, y1 = region.bbox
+    g = np.asarray(gen, bool)[y0:y1, x0:x1]
+    if g.sum() < 400:
+        return None
+    rb = np.asarray(region.mask, bool)
+    I = np.asarray(filled, np.float32)[y0:y1, x0:x1, :3]
+    Y = I @ np.array([0.299, 0.587, 0.114], np.float32)
+    dog = cv2.GaussianBlur(Y, (0, 0), 2.0) - cv2.GaussianBlur(Y, (0, 0), 8.0)
+    inner = cv2.erode(g.astype(np.uint8), _disk(8), borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool)
+    ring = _dilate(g, 24) & ~_dilate(g, 8) & rb
+    if inner.sum() < 200 or ring.sum() < 200:
+        return None
+    a = float(np.std(dog[inner]))
+    b = float(np.std(dog[ring]))
+    return a / b if b > 0.5 else None
 
 
 def _membrane_inpaint(img: np.ndarray, mask: np.ndarray, p: dict) -> np.ndarray:
@@ -852,8 +904,13 @@ def _cov_std(res) -> np.ndarray:
         return np.full(p, np.inf)
 
 
-def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line: bool = True, line_thick: float = 3.0, allowed: Optional[np.ndarray] = None) -> Optional[_Fit]:
-    """對局部遮罩的外輪廓做由簡到繁的幾何擬合（座標為局部像素，像素中心框架）。"""
+def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line: bool = True, line_thick: float = 3.0, allowed: Optional[np.ndarray] = None,
+              tips=None) -> Optional[_Fit]:
+    """對局部遮罩的外輪廓做由簡到繁的幾何擬合（座標為局部像素，像素中心框架）。
+
+    tips：疊在照片上的形狀才給（一個函式：多邊形頂點 → 補回的尖角裡「像形狀顏色」的像素比例）。JPEG 會把銳角整塊
+    （沿 8×8 區塊的邊）削掉，Douglas–Peucker 就多出幾段短邊；這時試著把短邊當成被削掉的尖角補回去（_refine_polygon 的 chamfer），
+    尖角附近被破壞的輪廓點不算誤差，而且補回的尖角裡大多要是形狀的顏色，才採用。"""
     m8 = mask.astype(np.uint8)
     cs, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cs:
@@ -973,8 +1030,39 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
     def _ok(f: _Fit, k: float = 1.0) -> bool:
         return f.err_mean <= float(P["accept_mean_k"]) * tol * k and f.err_p95 <= float(P["accept_p95_k"]) * tol * k and f.iou >= float(P["min_overlap"]) - (0.02 if k > 1 else 0.0)
 
+    def _tip_poly() -> Optional[_Fit]:
+        """補回被削掉尖角的多邊形（見 docstring 的 tips）；不成就回傳 None。
+        削掉的尖角會讓輪廓多出鋸齒，所以試三種簡化的容許誤差，取過關而且頂點最少的。"""
+        base_eps = max(1.0, float(P["poly_eps_k"]) * tol)
+        best_f: Optional[_Fit] = None
+        for k_eps in (1.0, 2.0, 3.0):
+            a2 = cv2.approxPolyDP(cnt, base_eps * k_eps, True)[:, 0, :].astype(np.float64) + 0.5
+            if not 3 <= len(a2) <= 2 * int(P["max_polygon_vertices"]):
+                continue
+            r = _refine_polygon(pts_all, ok, a2, tol, chamfer=float(P["overlay_tip_chamfer"]))
+            if r is None:
+                continue
+            verts, tip_list = r
+            if not tip_list or len(verts) > int(P["max_polygon_vertices"]):
+                continue
+            keep = np.ones(len(pts), bool)
+            for v, cut in tip_list:  # 尖角附近的輪廓點被壓縮破壞，不算誤差
+                keep &= np.linalg.norm(pts - v, axis=1) > max(6.0, 2.0 * cut)
+            if keep.sum() < 0.5 * len(pts):
+                continue
+            d = _seg_dist(pts[keep], verts)
+            f = _Fit("polygon", poly=verts, err_mean=float(d.mean()), err_p95=float(np.percentile(d, 95)))
+            f.iou = _iou(_offset_poly(verts, 0.5))
+            if not _ok(f) or tips(verts) < float(P["overlay_tip_color_frac"]):
+                continue
+            f.std = {"tips_recovered": float(len(tip_list))}
+            if best_f is None or (len(verts), f.err_mean) < (len(best_f.poly), best_f.err_mean):
+                best_f = f
+        return best_f
+
     if choice is None or not _ok(choice):
         pg = fits.get("polygon")
+        tp = None
         if pg is not None and _ok(pg):
             choice = pg
             ref = _refine_polygon(pts_all, ok, pg.poly, tol)
@@ -982,6 +1070,12 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
                 d = _seg_dist(pts, ref)
                 if float(d.mean()) <= 1.2 * pg.err_mean + 0.1:
                     pg.poly, pg.err_mean, pg.err_p95 = ref, float(d.mean()), float(np.percentile(d, 95))
+            if tips is not None and len(pg.poly) > 3:
+                tp = _tip_poly()
+                if tp is not None and len(tp.poly) < len(pg.poly):
+                    fits["polygon"] = choice = tp
+        elif tips is not None and (tp := _tip_poly()) is not None:
+            fits["polygon"] = choice = tp
         else:
             choice = choice or fits[cand[0][0]]
             choice.accepted = False
@@ -1011,10 +1105,34 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
     return choice
 
 
-def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float) -> Optional[np.ndarray]:
+def _tip_color_check(I: np.ndarray, mask: np.ndarray, bad: np.ndarray, F: np.ndarray):
+    """給 _fit_mask 的 tips：多邊形（局部座標）比遮罩多出來的部分（補回的尖角）裡，顏色比較接近形狀色 F、
+    而不是形狀外圍照片中位色的像素比例。真的被壓縮削掉的尖角裡仍是形狀的顏色（加上振鈴）；本來就是斜角的形狀，
+    多出來的地方是照片，比例很低。"""
+    h, w = mask.shape
+    ring = _dilate(mask, 6) & ~_dilate(mask, 3) & ~bad
+    O = np.median(I[ring], axis=0) if ring.sum() >= 8 else None
+
+    def _frac(verts: np.ndarray) -> float:
+        if O is None:
+            return 0.0
+        R = _raster_poly(verts, 0, 0, w, h, 2) > 0.5
+        add = R & ~_dilate(mask, 1)
+        if add.sum() < 4:
+            return 1.0
+        px = I[add]
+        return float((np.linalg.norm(px - F, axis=1) < np.linalg.norm(px - O, axis=1)).mean())
+
+    return _frac
+
+
+def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float, chamfer: float = 0.0):
     """Douglas–Peucker 的頂點只落在輪廓點上：反鋸齒會把銳角削鈍，在尖端留下兩三個靠得很近的頂點。
     這裡每條邊各自以直線擬合（去掉靠近兩端的點，只用沒被遮住的點），頂點改取相鄰兩條直線的交點；
     太短的邊（小於 max(4, 3 × 容許偏差)）拿掉，讓兩旁的邊直接相交。交點離原頂點太遠（幾乎平行）就保留原頂點。
+    chamfer > 0（疊在照片上的形狀才用）：比相鄰的長邊短得多（不到 chamfer 倍）的邊，當成被壓縮削掉的尖角，也拿掉，
+    兩旁的邊相交處容許離原頂點遠一點（削掉的長度的 3 倍）。這時回傳（頂點、補回的尖角 [(頂點, 削掉的長度)]），
+    尖角是否真的屬於形狀由呼叫端看顏色決定。
     回傳精修後的頂點（與輪廓同一個座標框架）；做不到時回傳 None。"""
     n0 = len(V)
     N = len(P_all)
@@ -1043,7 +1161,9 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
         nd = float(np.hypot(*d))
         return c, (d / nd if nd > _EPS else np.array([1.0, 0.0]))
 
-    def _vertices(lines, base):
+    slack: dict[int, float] = {}  # 邊的起點（輪廓序號）→ 因為削掉尖角而容許多遠
+
+    def _vertices(lines, base, starts):
         out = []
         for i in range(len(lines)):
             (c1, d1), (c2, d2) = lines[i - 1], lines[i]
@@ -1054,12 +1174,13 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
                 continue
             t = ((c2[0] - c1[0]) * d2[1] - (c2[1] - c1[1]) * d2[0]) / den
             v = c1 + t * d1
-            out.append(v if np.hypot(*(v - v0)) <= far else v0)
+            out.append(v if np.hypot(*(v - v0)) <= far + slack.get(starts[i], 0.0) else v0)
         return np.array(out)
 
     while True:
         lines = [_line(a, b) for a, b in edges]
-        verts = _vertices(lines, P_all[[a for a, _ in edges]])
+        starts = [a for a, _ in edges]
+        verts = _vertices(lines, P_all[starts], starts)
         if len(edges) <= 3:
             break
         # 幾乎共線的頂點（離前後兩頂點連線不到容許偏差）：兩條邊併成一條（邊界對比低的地方輪廓不平，會多出這種頂點）
@@ -1073,9 +1194,22 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
             continue
         L = np.linalg.norm(nxt - verts, axis=1)
         k = int(np.argmin(L))
-        if L[k] >= min_len:
+        if chamfer > 0 and L[k] >= min_len:
+            nb = np.maximum(np.roll(L, 1), np.roll(L, -1))  # 尖角常被削成兩三段短邊：拿較長的鄰邊比
+            rel = L / np.maximum(nb, _EPS)
+            k = int(np.argmin(rel))
+            if rel[k] >= chamfer:
+                break
+        elif L[k] >= min_len:
             break
+        if chamfer > 0:  # 被削掉的尖角：相交處容許離原頂點遠一點
+            nxt_start = edges[(k + 1) % len(edges)][0]
+            slack[nxt_start] = slack.get(nxt_start, 0.0) + slack.get(edges[k][0], 0.0) + 3.0 * float(L[k])
         del edges[k]  # 拿掉太短的邊：前後兩條邊直接相交
+    if chamfer > 0:
+        starts = [a for a, _ in edges]
+        tips = [(verts[i], slack[a] / 3.0) for i, a in enumerate(starts) if slack.get(a, 0.0) > 0]
+        return verts, tips
     return verts
 
 
@@ -1339,32 +1473,41 @@ class _OverlayContext:
         self._page: Optional[float] = None
         self.s = float(P["overlay_hp_sigma"])
         self.m = int(math.ceil(3 * self.s)) + 1  # 高斯平滑的影響範圍：離邊界這麼近的像素不拿來量顆粒
-        self.floors: dict[int, float] = {}
+        self.floors: dict = {}
+        self.rejects: dict[int, dict[str, int]] = {}  # 照片 id → 沒拆的原因 → 塊數（照片收尾時合併成一句 notes）
         self.flat_all = np.zeros((H, W), bool)
         for c in cands:
             if c.source == "flat":
                 X0, Y0, X1, Y1 = c.box
                 self.flat_all[Y0:Y1, X0:X1] |= c.vis
 
-    def _hp(self, box) -> np.ndarray:
-        """框內每個像素的高通殘差大小（各色版的絕對值平均；框外多取一圈避免邊界效應）。"""
-        X0, Y0, X1, Y1 = _expand_box(box, self.m, self.H, self.W)
+    def _hp(self, box, s: Optional[float] = None) -> np.ndarray:
+        """框內每個像素的高通殘差大小（各色版的絕對值平均；框外多取一圈避免邊界效應）。s：高通的 σ，預設 overlay_hp_sigma。"""
+        s = self.s if s is None else float(s)
+        X0, Y0, X1, Y1 = _expand_box(box, int(math.ceil(3 * s)) + 1, self.H, self.W)
         I = self.filled[Y0:Y1, X0:X1]
-        r = np.abs(I - cv2.GaussianBlur(I, (0, 0), self.s)).mean(axis=2)
+        r = np.abs(I - cv2.GaussianBlur(I, (0, 0), s)).mean(axis=2)
         x0, y0, x1, y1 = box
         return r[y0 - Y0 : y1 - Y0, x0 - X0 : x1 - X0]
 
-    def floor(self, host: _Cand) -> float:
-        """照片本身的顆粒下限：照片可見像素（避開平坦候選與文字）切成格子，取各格顆粒中位數的低百分位。"""
-        if host.id in self.floors:
-            return self.floors[host.id]
+    def floor(self, host: _Cand, s: Optional[float] = None) -> tuple[float, bool]:
+        """照片本身的顆粒下限，回傳（下限、是不是取自「本身平坦」的格子）。
+
+        照片可見像素（避開平坦候選與文字）切成格子，每格量兩件事：顆粒（高通殘差的中位數）與低頻起伏
+        （σ3 平滑後扣掉平面的穩健標準差）。起伏不超過 overlay_flat_tile_k 倍顆粒的格子是「本身平坦」的地方（天空、
+        漸層、牆面），下限取這些格子顆粒的低百分位。照片裡找不到這種格子（整張都是紋理：磚牆、樹葉）時，
+        只好取所有格子，但紋理會漏進高通、壓縮又把均勻處的顆粒壓得比紋理處少，下限因此偏高——呼叫端要用更嚴的比值。"""
+        s = self.s if s is None else float(s)
+        key = (host.id, round(s, 3))
+        if key in self.floors:
+            return self.floors[key]
         X0, Y0, X1, Y1 = host.box
-        a = self._hp(host.box)
-        valid = host.vis & ~self.unknown[Y0:Y1, X0:X1] & ~_dilate(self.flat_all[Y0:Y1, X0:X1], self.m)
+        a = self._hp(host.box, s)
+        valid = host.vis & ~self.unknown[Y0:Y1, X0:X1] & ~_dilate(self.flat_all[Y0:Y1, X0:X1], int(math.ceil(3 * s)) + 1)
         t = max(8, int(self.P["overlay_tile_px"]))
         h, w = a.shape
         ny, nx = h // t, w // t
-        f = 0.0
+        f, from_flat = 0.0, False
         if ny * nx >= 4:
             A = a[: ny * t, : nx * t].reshape(ny, t, nx, t).transpose(0, 2, 1, 3).reshape(ny * nx, t * t)
             V = valid[: ny * t, : nx * t].reshape(ny, t, nx, t).transpose(0, 2, 1, 3).reshape(ny * nx, t * t)
@@ -1372,14 +1515,26 @@ class _OverlayContext:
             if ok.sum() >= 4:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
-                    med = np.nanmedian(np.where(V[ok], A[ok], np.nan), axis=1)
-                f = float(np.percentile(med, float(self.P["overlay_floor_pct"]))) * _GRAIN_K
+                    med = np.nanmedian(np.where(V[ok], A[ok], np.nan), axis=1) * _GRAIN_K
+                # 低頻起伏：σ3 平滑後，每格以平面（線性漸層）擬合，殘差（各色版取大）的穩健標準差
+                lp = cv2.GaussianBlur(self.filled[Y0:Y1, X0:X1], (0, 0), 3.0)[: ny * t, : nx * t]
+                Lt = lp.reshape(ny, t, nx, t, 3).transpose(0, 2, 1, 3, 4).reshape(ny * nx, t * t, 3)[ok]
+                yy, xx = np.mgrid[0:t, 0:t]
+                B = np.stack([np.ones(t * t), xx.ravel(), yy.ravel()], 1).astype(np.float32)
+                coef = np.einsum("pk,nkc->npc", np.linalg.pinv(B), Lt)
+                res = np.abs(Lt - np.einsum("kp,npc->nkc", B, coef)).max(axis=2)
+                lf = 1.4826 * np.median(res, axis=1)
+                flat = lf <= float(self.P["overlay_flat_tile_k"]) * np.maximum(med, 0.5)
+                if flat.sum() >= 4:
+                    f, from_flat = float(np.percentile(med[flat], float(self.P["overlay_floor_pct"]))), True
+                else:
+                    f = float(np.percentile(med, float(self.P["overlay_floor_pct"])))
             elif valid.any():
                 f = float(np.median(a[valid])) * _GRAIN_K
         elif valid.any():
             f = float(np.median(a[valid])) * _GRAIN_K
-        self.floors[host.id] = f
-        return f
+        self.floors[key] = (f, from_flat)
+        return f, from_flat
 
     def page_grain(self) -> float:
         """頁面底色本身的顆粒（掃描、壓縮的雜訊）：取完全是背景的格子量高通殘差，各格的中位數。量不到時回傳 -1。
@@ -1443,8 +1598,25 @@ class _OverlayContext:
         good = (step >= cmin) & (sharp >= float(P["overlay_edge_sharpness"]))
         return float(good.mean()), n_u / max(n_b, 1)
 
+    def reject(self, host: _Cand, labels: list[str], detail: str) -> None:
+        """記一塊沒拆的平坦色塊：照片收尾時合併成一句 notes（summary）。labels 是簡短的原因，detail 是只有一塊時用的完整說明。"""
+        rec = self.rejects.setdefault(host.id, {"n": 0, "why": {}, "detail": detail})
+        rec["n"] += 1
+        for lb in labels:
+            rec["why"][lb] = rec["why"].get(lb, 0) + 1
+
+    def summary(self, host_id: int) -> Optional[str]:
+        """這張照片（或有紋理的插畫）裡沒拆出來的平坦色塊，合併成一句白話說明；沒有就回傳 None。"""
+        rec = self.rejects.get(host_id)
+        if not rec:
+            return None
+        if rec["n"] == 1:
+            return "照片裡有一塊平坦色塊沒有拆出來：" + rec["detail"]
+        why = "、".join(f"{k} {v} 塊" for k, v in sorted(rec["why"].items(), key=lambda kv: -kv[1]))
+        return f"照片裡有 {rec['n']} 塊平坦色塊沒有拆出來，當成照片的內容（{why}；一塊可能有幾個原因）"
+
     def judge(self, c: _Cand, host: _Cand, min_area: float) -> bool:
-        """量證據並判定；通過的在 c.feats 記 overlay=1 與 overlay_host，並在 notes 說明依據。"""
+        """量證據並判定；通過的在 c.feats 記 overlay=1 與 overlay_host，並在 notes 說明依據。沒過的原因記在 self.rejects。"""
         P = self.P
         X0, Y0, X1, Y1 = c.box
         area = float(c.vis.sum())
@@ -1453,35 +1625,68 @@ class _OverlayContext:
         if area < need_area:
             c.feats.update(fe)
             return False  # 太小：照片裡的小色塊，不值得量（也最容易誤判）
-        floor = self.floor(host)
-        inner = cv2.erode(c.vis.astype(np.uint8), _disk(self.m), borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool) & ~self.unknown[Y0:Y1, X0:X1]
-        grain = float(np.median(self._hp(c.box)[inner])) * _GRAIN_K if inner.sum() >= 50 else 99.0
-        ratio = grain / max(floor, _EPS)
+        floor, from_flat = self.floor(host)
+        known = ~self.unknown[Y0:Y1, X0:X1]
+        inner = cv2.erode(c.vis.astype(np.uint8), _disk(self.m), borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool) & known
+        s_used, floor_cmp, flat_cmp, thin = self.s, floor, from_flat, False
+        if inner.sum() < 50:
+            # 細長的形狀內縮後剩不到幾個像素：改用較小的高通 σ 與較小的內縮再量；照片的下限也用同一個 σ 重量，才比得起來
+            s_used = float(P["overlay_hp_sigma_thin"])
+            inner = cv2.erode(c.vis.astype(np.uint8), _disk(int(math.ceil(3 * s_used)) + 1), borderType=cv2.BORDER_CONSTANT, borderValue=0).astype(bool) & known
+            if inner.sum() >= 50:
+                floor_cmp, flat_cmp = self.floor(host, s_used)
+            else:
+                thin = True
+        grain = float(np.median(self._hp(c.box, s_used)[inner])) * _GRAIN_K if not thin else float("nan")
+        ratio = grain / max(floor_cmp, _EPS) if not thin else float("nan")
+        limit = float(P["overlay_noise_ratio"]) if flat_cmp else float(P["overlay_noise_ratio_textured"])
         cont, vis_frac = self._edges(c, host, floor)
         page = self.page_grain()
-        fe.update({"overlay_grain": grain, "overlay_host_grain": floor, "overlay_grain_ratio": float(min(ratio, 99.0)), "overlay_page_grain": page,
-                   "overlay_color_change": float(c.grad_amp), "overlay_edge_continuity": cont, "overlay_edge_visible": vis_frac})
-        why = []
+        # 截平：三個色版都是 0（或 255）附近的色塊，可能是照片欠曝（或過曝）到底的地方，內部一樣沒有顆粒、邊緣一樣銳利
+        col = np.asarray(c.color, np.float64)
+        lo, hi = float(P["overlay_clip_low"]), float(P["overlay_clip_high"])
+        clipped = "純黑" if (col <= lo).all() else ("純白" if (col >= hi).all() else "")
+        fe.update({"overlay_grain": grain if not thin else -1.0, "overlay_host_grain": floor_cmp, "overlay_grain_ratio": float(min(ratio, 99.0)) if not thin else -1.0,
+                   "overlay_ratio_limit": limit, "overlay_floor_flat": float(flat_cmp), "overlay_hp_sigma": s_used, "overlay_page_grain": page,
+                   "overlay_color_change": float(c.grad_amp), "overlay_edge_continuity": cont, "overlay_edge_visible": vis_frac, "overlay_clipped": float(bool(clipped))})
+        why: list[str] = []
+        labels: list[str] = []
         if floor < float(P["overlay_min_texture"]):
             why.append(f"照片本身很乾淨（顆粒 {floor:.1f}），比不出色塊是不是後來疊上去的")
-        elif ratio > float(P["overlay_noise_ratio"]):
-            why.append(f"色塊內部的顆粒（{grain:.1f}）與照片最平坦處（{floor:.1f}）差不多，是照片的一部分")
+            labels.append("照片太乾淨、比不出來")
+        elif thin:
+            why.append("形狀太細，內縮之後量不到內部的顆粒")
+            labels.append("太細、量不到顆粒")
+        elif ratio > limit:
+            where = "最平坦處" if flat_cmp else "（整張都是紋理，只能拿紋理處比，所以要求更嚴）"
+            why.append(f"色塊內部的顆粒（{grain:.1f}）與照片{where}（{floor_cmp:.1f}）相比不夠乾淨（比值 {ratio:.2f}，要 ≤ {limit:.2f}），像照片的一部分")
+            labels.append("顆粒與照片相近")
         elif page >= 0 and grain > float(P["overlay_page_grain_k"]) * page + float(P["overlay_page_grain_abs"]):
             why.append(f"色塊內部的顆粒（{grain:.1f}）比頁面底色（{page:.1f}）明顯多，像照片自己的平坦處")
+            labels.append("顆粒比頁面底色多")
+        elif 0 <= page <= float(P["overlay_translucent_page_max"]) and ratio > float(P["overlay_translucent_ratio"]):
+            why.append(f"頁面底色完全乾淨，色塊內部卻透出一點照片的顆粒（是照片的 {ratio:.2f} 倍），像半透明的色塊")
+            labels.append("像半透明")
+        if clipped:
+            why.append(f"顏色是{clipped}，可能是照片{'欠曝' if clipped == '純黑' else '過曝'}截平的地方（內部同樣沒有顆粒），保守起見不拆")
+            labels.append("純黑或純白（疑似欠曝、過曝）")
         if c.grad_amp > float(P["overlay_max_gradient"]):
             why.append(f"色塊內部有明暗變化（約 {c.grad_amp:.0f} 色階）")
+            labels.append("有明暗變化")
         if vis_frac < float(P["overlay_edge_visible"]):
             why.append(f"邊界大多被遮住（只看得到 {vis_frac:.0%}），證據不足")
+            labels.append("邊界大多被遮住")
         elif cont < float(P["overlay_edge_continuity"]):
             why.append(f"邊緣不夠銳利或不連續（只有 {cont:.0%} 的邊界清楚）")
+            labels.append("邊緣不清楚")
         if why:
             c.feats.update(fe)
-            host.notes.append("照片裡有一塊平坦色塊沒有拆出來：" + "；".join(why))
+            self.reject(host, labels, "；".join(why))
             return False
         fe.update({"overlay": 1.0, "overlay_host": float(host.id)})
         c.feats.update(fe)
         what = "照片" if host.role == "photo" else "有紋理的插畫"
-        c.notes.append(f"疊在{what}上的平塗圖形：內部顆粒 {grain:.1f}，{what}最平坦處 {floor:.1f}（比值 {ratio:.2f}）；"
+        c.notes.append(f"疊在{what}上的平塗圖形：內部顆粒 {grain:.1f}，{what}{'最平坦處' if flat_cmp else '（整張是紋理）'} {floor_cmp:.1f}（比值 {ratio:.2f}）；"
                        f"{cont:.0%} 的邊界銳利而且有對比；內部顏色變化約 {c.grad_amp:.0f} 色階")
         return True
 
@@ -1789,6 +1994,21 @@ def _find_regions_impl(image, text_mask, P, text_quads):
     filled = _fill_unknown(img, unknown)
     lap = _laplace_abs(filled)
     bg = _estimate_background_filled(filled, unknown, lap, P)
+    # 滿版照片：選出來的「底色」完全沒碰到影像外框、只佔一小部分，外框一圈又幾乎都是紋理——那片「底色」其實是疊在照片上的
+    # 色塊（或照片裡的平坦處）。這時整張影像都是前景、整張當成照片候選，疊加判斷照常進行。
+    full_bleed = bool(P.get("overlay_enabled", True) and P.get("overlay_full_bleed", True)
+                      and bg.border_flat <= float(P["overlay_full_bleed_border_flat"]) and bg.border_touch <= float(P["overlay_full_bleed_touch"])
+                      and (bg.kind == "none" or bg.coverage < float(P["overlay_full_bleed_coverage"])))
+    if full_bleed:
+        ring = np.zeros((H, W), bool)
+        b = max(2, min(H, W) // 50)
+        ring[:b, :] = ring[-b:, :] = True
+        ring[:, :b] = ring[:, -b:] = True
+        col = np.median(filled[ring & ~unknown], axis=0) if (ring & ~unknown).any() else np.median(filled.reshape(-1, 3), axis=0)
+        coeffs = np.zeros((6, 3))
+        coeffs[0] = col
+        bg = BackgroundModel("none", None, coeffs, bg.noise_sigma, 0.0, 0.0, 0.1,
+                             ["整張影像是照片（滿版，沒有頁面底色）：整張當成照片，再找疊在上面的平塗圖形"], border_flat=bg.border_flat, border_touch=bg.border_touch)
     sigma = bg.noise_sigma
     s_fg = float(P["fg_smooth_sigma"])
     gain = 1.0 / (2.0 * math.sqrt(math.pi) * s_fg) if s_fg > 0 else 1.0
@@ -1796,7 +2016,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
     sm = cv2.GaussianBlur(filled, (0, 0), s_fg) if s_fg > 0 else filled
     diff = np.linalg.norm(sm - pred, axis=2)
     thr = max(float(P["fg_min_diff"]), float(P["fg_noise_k"]) * sigma * gain * math.sqrt(3), float(P["fg_model_k"]) * bg.residual)
-    fg = diff > thr
+    fg = np.ones((H, W), bool) if full_bleed else diff > thr
     min_area = max(8.0, float(P["min_area_rel"]) * H * W)
     n, lab, st, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=8)
     small = np.nonzero(st[:, cv2.CC_STAT_AREA] < 0.25 * min_area)[0]
@@ -1812,6 +2032,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
     # ---- 表格 ----
     diff_raw = np.linalg.norm(filled - pred, axis=2)
     fg_raw = fg & (diff_raw > max(float(P["fg_min_diff"]), float(P["fg_noise_k"]) * sigma * math.sqrt(3)))
+    if full_bleed:
+        fg_raw = np.zeros((H, W), bool)  # 滿版照片上不找有框線的表格（照片的紋理會被當成格線）
     tables, table_px = _detect_ruled_tables(fg_raw, diff_raw, P, text_quads)
     table_px = _dilate(table_px, 1) & fg
     work = fg & ~_dilate(table_px, int(math.ceil(2 * s_fg)) + 1)
@@ -1950,7 +2172,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         ys1 = max(fst[m[0]][1] + fst[m[0]][3] for m in members)
         big = max(members, key=lambda m: m[4])
         F = big[1]
-        bx, vis, expl = _refine_flat(flab, root, (xs0, ys0, xs1, ys1), filled, smooth, unknown, F.astype(np.float32), P, sigma, pred, thr)
+        bx, vis, expl = _refine_flat(flab, root, (xs0, ys0, xs1, ys1), filled, smooth, unknown, F.astype(np.float32), P, sigma, None if full_bleed else pred, thr)
         X0, Y0, X1, Y1 = bx
         explained[Y0:Y1, X0:X1] |= expl
         cands.append(_Cand(len(cands), "flat", bx, vis, F, spread=big[2], grad_amp=big[3]))
@@ -1994,8 +2216,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         short, long_ = min(rw, rh) + 1.0, max(rw, rh) + 1.0
         dmean = float(diff[Y0:Y1, X0:X1][c.vis].mean())
         raw_med = float(np.median(diff_raw[Y0:Y1, X0:X1][c.vis])) if area else 0.0
-        if raw_med < thr:
-            c.role = "artifact"  # 平滑造成的殘影：像素本身其實是背景色
+        if raw_med < thr and not full_bleed:
+            c.role = "artifact"  # 平滑造成的殘影：像素本身其實是背景色（滿版照片沒有頁面底色，不判斷）
         c.feats.update({"raw_diff_med": raw_med, "area_px": float(area), "thickness_px": _thickness(c.vis), "short_px": short, "long_px": long_,
                         "hole_frac": float(hole.sum()) / max(float(filled_m.sum()), 1.0), "mean_diff_bg": dmean,
                         "darker_than_bg": float(_luma(c.color) < bgL)})
@@ -2063,12 +2285,14 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             continue
         Ob = pred[Y0:Y1, X0:X1][c.vis].mean(0)
         cF = float(np.linalg.norm(c.color - o.color))
-        cO = float(np.linalg.norm(c.color - Ob))
+        cO = float(np.linalg.norm(c.color - Ob)) if not full_bleed else float("inf")
         if min(cF, cO) <= max(float(P["ringing_max"]), float(P["ringing_frac"]) * float(np.linalg.norm(o.color - Ob))):
             c.role = "artifact"
     # ---- 陰影：緊貼較大區塊、比背景暗、對比低、很薄 ----
     sh_w = float(P["shadow_max_width_rel"]) * min(H, W)
     for c in cands:
+        if full_bleed:
+            break  # 陰影是投在頁面底色上的；滿版照片沒有頁面底色
         f = c.feats
         if not (f["mean_diff_bg"] <= float(P["shadow_max_contrast"]) and f["darker_than_bg"] > 0 and f["thickness_px"] <= sh_w):
             continue
@@ -2138,7 +2362,10 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         ph = photo_hull[bx[1] : bx[3], bx[0] : bx[2]][ring]
         if ph.size and (ph > 0).mean() >= float(P["enclosed_by_photo"]):
             pid = int(np.bincount(ph[ph > 0]).argmax()) - 1
-            if ov is not None and ov.judge(c, cands[pid], min_area):
+            touches = c.box[0] <= 0 or c.box[1] <= 0 or c.box[2] >= W or c.box[3] >= H
+            if full_bleed and touches:
+                pass  # 滿版照片裡碰到影像外框的平坦處（天空、地面）：看不到完整的邊界，當成照片內容
+            elif ov is not None and ov.judge(c, cands[pid], min_area):
                 continue  # 疊在照片上的形狀：照常擬合，圖層在照片之上
             c.role = "merged"
             c.parent = pid
@@ -2220,7 +2447,10 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         bad = _bad_zone(c, box, extra)
         Ls = L[Y0:Y1, X0:X1]
         occluders = ((Ls > 0) & ~np.isin(Ls, [c.id + 1] + [e + 1 for e in extra] + _not_occluders(c))) | unknown[Y0:Y1, X0:X1]
-        fit = _fit_mask(fill_mask, bad, P, tol, allow_line=(c.role == "line"), line_thick=line_thick, allowed=occluders)
+        tips = None
+        if c.feats.get("overlay") == 1.0:
+            tips = _tip_color_check(filled[Y0:Y1, X0:X1], fill_mask, bad, np.asarray(c.color, np.float32))
+        fit = _fit_mask(fill_mask, bad, P, tol, allow_line=(c.role == "line"), line_thick=line_thick, allowed=occluders, tips=tips)
         vis_full = _paste((H, W), box, vis_loc)
         if fit is None or not fit.accepted:
             if c.role == "line" and fit is not None:
@@ -2233,7 +2463,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         if c.role == "line":
             # 線寬：以覆蓋率積分（Σα ÷ 長度）
             zone = _dilate(vis_loc, 2)
-            ringo = _dilate(vis_loc, 5) & ~_dilate(vis_loc, 3) & ~unknown[Y0:Y1, X0:X1] & ~fg[Y0:Y1, X0:X1]
+            ringo = _dilate(vis_loc, 5) & ~_dilate(vis_loc, 3) & ~unknown[Y0:Y1, X0:X1] & (~fg[Y0:Y1, X0:X1] | full_bleed)
             I = filled[Y0:Y1, X0:X1]
             O = np.median(I[ringo], axis=0) if ringo.sum() >= 5 else pred[Y0:Y1, X0:X1][zone].mean(0)
             dd = np.linalg.norm(I - O, axis=2)
@@ -2279,6 +2509,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             if c.grad_amp > 12.0:
                 notes.append(f"填色有漸層（跨區約 {c.grad_amp:.0f} 色階），fill 為中位色")
         amodal = _raster_full(_shapefit_outer_poly(sf), H, W)
+        if fit.std.get("tips_recovered"):
+            notes.append(f"有 {int(fit.std['tips_recovered'])} 個尖角被壓縮削掉了（輪廓沿 8×8 區塊被切平），已依兩旁的邊補回；尖角附近的輪廓點不算誤差")
         occ = fit.std.get("occluded_frac", 0.0)
         if occ > 0.02:
             notes.append(f"外形有 {occ:.0%} 被文字或其他區域遮住，已依可見部分補全")
@@ -2300,7 +2532,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         elif host.role == "photo":
             c.role, c.parent = "merged", host.id
             c.feats["overlay"] = 0.0
-            host.notes.append("照片裡有一塊乾淨的平塗色塊，但外形不是基本幾何、也描不成向量，留在照片裡")
+            if ov is not None:
+                ov.reject(host, ["外形不是基本幾何、也描不成向量"], "色塊很乾淨，但外形不是基本幾何、也描不成向量，留在照片裡")
         else:
             c.feats["overlay"] = 0.0
     # ---- 插畫：擬合失敗的平坦區塊與插畫型紋理就近合併 ----
@@ -2350,6 +2583,8 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             else:
                 kind, conf = "illustration", 1.0 - s
             outline, amodal, onotes = _outline_fit(hull, ill_px, unknown, fg, L, ids, P, tol, H, W)
+            if ov is not None:
+                onotes = onotes + [t for t in (ov.summary(i) for i in ids) if t]
             fe = dict(feats, photo_score=s, area_px=float(hull.sum()), n_parts=float(len(ids)))
             outs.append(_Out(kind, amodal, ill_px, float(np.clip(0.5 + 0.5 * abs(conf - 0.5) * 2, 0.5, 0.95)) * (0.85 if len(ids) == 1 else 1.0),
                              sorted([("illustration", 1 - s), ("photo", s), ("shape", 0.0 if len(ids) > 1 else 0.15)], key=lambda t: -t[1]),
@@ -2366,6 +2601,9 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         if merged:
             notes.append(f"內含 {len(merged)} 個平坦色塊，視為照片內容（也可能是疊在照片上的形狀）")
         n_over = sum(1 for m in cands if m.feats.get("overlay") and int(m.feats.get("overlay_host", -1)) == c.id and m.role not in ("merged", "complex"))
+        summ = ov.summary(c.id) if ov is not None else None
+        if summ:
+            notes.append(summ)
         if n_over:
             notes.append(f"上面疊了 {n_over} 個平塗圖形，已拆成獨立的元素；照片被蓋住的部分要補（屬於生成）")
         hull = _fill_holes(vis | (_dilate(vis, 2 * band) & explained & fg & (L == 0)))
@@ -2401,12 +2639,15 @@ def _find_regions_impl(image, text_mask, P, text_quads):
             outs.remove(o)
         if small:
             t_out.notes.append(f"表格內有 {len(small)} 個未被文字遮罩涵蓋的小塊（可能是漏抓的文字），未另成區域")
+    if full_bleed and not any(o.feats.get("overlay") == 1.0 for o in outs):
+        # 滿版照片上沒有找到疊上去的圖形：照原本的讀法（不當成滿版照片）重來，結果與沒有這個功能時相同
+        return _find_regions_impl(image, text_mask, dict(P, overlay_full_bleed=False), text_quads)
     regions = _assemble(outs, unknown, bg, H, W)
     dbg = P.get("_debug")
     if isinstance(dbg, list):  # 除錯／調參工具用：各候選的來源、角色與特徵
         dbg.append({"background": bg, "fg_threshold": thr, "grad_threshold": g_thr,
                     "candidates": [{"id": c.id, "source": c.source, "role": c.role, "parent": c.parent, "box": c.box, "color": _to_rgb(c.color),
-                                    "spread": c.spread, "feats": dict(c.feats)} for c in cands]})
+                                    "spread": c.spread, "feats": dict(c.feats), "vis": c.vis} for c in cands]})
     return regions
 
 

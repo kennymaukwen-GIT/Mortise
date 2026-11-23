@@ -100,9 +100,14 @@ DEFAULTS: dict = {
     "blob_delta_e": 14.0,  # 色差超過此值的像素才算進成塊誤差
     "max_refine_rounds": 2,  # 誤差成塊時最多放細重描幾輪
     "max_paths": 1500,  # 路徑數上限，超過視為不適合向量化
+    "refine_max_blob_fraction": 0.04,  # 成塊誤差超過此比例就不再放細重描（補不回來；評測裡需要重描的第一輪最多 0.014）
+    "max_seconds": 30.0,  # 描圖的時間上限（秒）＝此值＋下一項 × 百萬像素；超過就回報不適合（安全網；0 表示不限）
+    "max_seconds_per_mpx": 10.0,
     "max_megapixels": 16.0,  # 影像大於此值先縮小再描（座標會換算回原尺寸）
     # ---- 早期判斷：明顯像照片或材質的輸入，取樣幾十個方塊就回傳不適合（見 vector_segment.photo_precheck）
     "photo_check": True,
+    "photo_check_side": 560,  # 第二個尺度：影像（面積平均）縮到最長邊這麼多像素再取樣；同一張照片在不同解析度下才量到一樣的東西（0 表示不看）
+    "photo_check_texture_de_small": 3.5,  # 第二個尺度的殘差門檻（ΔE）：量到插畫最多 3.35（放大四倍的雜訊插畫）、風景照 ≥ 4.38
     "photo_check_tile_px": 40,  # 取樣方塊的邊長（像素）
     "photo_check_tiles": 64,  # 最多取樣幾塊
     "photo_check_min_tiles": 8,  # 平坦方塊至少要有幾塊才下判斷（小圖、全是線條的圖表不判斷，交給完整流程）
@@ -223,9 +228,14 @@ def vectorize(image: np.ndarray, mask: Optional[np.ndarray] = None, params: Opti
     best: Optional[VectorResult] = None
     rounds = 0
     history = []
+    # 時間上限（安全網）：完整流程擋不下、又被切成幾百塊的照片，擬合與重畫可能要好幾分鐘。超過就回報不適合。
+    # 這是唯一和機器快慢有關的判斷；正常的插畫（評測每張最多約 2 秒）遠低於上限。
+    budget = float(P["max_seconds"]) + float(P["max_seconds_per_mpx"]) * H * W / 1e6 if float(P["max_seconds"]) > 0 else 0.0
+    deadline = t_start + budget if budget > 0 else None
     for level in range(1 + int(P["max_refine_rounds"])):
         Pl = dict(P)
         Pl.update(_REFINE_LEVELS[min(level, len(_REFINE_LEVELS) - 1)])
+        Pl["_deadline"] = deadline
         res = _trace_once(work, wmask, Pl)
         rounds += 1
         history.append({"level": level, "render_error": round(res.render_error, 3), "paths": len(res.paths), "blob_fraction": res.stats.get("blob_fraction"), "accepted": res.accepted})
@@ -233,8 +243,15 @@ def vectorize(image: np.ndarray, mask: Optional[np.ndarray] = None, params: Opti
             best = res
         if res.accepted or res.stats.get("rejected"):
             break
-        if (res.stats.get("blob_fraction") or 0.0) <= 0.0:
+        blob = res.stats.get("blob_fraction") or 0.0
+        if blob <= 0.0:
             break  # 誤差不是成塊的（沒有漏掉的東西），放細也不會更好
+        if blob > float(P["refine_max_blob_fraction"]):
+            # 成塊的誤差遠超過上限（照片的明暗、大片漏掉的東西）：放細門檻只會切出更多碎塊，補不回來（評測裡需要重描的最多 1.4%）
+            res.notes.append(f"成塊對不上的面積（{blob:.1%}）遠超過上限，放細門檻也補不回來，不再重描。")
+            break
+        if deadline is not None and time.perf_counter() > deadline:
+            break
     assert best is not None
     best.stats["rounds"] = rounds
     best.stats["history"] = history
@@ -377,6 +394,16 @@ def _similar(seg: Segmentation, img: np.ndarray, a: int, b: int, de: float) -> b
     return float(np.mean(np.abs(img[ys, xs].astype(np.float32) - pred).max(axis=1))) <= max(6.0, 4.0 * seg.sigma)
 
 
+def _late(P: dict) -> bool:
+    d = P.get("_deadline")
+    return d is not None and time.perf_counter() > d
+
+
+def _late_note(P: dict, where: str) -> str:
+    return (f"描圖超過時間上限（{float(P['max_seconds']):g} 秒＋每百萬像素 {float(P['max_seconds_per_mpx']):g} 秒）仍未完成（{where}），"
+            "內容太複雜，不適合向量化。這是時間上的安全網，機器很忙時結果可能不同。")
+
+
 def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorResult:
     H, W = img.shape[:2]
     timing: dict = {}
@@ -451,6 +478,8 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
                 inner = set(int(v) for v in np.unique(lab_c[hm])) - {k}
                 r.holes.append(((np.nonzero(hm)[0] + Y0, np.nonzero(hm)[1] + X0), inner))
     timing["contours"] = round(time.perf_counter() - t1, 4)
+    stats["contour_points"] = int(sum(len(ct.points) for k in live for ct in regs[k].contours))
+    stats["contour_density"] = round(stats["contour_points"] / float(max(1, H * W)), 4)
 
     # ---------- 圖層順序
     t1 = time.perf_counter()
@@ -477,6 +506,9 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
     order = _topo_order(fg, below, area, regs)
     rank = {k: i for i, k in enumerate(order)}
     timing["order"] = round(time.perf_counter() - t1, 4)
+    if _late(P):
+        stats["rejected"] = True
+        return _empty((W, H), _late_note(P, "還沒開始擬合"), stats)
 
     # ---------- 每個區域的外形與擬合
     t1 = time.perf_counter()
@@ -495,6 +527,9 @@ def _trace_once(img: np.ndarray, mask: Optional[np.ndarray], P: dict) -> VectorR
         if len(paths) > int(P["max_paths"]):
             stats["rejected"] = True
             return _empty((W, H), f"路徑超過 {P['max_paths']} 條，內容太複雜，不適合向量化。", stats)
+        if _late(P):
+            stats["rejected"] = True
+            return _empty((W, H), _late_note(P, f"已擬合 {len(paths)} 條路徑"), stats)
     timing["fit"] = round(time.perf_counter() - t1, 4)
     stats["counts"] = counts
 

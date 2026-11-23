@@ -57,17 +57,43 @@ class Segmentation:
 
 
 def photo_precheck(image: np.ndarray, mask: Optional[np.ndarray], P: dict) -> tuple[Optional[str], dict]:
-    """便宜的早期判斷：明顯像照片或材質的輸入，不必走完整的分割（大張照片要好幾秒到一分鐘才會被判定不適合）。
+    """便宜的早期判斷：明顯像照片或材質的輸入，不必走完整的分割（大張照片要好幾秒到好幾分鐘才會被判定不適合）。
 
-    只看取樣的方塊（最多 photo_check_tiles 塊、邊長 photo_check_tile_px），用的是與 segment 相同的量法與門檻：
+    看兩個尺度，任一個像照片就回傳不適合：
+      1. 原尺寸：照片本身的細顆粒（感光雜訊）在這裡最清楚（海報那種「漸層加顆粒」縮小後顆粒就被平均掉了）。
+      2. 縮到最長邊 photo_check_side 像素（面積平均）：同一張照片解析度越高，固定大小的方塊裡就越平滑，
+         原尺寸的判斷會跟著尺寸變（風景照 780 寬擋得住、1500 寬以上就擋不住）；縮到同一個尺寸，方塊涵蓋的內容
+         才一樣多。插畫的平坦處縮小後仍然平坦。這個尺度只用「平坦方塊的殘差」一條，門檻 photo_check_texture_de_small
+         比原尺寸寬一點（放大四倍的雜訊插畫縮小後最多量到 ΔE 3.35，完整流程仍然描得成）。
+    每個尺度的做法見 _precheck_once。回傳（不適合的原因或 None、量到的數值）。不會改動影像。"""
+    why, stats = _precheck_once(image, mask, P, float(P.get("photo_check_texture_de", 3.0)), use_smooth=True)
+    if why is not None:
+        return why, stats
+    H, W = image.shape[:2]
+    side = int(P.get("photo_check_side", 0) or 0)
+    if side > 0 and max(H, W) > side:
+        k = side / float(max(H, W))
+        T = int(P.get("photo_check_tile_px", 40))
+        w2, h2 = max(T, int(round(W * k))), max(T, int(round(H * k)))
+        small = cv2.resize(np.ascontiguousarray(image[..., :3]), (w2, h2), interpolation=cv2.INTER_AREA)
+        msmall = None if mask is None else cv2.resize(np.asarray(mask, np.uint8) * 255, (w2, h2), interpolation=cv2.INTER_AREA) >= 128
+        why2, st2 = _precheck_once(small, msmall, P, float(P.get("photo_check_texture_de_small", 3.5)), use_smooth=False)
+        stats.update({"photo_check_small_" + k_[12:]: v for k_, v in st2.items()})
+        stats["photo_check_small_scale"] = round(k, 4)
+        if why2 is not None:
+            return why2.replace("快速檢查：", f"快速檢查（縮小到 {w2}×{h2}）："), stats
+    return None, stats
+
+
+def _precheck_once(image: np.ndarray, mask: Optional[np.ndarray], P: dict, de_thr: float, use_smooth: bool = True) -> tuple[Optional[str], dict]:
+    """在一個尺度上取樣方塊（最多 photo_check_tiles 塊、邊長 photo_check_tile_px），用的是與 segment 相同的量法與門檻：
       1. 雜訊：方塊的 Laplacian 中位數；雜訊大時做與 segment 相同的保邊平滑。
-      2. 平滑像素（二階差分、梯度都小）佔取樣的比例太低（不到 photo_check_smooth）→ 像照片或材質。
+      2. 平滑像素（二階差分、梯度都小）佔取樣的比例太低（不到 photo_check_smooth）→ 像照片或材質（use_smooth 時才看）。
          完整流程的門檻是 min_core_fraction；這裡取得更嚴，只擋明顯的。
       3. 沒有強邊緣、大多平滑的方塊（插畫裡的純色或漸層區）：在 CIELAB 裡以平面（線性漸層）擬合，殘差（ΔE）的中位數。
          插畫的平坦區在平滑後幾乎沒有殘差（漸層也是平面）；照片的平坦處還留著成片的明暗起伏，起伏與分色帶（band_de）
          同一個量級時，完整流程會把它切成上千個碎塊。這種方塊夠多（至少 photo_check_min_tiles 塊、佔取樣的
-         photo_check_min_share），而且各塊殘差的中位數超過 photo_check_texture_de → 像照片或材質。
-    回傳（不適合的原因或 None、量到的數值）。不會改動影像。"""
+         photo_check_min_share），而且各塊殘差的中位數超過 de_thr → 像照片或材質。"""
     import math
 
     H, W = image.shape[:2]
@@ -110,7 +136,7 @@ def photo_precheck(image: np.ndarray, mask: Optional[np.ndarray], P: dict) -> tu
     smooth = [(l <= t_lap) & (g <= t_grad) for _, l, g in proc]
     smooth_frac = float(np.mean([s.mean() for s in smooth]))
     stats.update({"photo_check_sigma": round(sigma, 3), "photo_check_smooth": round(smooth_frac, 4)})
-    if smooth_frac < float(P.get("photo_check_smooth", 0.15)):
+    if use_smooth and smooth_frac < float(P.get("photo_check_smooth", 0.15)):
         return f"快速檢查：取樣的 {len(tiles)} 個方塊裡，平滑的像素只佔 {smooth_frac:.0%}，像照片或材質，不適合向量化。", stats
     yy, xx = np.mgrid[0:T, 0:T]
     A = np.stack([np.ones(T * T), xx.ravel(), yy.ravel()], axis=1).astype(np.float64)
@@ -125,7 +151,7 @@ def photo_precheck(image: np.ndarray, mask: Optional[np.ndarray], P: dict) -> tu
     score = float(np.median(ratios)) if ratios else 0.0
     stats.update({"photo_check_flat_tiles": n_flat, "photo_check_texture_de": round(score, 3)})
     if n_flat >= int(P.get("photo_check_min_tiles", 8)) and n_flat >= float(P.get("photo_check_min_share", 0.3)) * len(tiles) \
-            and score >= float(P.get("photo_check_texture_de", 3.0)):
+            and score >= de_thr:
         return (f"快速檢查：取樣的 {n_flat} 個平坦方塊在平滑後仍有成片的明暗起伏（中位數 ΔE {score:.1f}），"
                 "像照片或材質，不適合向量化。"), stats
     return None, stats
@@ -736,22 +762,30 @@ def _rejected(H: int, W: int, sigma: float, stats: dict, why: str) -> Segmentati
 
 
 def _split_colors(lab_px: np.ndarray, de: float, kmax: int) -> np.ndarray:
-    """決定性的色彩分群：從整體平均色開始，每次把散得最開的一群沿主軸切成兩半，直到每群內的色差夠小。"""
+    """決定性的色彩分群：從整體平均色開始，每次把散得最開的一群沿主軸切成兩半，直到每群內的色差夠小。
+
+    每群記住自己的像素序號與散開程度（只在新切出來的兩群重算），不必每一輪都掃過全部像素；
+    結果與逐輪重算完全相同（大張照片的一個大核心原本要十幾秒）。"""
     assign = np.zeros(len(lab_px), dtype=np.int32)
+    members: list[np.ndarray] = [np.arange(len(lab_px))]
+
+    def _spread(ix: np.ndarray) -> Optional[float]:
+        if len(ix) < 8:
+            return None
+        px = lab_px[ix]
+        return float(np.percentile(np.sqrt(((px - px.mean(axis=0)) ** 2).sum(axis=1)), 90))
+
+    spreads: list[Optional[float]] = [_spread(members[0])]
     k = 1
     while k < kmax:
         worst, worst_spread = -1, de
         for b in range(k):
-            m = assign == b
-            if m.sum() < 8:
-                continue
-            px = lab_px[m]
-            spread = float(np.percentile(np.sqrt(((px - px.mean(axis=0)) ** 2).sum(axis=1)), 90))
-            if spread > worst_spread:
-                worst, worst_spread = b, spread
+            sp = spreads[b]
+            if sp is not None and sp > worst_spread:
+                worst, worst_spread = b, sp
         if worst < 0:
             break
-        m = np.nonzero(assign == worst)[0]
+        m = members[worst]
         px = lab_px[m].astype(np.float64)
         c = px.mean(axis=0)
         _, _, vt = np.linalg.svd((px - c)[:: max(1, len(px) // 5000)], full_matrices=False)
@@ -763,7 +797,12 @@ def _split_colors(lab_px: np.ndarray, de: float, kmax: int) -> np.ndarray:
             if len(a) == 0 or len(b2) == 0:
                 break
             thr = 0.5 * (float(a.mean()) + float(b2.mean()))
-        assign[m[proj > thr]] = k
+        hi = proj > thr
+        assign[m[hi]] = k
+        members[worst] = m[~hi]
+        members.append(m[hi])
+        spreads[worst] = _spread(members[worst])
+        spreads.append(_spread(members[k]))
         k += 1
     return assign
 

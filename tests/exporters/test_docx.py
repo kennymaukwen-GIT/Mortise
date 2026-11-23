@@ -288,7 +288,12 @@ def test_fixed_layers_shapes_and_images(synth):
     assert bg[1] == "1" and all(bg[0] < v[0] for v in rh.values())
     page1 = synth["doc"].pages[0]
     order = sorted([(e.z, e.id) for e in page1.text_boxes + page1.images + page1.shapes + page1.tables])
-    assert [i for _, i in order] == sorted((n for n in rh if n.startswith("p001")), key=lambda n: rh[n][0])
+    # 多段的文字框分開放時（docx_fixed._split_groups），第二段起的方塊名稱是「元素編號-p段落序號」，緊接在同一個元素的方塊後面
+    got = sorted((n for n in rh if n.startswith("p001")), key=lambda n: rh[n][0])
+    assert [i for _, i in order] == [n for n in got if not __import__("re").search(r"-p\d+$", n)]
+    for n in got:
+        if (m := __import__("re").match(r"(.*)-p\d+$", n)):
+            assert got[got.index(n) - 1].startswith(m.group(1)), (n, got)
     rr = anchor_by_name(root, "p001-shp-rr")
     assert rr.find(f".//{q('a:prstGeom')}").get("prst") == "roundRect"
     assert rr.find(f".//{q('a:gd')}").get("fmla") == "val 20000"  # 10 pt ÷ 短邊 50 pt

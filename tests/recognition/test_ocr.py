@@ -633,8 +633,7 @@ def _fake_line(model_text: str, truth: str, em: float = 20.0, track_em: float = 
     ("S K I L L S", "SKILLS", 0.13, "SKILLS"),  # 每個字母間都讀成空白，字距小於一般空白寬
     ("A B O U T M E", "ABOUT ME", 0.13, "ABOUT ME"),  # 兩個詞：詞間距大出一個空白寬以上，保留一個空白
     ("S O FT WA R E", "SOFTWARE", 0.25, "SOFTWARE"),  # 字距接近空白寬，但 FT、WA 沒讀成空白、間距卻一樣大：那些空白只是字距
-    ("C O N T A C T", "CONTACT", 0.30, "CONTACT"),  # 每個字母間都是空白、字距大：連續 7 個字母間距一致，仍視為字距拉開
-    ("r e f e r e n c e s", "references", 0.20, "references"),  # 小寫也一樣
+    ("r e f e r e n c e s", "references", 0.16, "references"),  # 小寫也一樣（0.20 em 以上、每個字母間都是空白的，要同一頁的旁證，見 test_letter_spacing_review_page_evidence）
 ])
 def test_letter_spacing_logic_collapses(model_text, truth, track_em, expected):
     from mortise.recognition.ocr import _letter_spacing
@@ -655,6 +654,9 @@ def test_letter_spacing_logic_collapses(model_text, truth, track_em, expected):
     ("2 0 2 6", "2026", 0.13),  # 數字不併（數字之間的空白可能是真的：電話、金額）
     ("S K I L L S 技能", "SKILLS 技能", 0.13),  # 混有中文字的行不處理
     ("L A B E L S", "LABELS", 1.0),  # 間距大到不像字距（分開擺放的標籤）
+    # 每個字母間都讀成空白、間距接近空白寬：一行本身和真正以空白隔開的字母分不出來，沒有同一頁的旁證就不併
+    # （審查實測「A B C D E F G H」等真正的空白間距 0.24 到 0.31 em；舊規則「連續 5 個以上就併」會誤併）
+    ("C O N T A C T", "CONTACT", 0.30),
 ])
 def test_letter_spacing_logic_leaves_alone(model_text, truth, track_em):
     from mortise.recognition.ocr import _letter_spacing
@@ -687,9 +689,11 @@ def _draw_tracked(canvas: Image.Image, text: str, font_path: str, size: int, xy,
 
 
 TRACKED = [  # (文字, 字型, 字級 px, 字距 em)：不同字型、字級、字距，含兩個詞與小寫
+    # 單一個詞、字距接近空白寬（0.25 em 以上）、每個字母間都讀成空白的行，量起來和真正以空白隔開的單字母一樣，
+    # 只在同一頁有旁證時才併（見 test_letter_spacing_review_page_evidence），所以這裡單一個詞的字距都在 0.2 em 以下
     ("SKILLS", SANS_B, 26, 0.13), ("PROFILE", INTER_B, 20, 0.15), ("EXPERIENCE", INTER_B, 34, 0.12),
     ("ABOUT ME", SANS_B, 30, 0.20), ("WORK EXPERIENCE", INTER_R, 24, 0.25), ("SOFTWARE", DEJAVU, 22, 0.18),
-    ("LANGUAGES", SERIF_B, 28, 0.15), ("CONTACT", INTER_B, 16, 0.30), ("EDUCATION", SANS, 40, 0.10),
+    ("LANGUAGES", SERIF_B, 28, 0.15), ("CONTACT", INTER_B, 16, 0.18), ("EDUCATION", SANS, 40, 0.10),
     ("references", INTER_R, 30, 0.20),
 ]
 UNTOUCHED = [  # 一般字距的行：開不開這個功能，讀出來都要一樣
@@ -766,3 +770,81 @@ def test_letter_spacing_leaves_normal_lines_alone():
         assert not any(_track_from_note(l) is not None for l in on[base + k]), text
     # 沒有這個功能時，標題會讀成字母間有空白的樣子（確保這個測試真的在測這件事）
     assert [l.text for l in off[0]] == ["S K I L L S"], [l.text for l in off[0]]
+
+
+# ---------- 審查找到的反例（字距判斷）：真正以空白隔開的單字母不併、斜體襯線與連字號的拉開標題要併 ----------
+
+
+def _shift_char(line: OcrLine, index: int, dx_em: float, em: float = 20.0) -> OcrLine:
+    """把第 index 個非空白字（含）之後的字往左右移 dx_em：模擬斜體、襯線字的留白和字形表不同，某一對字量起來特別近。"""
+    from mortise.recognition.types import OcrChar
+
+    out, k = [], 0
+    for c in line.chars:
+        if c.text != " ":
+            k += 1
+        d = dx_em * em if k > index else 0.0
+        out.append(OcrChar(c.text, c.score, c.x0 + d, c.x1 + d, c.candidates, x_error=c.x_error))
+    return OcrLine(quad=line.quad, text=line.text, score=line.score, chars=out)
+
+
+@pytest.mark.parametrize("text", [
+    "F B I C I A",  # 粗體縮寫連在一起
+    "A B C D E F G H",  # 連續 8 個以空白隔開的大寫字母
+    "a b c d e",  # 小寫
+    "C D E F G A B",  # 音名
+    "a I o u e",  # 大小寫交錯
+])
+def test_letter_spacing_review_real_spaces_kept(text):
+    """真正以空白隔開的單字母（間距 = 空白寬，約 0.28 em）：開關這個功能讀出來都一樣，整頁判斷也不併。"""
+    from mortise.recognition.ocr import _letter_spacing, _page_letter_spacing
+
+    line = _fake_line(text, text, track_em=0.0)
+    assert _letter_spacing(line, 20.0, DEFAULT_PARAMS).text == text
+    assert _page_letter_spacing([(line, 20.0)], DEFAULT_PARAMS)[0][0].text == text
+
+
+def test_letter_spacing_review_italic_serif_one_tight_pair():
+    """斜體襯線字「P R O F IL E」（字距 0.15 em）：I 和 L 的留白和字形表差得多，那一對量起來像正常字距、也沒讀成空白。
+    只有一對（不超過字母對的 ls_max_tight_frac）時仍判為字距拉開；「I am a cat」這種一半以上是正常字距的不併。"""
+    from mortise.recognition.ocr import _letter_spacing
+
+    line = _shift_char(_fake_line("P R O F IL E", "PROFILE", track_em=0.15), 5, -0.11)  # IL 之間只剩約 0.04 em
+    out = _letter_spacing(line, 20.0, DEFAULT_PARAMS)
+    assert out.text == "PROFILE", out.text
+    assert _letter_spacing(_fake_line("I am a cat", "I am a cat"), 20.0, DEFAULT_PARAMS).text == "I am a cat"
+
+
+def test_letter_spacing_review_hyphen_joined():
+    """「E - M A I L」（字距 0.12 em）：連字號兩側的間距也和字母間距一樣，兩側的空白一起拿掉；
+    「SKILLS & TOOLS」的 & 兩側是詞間距，空白保留。"""
+    from mortise.recognition.ocr import _letter_spacing
+
+    assert _letter_spacing(_fake_line("E - M A I L", "E-MAIL", track_em=0.12), 20.0, DEFAULT_PARAMS).text == "E-MAIL"
+    out = _letter_spacing(_fake_line("S K I L L S & T O O L S", "SKILLS & TOOLS", track_em=0.13), 20.0, DEFAULT_PARAMS)
+    assert out.text == "SKILLS & TOOLS", out.text
+
+
+def test_letter_spacing_review_page_evidence():
+    """字距接近空白寬、每個字母間都讀成空白的「T E A M S」（字距 0.25 em）：只看這一行分不出來，不併；
+    同一頁另一個字距相近、確定拉開的標題（「C O N T AC T」：AC 沒讀成空白、間距卻一樣）是旁證，兩行都併。
+    旁證的字距差太多（0.10 em 的標題）或字級差太多時不算。"""
+    from mortise.recognition.ocr import _page_letter_spacing
+
+    team = _fake_line("T E A M S", "TEAMS", track_em=0.25)
+    contact = _fake_line("C O N T AC T", "CONTACT", track_em=0.25)
+    alone = _page_letter_spacing([(team, 20.0)], DEFAULT_PARAMS)
+    assert alone[0][0].text == "T E A M S"
+    both = _page_letter_spacing([(team, 20.0), (contact, 20.0)], DEFAULT_PARAMS)
+    assert [l.text for l, _ in both] == ["TEAMS", "CONTACT"]
+    assert "確定拉開" in both[0][0].notes[-1]
+    far = _page_letter_spacing([(team, 20.0), (_fake_line("S K IL L S", "SKILLS", track_em=0.10), 20.0)], DEFAULT_PARAMS)
+    assert far[0][0].text == "T E A M S"
+    big = _page_letter_spacing([(team, 20.0), (_fake_line("C O N T AC T", "CONTACT", em=40.0, track_em=0.25), 40.0)], DEFAULT_PARAMS)
+    assert big[0][0].text == "T E A M S"
+    # 四個字母（「T E A M」與真正的「A B C D」量起來一樣）即使有旁證也不併：已知的限制，寧可留空白也不誤併
+    four = _page_letter_spacing([(_fake_line("T E A M", "TEAM", track_em=0.25), 20.0), (contact, 20.0)], DEFAULT_PARAMS)
+    assert four[0][0].text == "T E A M"
+    # 真正以空白隔開的字母不會因為同一頁有字距拉開的標題就被併：大小寫交錯
+    mixed = _fake_line("a I o u e", "a I o u e")
+    assert _page_letter_spacing([(mixed, 20.0), (contact, 20.0)], DEFAULT_PARAMS)[0][0].text == "a I o u e"

@@ -995,6 +995,73 @@ def test_chromium_cross_check(doc, out, store, tmp_path):
             assert diff_ratio(chrome, mine, 96, box=(320 / 600, 40 / 400, 560 / 600, 240 / 400)) < 0.0005  # 向量圖
 
 
+def _ink_words(im: Image.Image, box: tuple[int, int, int, int], gap_px: int) -> list[tuple[int, int]]:
+    """標題列裡有墨水的欄，間隔不到 gap_px 的併成一個「詞」，回傳各詞的（起點, 終點）像素。"""
+    a = np.asarray(im.convert("L").crop(box), dtype=np.int16) < 128
+    words: list[list[int]] = []
+    for x in np.flatnonzero(a.any(axis=0)):
+        if words and x - words[-1][1] <= gap_px:
+            words[-1][1] = int(x)
+        else:
+            words.append([int(x), int(x)])
+    return [(s + box[0], e + box[0]) for s, e in words]
+
+
+_DECK_TITLE_PX = (150, 80, 1420, 220)  # deck 標題列（「產品策略 Product Strategy」）在 2560 px 寬的渲染裡的範圍
+
+
+def _deck_svg(job):
+    name, pipe, _ = job
+    if name != "deck":
+        pytest.skip("只看 deck")
+    pages, others = svg.unpack(pipe.store.load("s6/svg", OutputFile), pipe.store)
+    return pipe, pages, others
+
+
+def test_deck_mixed_script_title_same_in_resvg_and_chromium(job, tmp_path):
+    """deck 的標題「產品策略 Product Strategy」（中文與拉丁字分屬兩個 tspan）：驗證用的 resvg（渲染前補 y）
+    與 Chromium（原檔）畫出來每個詞的位置相同。網頁疊圖看到的錯開不是渲染器造成的（見下一個測試）。"""
+    pipe, pages, others = _deck_svg(job)
+    if not _chromium_ready():
+        pytest.skip("這台機器沒有 Node 版的 Playwright 與 Chromium")
+    script = tmp_path / "shot.js"
+    script.write_text(_SHOT_JS, encoding="utf-8")
+    args = []
+    for i, data in pages.items():
+        (tmp_path / f"p{i}.svg").write_bytes(data)
+        args += [str(tmp_path / f"p{i}.svg"), str(tmp_path / f"p{i}.png")]
+    r = subprocess.run(["node", str(script), "1280", "720", *args], cwd=REPO, capture_output=True, text=True, timeout=180)  # 960 × 540 pt = 1280 × 720 CSS px，兩倍取樣
+    if r.returncode != 0:
+        pytest.skip(f"Chromium 無法啟動：{r.stderr[-200:]}")
+    for i, data in pages.items():
+        chrome = Image.open(tmp_path / f"p{i}.png").convert("RGB")
+        mine = resvg_page(data, others, 2560, emulate_bold=False)  # Chromium 也不模擬粗體
+        a, b = _ink_words(mine, _DECK_TITLE_PX, 16), _ink_words(chrome, _DECK_TITLE_PX, 16)
+        assert len(a) == len(b) == 3  # 中文標題、第一個英文詞、第二個英文詞
+        for (s0, e0), (s1, e1) in zip(a, b):
+            assert abs(s0 - s1) <= 3 and abs(e0 - e1) <= 3  # 3 px ≈ 1.1 pt（文泉驛沒有粗體檔，兩邊的反鋸齒略有不同）
+
+
+@pytest.mark.xfail(reason="上游問題（⑤）：原 PDF 的拉丁段用自己的 Td 從 227.96 pt 起畫（空白之後多了 8.54 pt 的中西文間距），"
+                          "③量到了（第二段 quad 的 x），但⑤的 StyledRun 沒有位置欄位，排版把它接在空白後面（219.42 pt），"
+                          "所有輸出器（SVG、ai_pdf 中性渲染）都差 8.5 pt。修好後這個測試會通過，到時拿掉 xfail。", strict=False)
+def test_deck_mixed_script_title_matches_source(job):
+    pipe, pages, others = _deck_svg(job)
+    d = mp.open_document(str(FIXTURES / "deck.pdf"))
+    try:
+        for i, data in pages.items():
+            rd = mp.PageReader(d, i)
+            try:
+                src = rd.render(2560 / 960 * 72).convert("RGB")
+            finally:
+                rd.close()
+            got, want = _ink_words(resvg_page(data, others, 2560), _DECK_TITLE_PX, 16), _ink_words(src, _DECK_TITLE_PX, 16)
+            assert len(got) == len(want) == 3
+            assert abs(got[1][0] - want[1][0]) <= 2560 / 960  # 拉丁段的起點差不到 1 pt
+    finally:
+        d.close()
+
+
 def test_resvg_needs_tspan_y_for_mixed_script_lines(out, store):
     """resvg 0.48 的行為（升版時這個測試若失敗，代表它改了，svg_target.render_copy 補 y 的調整可以重新檢討）：
     同一行裡中文與拉丁字分屬不同字型的 tspan，不補 y 時拉丁字會被換成中文字型的字形；補了 y 才逐片段選字型。"""
