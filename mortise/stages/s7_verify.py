@@ -76,10 +76,19 @@ NAME = "s7"
 VERSION = "5"
 
 # 逐行文字對照的問題說明前面加的渲染來源
-_WHERE = {OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.PPTX: "PowerPoint 經 LibreOffice 渲染"}
+_WHERE = {OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.PPTX: "PowerPoint 經 LibreOffice 渲染",
+          OutputFormat.DOCX_FIXED: "Word（版面固定）經 LibreOffice 渲染", OutputFormat.DOCX_FLOW: "Word（可重排）經 LibreOffice 渲染",
+          OutputFormat.AI_PDF: "給 Illustrator 的 PDF"}
 _NEUTRAL_WHERE = "成品自行渲染"
 # 會把字型內嵌進檔案的格式：驗證時畫不出來的字，使用者那裡也畫不出來（照常判斷）；其他格式只寫字型名稱
 _EMBEDS_FONTS = {OutputFormat.PDF, OutputFormat.AI_PDF}
+# 渲染結果是替身引擎自己重新排字的格式（LibreOffice 代替 Word）：水平位置放寬（PowerPoint 與中性渲染另外指定）
+_RELAYOUT = {OutputFormat.DOCX_FIXED, OutputFormat.DOCX_FLOW}
+# 報告裡各格式的名稱
+_LABEL = {OutputFormat.PPTX: "PowerPoint", OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.DOCX_FIXED: "Word（版面固定）",
+          OutputFormat.DOCX_FLOW: "Word（可重排）", OutputFormat.XLSX: "Excel", OutputFormat.AI_PDF: "給 Illustrator 的 PDF",
+          OutputFormat.IDML: "InDesign（IDML）", OutputFormat.GOOGLE_SLIDES: "Google 簡報", OutputFormat.TEMPLATE: "模板",
+          OutputFormat.SVG_ASSETS: "向量圖 SVG"}
 
 _STATUS = {
     Provenance.EXACT: FieldStatus.EXACT, Provenance.MEASURED: FieldStatus.MEASURED, Provenance.SNAPPED: FieldStatus.MEASURED,
@@ -145,26 +154,30 @@ def run(
     outputs: list[OutputFile], cfg: Config, store: Store, round_no: int = 0,
 ) -> FidelityReport:
     from .. import verify as targets  # 其他格式的目標驗證（mortise/verify/ 下各格式一個模組）
+    from . import s6_export
 
     c = cfg.section("verify")
     notes: list[str] = []
     lines_on = bool(line_check.params(cfg)["line_check"])
     checker = _LineChecker(specs, elements, layout, styled, cfg, store, notes) if lines_on else None
     pptx = next((o for o in outputs if o.format == OutputFormat.PPTX), None)
-    # 中性渲染只在沒有別的渲染可以評分時才用來評分；那時才需要逐行比對它（省下每一頁的比對時間）
-    neutral_scores = not ((pptx is not None and libreoffice.available()) or any(targets.verifier(o.format) for o in outputs))
     pages = [_field_report(spec, el, layout, styled) for spec, el in zip(specs, elements)]
-    neutral_engine = None
-    neutral_lines: dict[int, line_check.PageLines] = {}
+    # 7A 的第一半：先把中性渲染的 PDF 輸出出來。它的缺字紀錄（所有候選字型都沒有的字）告訴其他格式的逐行比對：
+    # 驗證用的這台電腦畫不出哪些字。真正畫出來比對（第二半）放在最後，那時才知道需不需要拿它來評分。
+    neutral_out = None
     if c.get("neutral", True):
         try:
-            pages, neutral_engine, neutral_lines = _neutral_verify(specs, elements, layout, styled, pages, cfg, store, checker if neutral_scores else None, checker)
+            neutral_out = s6_export.run(styled, OutputFormat.AI_PDF, "neutral", cfg, store)
+            if checker is not None:
+                checker.unrenderable = frozenset(chr(int(h, 16)) for d in neutral_out.degradations if d.concept == "缺字"
+                                                 for h in re.findall(r"U\+([0-9A-F]{4,6})", d.action))
         except Exception as e:  # 中性渲染失敗不影響其他驗證
             notes.append(f"7A 中性驗證沒有執行：{type(e).__name__}: {e}")
     target_engine = None
     target_render = None
     proposals: list[Correction] = []
     target_lines: dict[int, line_check.PageLines] = {}
+    unverified: dict[OutputFormat, str] = {}  # 這台機器驗證不了的格式 → 原因
 
     if pptx is not None and libreoffice.available():
         try:
@@ -174,8 +187,10 @@ def run(
             pages, proposals, target_lines = _target_verify(rendered, specs, elements, layout, styled, pages, cfg, store, round_no, checker)
         except libreoffice.RenderError as e:
             notes.append(f"7B 目標驗證沒有執行：{e}")
+            unverified[OutputFormat.PPTX] = f"LibreOffice 沒有把 PowerPoint 檔轉出來（{e}）"
     elif pptx is not None:
         notes.append("7B 目標驗證沒有執行：這台機器沒有安裝 LibreOffice。")
+        unverified[OutputFormat.PPTX] = "這台機器沒有安裝 LibreOffice"
 
     # 其他格式的目標驗證
     format_reports = []
@@ -187,16 +202,22 @@ def run(
         kwargs = {}
         if checker is not None and "on_render" in inspect.signature(fn).parameters:
             # 驗證模組每畫好一頁就交給逐行文字對照（只保留比對結果，不必把每一頁的影像都留在記憶體裡）
-            def on_render(page_index: int, image: Image.Image, _fmt: OutputFormat = o.format) -> None:
-                found = checker.check(page_index, image, _WHERE.get(_fmt, _fmt.value), embeds_fonts=_fmt in _EMBEDS_FONTS)
+            def on_render(page_index: int, image: Image.Image, glyphs=None, _fmt: OutputFormat = o.format) -> None:
+                found = checker.check(page_index, image, _WHERE.get(_fmt, _fmt.value), relayout=_fmt in _RELAYOUT,
+                                      embeds_fonts=_fmt in _EMBEDS_FONTS, glyphs=glyphs)
                 if found is not None:
                     format_lines[(_fmt, page_index)] = found
 
             kwargs["on_render"] = on_render
         try:
             fr = fn(o, specs, elements, layout, styled, cfg, store, **kwargs)
+        except targets.Unverified as e:
+            notes.append(f"{_LABEL.get(o.format, o.format.value)} 的目標驗證沒有執行：{e}")
+            unverified[o.format] = str(e).rstrip("。")
+            continue
         except Exception as e:  # 單一格式的驗證失敗不影響其他驗證
             notes.append(f"{o.format.value} 的目標驗證沒有執行：{type(e).__name__}: {e}")
+            unverified[o.format] = f"驗證時發生錯誤（{type(e).__name__}）"
             continue
         format_reports.append(_with_lines(fr, format_lines))
         # 驗證模組可以另外提供 propose：回傳要送給⑥該格式輸出器的修正單（欄位名稱以「格式.」開頭）。
@@ -208,45 +229,56 @@ def run(
             except Exception as e:
                 notes.append(f"{o.format.value} 的修正單沒有開出來：{type(e).__name__}: {e}")
 
+    # 哪些格式沒有自己的驗證：分數用中性渲染代替（要逐行比對中性渲染，問題也列進各頁）
+    formats = list(dict.fromkeys(o.format for o in outputs))
+    verified = {fr.format for fr in format_reports} | ({OutputFormat.PPTX} if target_engine is not None else set())
+    proxies = [f for f in formats if f not in verified]
+    neutral_scores = not formats or bool(proxies)
+    neutral_engine = None
+    neutral_lines: dict[int, line_check.PageLines] = {}
+    if neutral_out is not None:
+        try:
+            pages, neutral_engine, neutral_lines = _neutral_verify(neutral_out, specs, styled, pages, cfg, store, checker if neutral_scores else None)
+        except Exception as e:  # 中性渲染失敗不影響其他驗證
+            notes.append(f"7A 中性驗證沒有執行：{type(e).__name__}: {e}")
+
     counts: dict[str, int] = {}
     for p in pages:
         for e in p.elements:
             for status in e.fields.values():
                 counts[status.value] = counts.get(status.value, 0) + 1
-    scores = []
-    scored_pages = []
+    if neutral_scores:  # 中性渲染就是（某些格式的）評分依據：它的逐行問題列進各頁
+        pages = [p.model_copy(update={"issues": p.issues + neutral_lines[p.page_index].issues}) if p.page_index in neutral_lines else p for p in pages]
+    neutral_page = {p.page_index: (p.neutral_similarity * _line_factor(neutral_lines.get(p.page_index)) if p.neutral_similarity is not None else None)
+                    for p in pages}
+    per_format: dict[OutputFormat, dict[int, Optional[float]]] = {}
+    for fmt in formats:
+        if fmt == OutputFormat.PPTX and fmt in verified:
+            per_format[fmt] = {p.page_index: _pptx_page_score(p, target_lines.get(p.page_index), c) for p in pages}
+        elif fmt in verified:
+            fr = next(r for r in format_reports if r.format == fmt)
+            per_format[fmt] = {p.page_index: _readback_page_score(fr, p.page_index, format_lines.get((fmt, p.page_index)), neutral_page.get(p.page_index))
+                               for p in pages}
+        else:
+            per_format[fmt] = dict(neutral_page)
+    overall, summary = _combine(per_format, neutral_page, proxies, unverified, float(c.get("format_mean_weight", 0.1)))
+    head = [summary] if summary else []
     for p in pages:
-        if p.target_similarity is None:
-            readback = _readback_score(format_reports, p.page_index, format_lines)
-            if readback is not None:
-                scores.append(readback)
-                for fr in format_reports:
-                    found = format_lines.get((fr.format, p.page_index))
-                    if found is not None:
-                        notes.append(f"第 {p.page_index + 1} 頁（{_WHERE.get(fr.format, fr.format.value)}）{found.summary()}")
-            elif p.neutral_similarity is not None:
-                found = neutral_lines.get(p.page_index)
-                scores.append(p.neutral_similarity * _line_factor(found))
-                if found is not None:  # 中性渲染就是評分的依據：它的逐行問題列進這一頁
-                    p = p.model_copy(update={"issues": p.issues + found.issues})
-                    notes.append(f"第 {p.page_index + 1} 頁（{_NEUTRAL_WHERE}）{found.summary()}")
-            scored_pages.append(p)
-            continue
-        boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
-        good = [e for e in boxes if e.text_match and e.linebreak_match and (e.position_error_pt or 0.0) <= c["position_tolerance_pt"]]
-        text_score = len(good) / len(boxes) if boxes else 1.0
-        found = target_lines.get(p.page_index)
-        scores.append((0.5 * p.target_similarity + 0.5 * text_score) * _line_factor(found))
-        if found is not None:
-            notes.append(f"第 {p.page_index + 1} 頁（{_WHERE[OutputFormat.PPTX]}）{found.summary()}")
-        scored_pages.append(p)
-    pages = scored_pages
+        if p.page_index in target_lines:
+            head.append(f"第 {p.page_index + 1} 頁（{_WHERE[OutputFormat.PPTX]}）{target_lines[p.page_index].summary()}")
+        if neutral_scores and p.page_index in neutral_lines:
+            head.append(f"第 {p.page_index + 1} 頁（{_NEUTRAL_WHERE}）{neutral_lines[p.page_index].summary()}")
+        for fr in format_reports:
+            found = format_lines.get((fr.format, p.page_index))
+            if found is not None:
+                head.append(f"第 {p.page_index + 1} 頁（{_WHERE.get(fr.format, fr.format.value)}）{found.summary()}")
+    notes = head + notes
     for o in outputs:
         for d in o.degradations:
             notes.append(f"{o.format.value}：{d.concept} → {d.action}")
     notes.extend(styled.notes)
     return FidelityReport(
-        neutral_engine=neutral_engine, target_engine=target_engine, pages=pages, overall_score=(sum(scores) / len(scores)) if scores else None,
+        neutral_engine=neutral_engine, target_engine=target_engine, pages=pages, overall_score=overall,
         field_counts=counts, corrections_proposed=proposals, round=round_no, notes=notes, target_render=target_render,
         format_reports=format_reports,
     )
@@ -257,19 +289,68 @@ def _line_factor(found) -> float:
     return found.score if found is not None and found.score is not None else 1.0
 
 
+def _pptx_page_score(p: PageReport, found, c) -> float:
+    """PowerPoint（LibreOffice 渲染）這一頁的分數：(0.5 × 相似度 ＋ 0.5 × 文字框一致率) × 逐行分數。渲染結果少了這一頁是 0。"""
+    if p.target_similarity is None:
+        return 0.0
+    boxes = [e for e in p.elements if e.kind in ("text_box", "table")]
+    good = [e for e in boxes if e.text_match and e.linebreak_match and (e.position_error_pt or 0.0) <= c["position_tolerance_pt"]]
+    text_score = len(good) / len(boxes) if boxes else 1.0
+    return (0.5 * p.target_similarity + 0.5 * text_score) * _line_factor(found)
+
+
+def _readback_page_score(fr, page_index: int, found, fallback: Optional[float]) -> Optional[float]:
+    """某個格式（回讀驗證）這一頁的分數：(0.5 × 相似度 ＋ 0.5 × 文字一致率，缺一個就只用另一個) × 逐行分數。
+    輸出檔裡沒有這一頁（有 error 等級的問題、兩個數字都沒有）是 0；兩個數字都量不到（例如渲染器載入失敗）時用 fallback（中性渲染）。"""
+    fp = next((x for x in fr.pages if x.page_index == page_index), None)
+    if fp is None:
+        return 0.0
+    parts = [v for v in (fp.similarity, fp.text_match_ratio) if v is not None]
+    if parts:
+        return sum(parts) / len(parts) * _line_factor(found)
+    if any(i.severity == Severity.ERROR for i in fp.issues):
+        return 0.0
+    return fallback
+
+
 def _readback_score(format_reports, page_index: int, format_lines=None):
-    """沒有 PowerPoint 目標驗證時，這一頁的分數取自各格式的回讀驗證：
-    每個格式（0.5 × 相似度 ＋ 0.5 × 文字一致率，缺一個就只用另一個）× 這個格式的逐行分數，再對各格式取平均。
-    沒有任何格式驗到這一頁就回傳 None。"""
-    per_format = []
-    for fr in format_reports:
-        for fp in fr.pages:
-            if fp.page_index != page_index:
-                continue
-            parts = [v for v in (fp.similarity, fp.text_match_ratio) if v is not None]
-            if parts:
-                per_format.append(sum(parts) / len(parts) * _line_factor((format_lines or {}).get((fr.format, page_index))))
+    """（舊介面，保留給測試與外部工具）各格式回讀驗證這一頁的分數的平均；沒有任何格式驗到這一頁就回傳 None。"""
+    per_format = [s for fr in format_reports
+                  if (s := _readback_page_score(fr, page_index, (format_lines or {}).get((fr.format, page_index)), None)) is not None
+                  and any(fp.page_index == page_index for fp in fr.pages)]
     return (sum(per_format) / len(per_format)) if per_format else None
+
+
+def _combine(per_format: dict, neutral_page: dict, proxies: list, unverified: dict, mean_weight: float) -> tuple[Optional[float], str]:
+    """各格式的分數（各頁平均）→ 整體分數與一句說明。見模組開頭「多個輸出格式」。"""
+    doc_scores: dict = {}
+    for fmt, by_page in per_format.items():
+        vals = [v for v in by_page.values() if v is not None]
+        if vals:
+            doc_scores[fmt] = sum(vals) / len(vals)
+    if not per_format:  # 沒有輸出檔：只看成品文件本身（中性渲染）
+        vals = [v for v in neutral_page.values() if v is not None]
+        return ((sum(vals) / len(vals)) if vals else None), ""
+    parts = []
+    for fmt in per_format:
+        label = _LABEL.get(fmt, fmt.value)
+        if fmt not in doc_scores:
+            parts.append(f"{label} 沒有分數（{unverified.get(fmt, '沒有可用的驗證')}，中性渲染也沒有結果）")
+        elif fmt in proxies:
+            why = unverified.get(fmt, "這個格式還沒有自己的驗證")
+            parts.append(f"{label} {doc_scores[fmt]:.3f}（代用值：{why}，{label}檔本身沒有驗證；分數來自成品文件的中性渲染）")
+        else:
+            parts.append(f"{label} {doc_scores[fmt]:.3f}")
+    if not doc_scores:
+        return None, "各格式的分數：" + "；".join(parts) + "。"
+    worst, mean = min(doc_scores.values()), sum(doc_scores.values()) / len(doc_scores)
+    overall = worst + mean_weight * (mean - worst)
+    text = "各格式的分數：" + "；".join(parts) + "。"
+    if len(doc_scores) > 1:
+        bad = min(doc_scores, key=doc_scores.get)
+        text += (f"整體分數以最差的格式為準：最差（{_LABEL.get(bad, bad.value)} {worst:.3f}）＋ {mean_weight:g} ×（平均 {mean:.3f} − 最差），"
+                 f"一個格式壞掉不會被其他格式的高分蓋過。")
+    return overall, text
 
 
 # ---------- s7.lines（逐行文字對照）----------
@@ -289,16 +370,17 @@ class _LineChecker:
 
     unrenderable: frozenset[str] = frozenset()  # 驗證用的這台電腦沒有字型畫得出來的字（由中性渲染的缺字紀錄得知）
 
-    def check(self, page_index: int, rendered: Image.Image, where: str, relayout: bool = False, embeds_fonts: bool = False):
-        """relayout：渲染結果是替身引擎自己重新排字的（LibreOffice 代替 PowerPoint、中性渲染代替 Word）。
-        embeds_fonts：輸出檔內嵌字型（可編輯 PDF）；沒有內嵌時，驗證用的電腦畫不出來的字所在的行不判斷。"""
+    def check(self, page_index: int, rendered: Image.Image, where: str, relayout: bool = False, embeds_fonts: bool = False, glyphs=None):
+        """relayout：渲染結果是替身引擎自己重新排字的（LibreOffice 代替 PowerPoint 或 Word、中性渲染）。
+        embeds_fonts：輸出檔內嵌字型（可編輯 PDF）；沒有內嵌時，驗證用的電腦畫不出來的字所在的行不判斷。
+        glyphs：從輸出檔讀回來的每個字的位置（輸出頁面 pt，lines.Glyph）；讀不到文字層時是 None，只靠影像判斷。"""
         spec, el, sp = self.specs.get(page_index), self.elements.get(page_index), self.styled.get(page_index)
         if spec is None or el is None or sp is None:
             return None
         try:
             working = Image.open(self.store.blob_path(spec.working_image))
             return line_check.check_page(working, rendered, el, self.layout.get(page_index), sp, source_frame(sp), self.p, where,
-                                         relayout=relayout, unrenderable=frozenset() if embeds_fonts else self.unrenderable)
+                                         relayout=relayout, unrenderable=frozenset() if embeds_fonts else self.unrenderable, glyphs=glyphs)
         except Exception as e:  # 逐行比對失敗：這一頁只看畫面分數
             self.notes.append(f"第 {page_index + 1} 頁（{where}）的逐行文字對照沒有執行：{type(e).__name__}: {e}")
             return None
@@ -317,6 +399,13 @@ def _with_lines(fr, format_lines):
         pages.append(fp.model_copy(update={"issues": fp.issues + found.issues}))
     notes = list(fr.notes) + [f"第 {pg + 1} 頁{found.summary()}" for (fmt, pg), found in sorted(format_lines.items(), key=lambda kv: kv[0][1]) if fmt == fr.format]
     return fr.model_copy(update={"pages": pages, "notes": notes, "ok": fr.ok and not bad})
+
+
+def _read_back(reader, page_index: int, cfg: Config):
+    """從一頁 PDF 讀回看得見的文字行（③的擷取函式）。回傳（文字行、頁寬 pt）。"""
+    from ..verify import rendered
+
+    return rendered.read_page(reader, page_index, cfg)
 
 
 # ---------- s7.fields ----------
@@ -392,22 +481,15 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
 # ---------- s7.neutral（7A）----------
 
 
-def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: Store, checker=None, line_checker=None):
+def _neutral_verify(out: OutputFile, specs, styled, pages, cfg: Config, store: Store, checker=None):
     """7A 中性驗證：用自家確定性的渲染（給 Illustrator 的 PDF 輸出器，ReportLab 加開放字型）把成品文件畫出來，
     與工作影像比對。它不依賴任何辦公軟體，所以檢查的是③④⑤的結果本身：位置、字級、字型寬度、斷行。
-    不能檢查目標軟體的重新斷行（那是 7B 的工作）。
-    有 checker 時也做逐行文字對照，結果另外回傳（run 只在沒有其他渲染可以評分時才傳 checker，並把它的問題列進報告）。
-    line_checker（與 checker 是同一個物件、但一律傳入）用來記下中性渲染的缺字，供其他格式的逐行比對參考。"""
-    from . import s6_export
-    from ..artifacts import OutputFormat
-
+    不能檢查目標軟體的重新斷行（那是 7B 的工作）。out 是 run 先輸出好的中性渲染 PDF。
+    有 checker 時也做逐行文字對照，結果另外回傳（run 只在有格式要拿它當代用值時才傳 checker，並把它的問題列進報告）。"""
     c = cfg.section("verify")
-    out = s6_export.run(styled, OutputFormat.AI_PDF, "neutral", cfg, store)
     engine = "Mortise 中性渲染（ReportLab，開放授權字型）"
     new_pages = []
     found_lines: dict[int, line_check.PageLines] = {}
-    if line_checker is not None:  # 中性渲染記下的缺字（所有候選字型都沒有的字）：驗證用的這台電腦畫不出來
-        line_checker.unrenderable = frozenset(chr(int(h, 16)) for d in out.degradations if d.concept == "缺字" for h in re.findall(r"U\+([0-9A-F]{4,6})", d.action))
     pdoc = pdf.open_document(str(store.blob_path(out.file)))
     try:
         for spec, report in zip(specs, pages):
@@ -418,13 +500,14 @@ def _neutral_verify(specs, elements, layout, styled, pages, cfg: Config, store: 
             reader = pdf.PageReader(pdoc, spec.page_index)
             try:
                 image = reader.render(verify_dpi(c["render_dpi"], sp, spec))
+                glyphs = line_check.glyphs_from_lines(*_read_back(reader, spec.page_index, cfg)) if checker is not None else None
             finally:
                 reader.close()
             working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
             region = content_region(image, sp)
             sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
             if checker is not None:
-                found = checker.check(spec.page_index, region, _NEUTRAL_WHERE, relayout=True)
+                found = checker.check(spec.page_index, region, _NEUTRAL_WHERE, relayout=True, glyphs=glyphs)
                 if found is not None:
                     found_lines[spec.page_index] = found
             issues = list(report.issues)
@@ -466,7 +549,8 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                 working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
                 region = content_region(image, sp)
                 sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊
-                found = checker.check(spec.page_index, region, _WHERE[OutputFormat.PPTX], relayout=True) if checker is not None else None
+                found = (checker.check(spec.page_index, region, _WHERE[OutputFormat.PPTX], relayout=True, glyphs=line_check.glyphs_from_lines(r_lines, dw))
+                         if checker is not None else None)
                 if found is not None:
                     found_lines[spec.page_index] = found
                 w = sp.width_pt

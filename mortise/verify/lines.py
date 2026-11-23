@@ -156,6 +156,44 @@ class PageLines:
         return text
 
 
+# ================================================================ 讀回的文字層
+
+
+@dataclass
+class Glyph:
+    """從輸出檔讀回來的一個字（輸出頁面 pt，原點左上、y 向下）：x 是字的起點、y 是基線，size 是字級。"""
+
+    ch: str
+    x: float
+    y: float
+    size: float
+
+
+def glyphs_from_lines(lines: list[TextLine], width_pt: float) -> list[Glyph]:
+    """讀回來的文字行（頁寬為 1 的相對座標，③的擷取函式的結果）→ 每個字在輸出頁面上的位置。
+    字的位置沿基線量（runs 的 char_x）；量不到時把整行的字平均分配在行的範圍裡。旋轉的行照它的方向排。"""
+    out: list[Glyph] = []
+    for line in lines:
+        b0, b1 = line.baseline
+        dx, dy = b1.x - b0.x, b1.y - b0.y
+        length = math.hypot(dx, dy)
+        ux, uy = (dx / length, dy / length) if length > 1e-9 else (1.0, 0.0)
+        starts = [cx for r in line.runs for cx in r.char_x]
+        base = min(starts) if starts else 0.0
+        vis_all = [(ch, r) for r in line.runs for ch in r.text if ch.strip()]
+        even = not starts or len(starts) != len(vis_all)
+        k = 0
+        for r in line.runs:
+            size = float(r.font_size.value) * width_pt
+            vis = [ch for ch in r.text if ch.strip()]
+            xs = list(r.char_x)
+            for j, ch in enumerate(vis):
+                s = (k / max(1, len(vis_all))) * length if even else ((xs[j] if j < len(xs) else base) - base)
+                out.append(Glyph(ch=ch, x=(b0.x + ux * s) * width_pt, y=(b0.y + uy * s) * width_pt, size=size))
+                k += 1
+    return out
+
+
 # ================================================================ 影像
 
 
@@ -271,7 +309,7 @@ def _chunks(line: TextLine, W: float, x0: float, x1: float, min_w: float) -> lis
 
 def check_page(working: Image.Image, rendered: Image.Image, el: ElementList, layout: Optional[PageLayout], page: Optional[StyledPage],
                frame: tuple[float, float, float], p: Optional[dict] = None, where: str = "", relayout: bool = False,
-               unrenderable: frozenset[str] = frozenset()) -> PageLines:
+               unrenderable: frozenset[str] = frozenset(), glyphs: Optional[list[Glyph]] = None) -> PageLines:
     """逐行比對一頁。
 
     working：工作影像（③的座標所在的影像）。rendered：成品的渲染結果，已裁成與工作影像同一個範圍

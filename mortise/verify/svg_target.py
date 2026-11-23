@@ -46,6 +46,7 @@ from ..exporters import ai_pdf
 from ..exporters import svg as svgx
 from ..pipeline.store import Store
 from ..stages.s7_verify import content_region, similarity, source_frame, verify_dpi
+from . import lines as line_check
 
 DEFAULTS: dict[str, Any] = {
     "svg_similarity_pass": 0.95,  # 相似度低於此值就在 issues 提醒
@@ -362,6 +363,37 @@ def _read_anchor(rl: svgx.ReadLine, align: Align, book: FontBook) -> Optional[tu
     return rl.x + math.cos(th) * width * k, rl.y + math.sin(th) * width * k
 
 
+def _glyphs(read: dict[tuple, list[svgx.ReadLine]], book: FontBook) -> list[line_check.Glyph]:
+    """讀回來的每一行 → 每個字的位置（輸出頁面 pt），給⑦的逐行文字對照比對「原位置上寫的是什麼字」。
+    讀回的 x 是行的起點（輸出器一律從行首寫起）；每個字的位置是逐字前進寬度（用渲染時會用到的字型量）加上字距、詞距。
+    文字轉外框、旋轉的行、量不出字寬的行不列（那幾行只靠影像判斷）。"""
+    out: list[line_check.Glyph] = []
+    for rls in read.values():
+        for rl in rls:
+            if rl.outlined or abs(rl.rotation) > 0.5 or not rl.spans:
+                continue
+            chars: list[tuple[str, float, float]] = []  # （字、前進寬度 pt、字級 pt）
+            ok = True
+            for sp in rl.spans:
+                size = float(sp.get("size") or 0.0)
+                info, _, _ = book.resolve(sp.get("families") or [], int(sp.get("weight", 400)), bool(sp.get("italic")))
+                face = book.face(info) if info is not None else None
+                if face is None or size <= 0:
+                    ok = False
+                    break
+                for ch in sp["text"]:
+                    adv = face.shaped_width(ch) * size + rl.letter_spacing + (rl.word_spacing if ch == " " else 0.0)
+                    chars.append((ch, adv, size))
+            if not ok or not chars:
+                continue
+            x = rl.x
+            for ch, adv, size in chars:
+                if ch.strip():
+                    out.append(line_check.Glyph(ch=ch, x=x, y=rl.y, size=size))
+                x += adv
+    return out
+
+
 def _font_issues(lines: list[svgx.ReadLine], book: FontBook) -> list[Issue]:
     """核對 SVG 用到的「家族名稱加字重加斜體」在伺服器上對到什麼。"""
     issues: list[Issue] = []
@@ -538,7 +570,7 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
                     region = content_region(image, page)
                     sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊（留白不算）
                     if on_render is not None:
-                        on_render(i, region)
+                        on_render(i, region, glyphs=_glyphs(read, book))
                     if sim < p["svg_similarity_pass"]:
                         issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"SVG 渲染後與原圖的相似度 {sim:.3f}，低於合格線 {p['svg_similarity_pass']}。"))
             except Exception as e:  # 渲染失敗：這一頁退回只做結構檢查

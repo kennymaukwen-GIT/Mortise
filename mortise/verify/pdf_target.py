@@ -67,6 +67,7 @@ from ..exporters import ai_pdf, pdf_editable
 from ..pipeline.store import Store
 from ..stages import s2_page, s3_recognize
 from ..tools import pdfium as pdf
+from . import lines as line_check
 
 ENGINE = "PDFium 回讀（自家工具，不是 Acrobat；只能證明檔案裡寫了什麼，編輯軟體裡的行為沒有實測）"
 
@@ -649,7 +650,7 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
                 region = content_region(image, sp)
                 sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊（留白不算）
                 if on_render is not None:
-                    on_render(i, region)
+                    on_render(i, region, glyphs=line_check.glyphs_from_lines(got, width))
                 if sim < p["pdf_similarity_pass"]:
                     issues.append(Issue(severity=Severity.WARNING, code="low_similarity", message=f"輸出檔重新畫出來與原圖的相似度 {sim:.3f}，低於合格線 {p['pdf_similarity_pass']}。"))
             # 2. 文字

@@ -235,6 +235,7 @@ DEFAULT_PARAMS: dict = {
     "overlay_full_bleed_coverage": 0.3,  # 而且「底色」只佔全部格子的這個比例以下（大片的是真的底色，例如有花邊框的頁面）
     "overlay_clean_grain": 1.0,  # 「完全沒有顆粒」的上限（色階；另與 2 倍頁面雜訊取大者）：照片紋理連到形狀時，靠它把形狀挖出來
     "overlay_tip_chamfer": 0.2,  # 疊在照片上的多邊形：比相鄰長邊短到此比例以下的邊，當成被 JPEG 削掉的尖角試著補回（倍）
+    "overlay_tip_max_px": 24.0,  # 上一項的短邊最長幾個像素（JPEG 削掉的尖角大約一到三個 8×8 區塊；32 會補出離譜的頂點）
     "overlay_tip_color_frac": 0.6,  # 補回的尖角裡，顏色比較接近形狀（而不是周圍照片）的像素至少要這個比例
     "overlay_fill_block_px": 24,  # 補照片時複製顆粒的方塊邊長（像素）
     "overlay_fill_pad_px": 64,  # 補照片時，要補的範圍外擴這麼多像素（另與下一項取大者）當成依據，不必整張照片交給背景補全
@@ -905,7 +906,7 @@ def _cov_std(res) -> np.ndarray:
 
 
 def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line: bool = True, line_thick: float = 3.0, allowed: Optional[np.ndarray] = None,
-              tips=None) -> Optional[_Fit]:
+              tips=None, origin: Optional[tuple[float, float]] = None) -> Optional[_Fit]:
     """對局部遮罩的外輪廓做由簡到繁的幾何擬合（座標為局部像素，像素中心框架）。
 
     tips：疊在照片上的形狀才給（一個函式：多邊形頂點 → 補回的尖角裡「像形狀顏色」的像素比例）。JPEG 會把銳角整塊
@@ -1039,11 +1040,11 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
             a2 = cv2.approxPolyDP(cnt, base_eps * k_eps, True)[:, 0, :].astype(np.float64) + 0.5
             if not 3 <= len(a2) <= 2 * int(P["max_polygon_vertices"]):
                 continue
-            r = _refine_polygon(pts_all, ok, a2, tol, chamfer=float(P["overlay_tip_chamfer"]))
+            r = _refine_polygon(pts_all, ok, a2, tol, chamfer=float(P["overlay_tip_chamfer"]), chamfer_max_px=float(P["overlay_tip_max_px"]), grid=origin)
             if r is None:
                 continue
             verts, tip_list = r
-            if not tip_list or len(verts) > int(P["max_polygon_vertices"]):
+            if len(verts) > int(P["max_polygon_vertices"]):
                 continue
             keep = np.ones(len(pts), bool)
             for v, cut in tip_list:  # 尖角附近的輪廓點被壓縮破壞，不算誤差
@@ -1055,7 +1056,7 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
             f.iou = _iou(_offset_poly(verts, 0.5))
             if not _ok(f) or tips(verts) < float(P["overlay_tip_color_frac"]):
                 continue
-            f.std = {"tips_recovered": float(len(tip_list))}
+            f.std = {"tips_recovered": float(len(tip_list))} if tip_list else {}
             if best_f is None or (len(verts), f.err_mean) < (len(best_f.poly), best_f.err_mean):
                 best_f = f
         return best_f
@@ -1105,33 +1106,51 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
     return choice
 
 
+def _on_block_edge(a: np.ndarray, b: np.ndarray, grid: tuple[float, float], block: int = 8) -> np.ndarray:
+    """邊（a[i] → b[i]，輪廓座標＝像素中心）是不是水平或垂直、而且貼著 JPEG 的 8×8 區塊邊界（整張影像座標）。"""
+    ga = a + np.asarray(grid, np.float64)
+    gb = b + np.asarray(grid, np.float64)
+
+    def _on(v):  # 像素中心離區塊邊界半個像素
+        r = np.minimum(np.mod(v + 0.5, block), np.mod(v - 0.5, block))
+        return np.minimum(r, block - np.maximum(np.mod(v + 0.5, block), np.mod(v - 0.5, block))) <= 0.75
+
+    vert = np.abs(ga[:, 0] - gb[:, 0]) <= 1.0
+    horz = np.abs(ga[:, 1] - gb[:, 1]) <= 1.0
+    return (vert & _on((ga[:, 0] + gb[:, 0]) / 2)) | (horz & _on((ga[:, 1] + gb[:, 1]) / 2))
+
+
 def _tip_color_check(I: np.ndarray, mask: np.ndarray, bad: np.ndarray, F: np.ndarray):
     """給 _fit_mask 的 tips：多邊形（局部座標）比遮罩多出來的部分（補回的尖角）裡，顏色比較接近形狀色 F、
-    而不是形狀外圍照片中位色的像素比例。真的被壓縮削掉的尖角裡仍是形狀的顏色（加上振鈴）；本來就是斜角的形狀，
-    多出來的地方是照片，比例很低。"""
+    而不是「緊鄰外側的照片」（多邊形外 2 到 5 像素、離它最近的那個照片像素）的像素比例。真的被壓縮削掉的尖角裡
+    仍偏向形狀的顏色（加上振鈴與色度模糊）；本來就是斜角的形狀，多出來的地方是照片，比例很低。"""
     h, w = mask.shape
-    ring = _dilate(mask, 6) & ~_dilate(mask, 3) & ~bad
-    O = np.median(I[ring], axis=0) if ring.sum() >= 8 else None
+    near_mask = _dilate(mask, 1)
 
     def _frac(verts: np.ndarray) -> float:
-        if O is None:
-            return 0.0
         R = _raster_poly(verts, 0, 0, w, h, 2) > 0.5
-        add = R & ~_dilate(mask, 1)
+        add = R & ~near_mask
         if add.sum() < 4:
             return 1.0
+        ring = _dilate(R, 5) & ~_dilate(R, 2) & ~bad & ~near_mask
+        if ring.sum() < 8:
+            return 0.0
+        O = _nearest_fill_local(I, ring)
         px = I[add]
-        return float((np.linalg.norm(px - F, axis=1) < np.linalg.norm(px - O, axis=1)).mean())
+        return float((np.linalg.norm(px - F, axis=1) < np.linalg.norm(px - O[add], axis=1)).mean())
 
     return _frac
 
 
-def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float, chamfer: float = 0.0):
+def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float, chamfer: float = 0.0, chamfer_max_px: float = 24.0,
+                    grid: Optional[tuple[float, float]] = None):
     """Douglas–Peucker 的頂點只落在輪廓點上：反鋸齒會把銳角削鈍，在尖端留下兩三個靠得很近的頂點。
     這裡每條邊各自以直線擬合（去掉靠近兩端的點，只用沒被遮住的點），頂點改取相鄰兩條直線的交點；
     太短的邊（小於 max(4, 3 × 容許偏差)）拿掉，讓兩旁的邊直接相交。交點離原頂點太遠（幾乎平行）就保留原頂點。
-    chamfer > 0（疊在照片上的形狀才用）：比相鄰的長邊短得多（不到 chamfer 倍）的邊，當成被壓縮削掉的尖角，也拿掉，
-    兩旁的邊相交處容許離原頂點遠一點（削掉的長度的 3 倍）。這時回傳（頂點、補回的尖角 [(頂點, 削掉的長度)]），
+    chamfer > 0（疊在照片上的形狀才用）：比相鄰的長邊短得多（不到 chamfer 倍）、而且不超過 chamfer_max_px（JPEG 削掉的
+    尖角大約一兩個 8×8 區塊）的邊，當成被壓縮削掉的尖角，也拿掉，兩旁的邊相交處容許離原頂點遠一點（削掉的長度的 3 倍，
+    最多 3 × chamfer_max_px）。grid（局部座標到整張影像的位移）：沿著 8×8 區塊邊界的水平或垂直短邊是 JPEG 削掉尖角的
+    典型痕跡，這種邊容許到 2 × chamfer_max_px。這時回傳（頂點、補回的尖角 [(頂點, 削掉的長度)]），
     尖角是否真的屬於形狀由呼叫端看顏色決定。
     回傳精修後的頂點（與輪廓同一個座標框架）；做不到時回傳 None。"""
     n0 = len(V)
@@ -1196,7 +1215,10 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
         k = int(np.argmin(L))
         if chamfer > 0 and L[k] >= min_len:
             nb = np.maximum(np.roll(L, 1), np.roll(L, -1))  # 尖角常被削成兩三段短邊：拿較長的鄰邊比
-            rel = L / np.maximum(nb, _EPS)
+            cap = np.full(len(L), chamfer_max_px)
+            if grid is not None:
+                cap[_on_block_edge(verts, nxt, grid)] = 2.0 * chamfer_max_px
+            rel = np.where(L <= cap, L / np.maximum(nb, _EPS), np.inf)
             k = int(np.argmin(rel))
             if rel[k] >= chamfer:
                 break
@@ -1204,7 +1226,7 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
             break
         if chamfer > 0:  # 被削掉的尖角：相交處容許離原頂點遠一點
             nxt_start = edges[(k + 1) % len(edges)][0]
-            slack[nxt_start] = slack.get(nxt_start, 0.0) + slack.get(edges[k][0], 0.0) + 3.0 * float(L[k])
+            slack[nxt_start] = min(slack.get(nxt_start, 0.0) + slack.get(edges[k][0], 0.0) + 3.0 * float(L[k]), 6.0 * chamfer_max_px)
         del edges[k]  # 拿掉太短的邊：前後兩條邊直接相交
     if chamfer > 0:
         starts = [a for a, _ in edges]
@@ -2450,7 +2472,7 @@ def _find_regions_impl(image, text_mask, P, text_quads):
         tips = None
         if c.feats.get("overlay") == 1.0:
             tips = _tip_color_check(filled[Y0:Y1, X0:X1], fill_mask, bad, np.asarray(c.color, np.float32))
-        fit = _fit_mask(fill_mask, bad, P, tol, allow_line=(c.role == "line"), line_thick=line_thick, allowed=occluders, tips=tips)
+        fit = _fit_mask(fill_mask, bad, P, tol, allow_line=(c.role == "line"), line_thick=line_thick, allowed=occluders, tips=tips, origin=(float(X0), float(Y0)))
         vis_full = _paste((H, W), box, vis_loc)
         if fit is None or not fit.accepted:
             if c.role == "line" and fit is not None:

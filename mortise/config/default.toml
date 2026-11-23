@@ -125,6 +125,15 @@ region_overlay_min_texture = 1.5     # 照片本身的顆粒至少要這麼大�
 region_overlay_max_gradient = 10.0   # 色塊內部的顏色變化上限（色階）；有明暗的（天空、牆面）不拆
 region_overlay_edge_sharpness = 0.25 # 邊緣銳利度（邊緣上最大梯度 ÷ 兩側色差）下限；模糊的色塊不拆（初始值）
 region_overlay_edge_continuity = 0.85  # 沒被遮住的邊界中，銳利而且有對比的比例下限（初始值）
+vector_photo_check_side = 560        # 早期判斷的第二個尺度：縮到最長邊這麼多像素再取樣（大張照片在原尺寸太平滑，擋不住；0 表示不看）
+vector_photo_check_texture_de_small = 3.5  # 第二個尺度的殘差門檻（ΔE；量到：插畫最多 3.35、風景照 ≥ 4.38；初始值）
+vector_refine_max_blob_fraction = 0.04  # 成塊誤差超過此比例就不再放細重描（補不回來；評測需要重描的第一輪最多 0.014）
+vector_max_seconds = 30.0            # 描圖的時間上限（秒）＝此值＋下一項 × 百萬像素，超過就回報不適合（安全網，機器忙時結果可能不同；0 表示不限）
+vector_max_seconds_per_mpx = 10.0
+region_overlay_noise_ratio_textured = 0.08  # 照片找不到本身平坦的地方（整張是紋理）時，改用這個更嚴的顆粒比（壓縮把均勻處的顆粒壓得比紋理處少；初始值）
+region_overlay_translucent_ratio = 0.05  # 頁面底色完全乾淨時，色塊內部的顆粒比超過此值就當成半透明，不拆（初始值）
+region_overlay_full_bleed = true     # 滿版照片（沒有頁面底色）也找疊在上面的平塗圖形；找不到就照原本的讀法
+region_overlay_fill_quality_warn = 0.5  # 補出來的地方的中尺度紋理不到周圍的此比例時，在 notes 提醒移動圖形會看得出是補的
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）

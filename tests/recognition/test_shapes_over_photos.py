@@ -5,7 +5,10 @@
 (b) 合成：有顆粒的漸層、多尺度紋理上疊平塗的圓、矩形、圓角矩形、三角形（4 倍超取樣畫，等於反鋸齒）；
     不是基本幾何的心形要描成向量圖（regions 與影像產線①→③兩層都測）。
 (c) 合成的「真照片」：多尺度紋理、乾淨但柔邊的色塊、平滑的天空與湖（整張有同樣的感光顆粒）——不可拆出形狀。
-(d) 早期放棄：大張雜訊圖、海報的照片，描圖要在 1 秒內放棄（測試門檻放寬到 2 秒）；插畫（含放大三倍的雜訊圖）不可被擋。
+(d) 早期放棄：大張雜訊圖、海報的照片、大張 JPEG 照片（1800 寬以上），描圖要在 1 秒內放棄（測試門檻放寬到 2 秒）；
+    插畫（含放大三、四倍的雜訊圖）不可被擋。
+審查後補的案例：滿版照片（沒有頁面底色）、細條、JPEG 壓縮過的形狀（含三角形的尖角）；照片裡截平成純黑／純白的區塊、
+磚牆上的油漆招牌（JPEG）、透明度 0.95 的色塊都不可拆；照片 notes 合併成一句；補圖品質（fill_quality）。
 """
 
 from __future__ import annotations
@@ -415,14 +418,227 @@ def test_precheck_lets_illustrations_through():
 
     P = _params(None)
     samples = make_samples(SEED)
-    worst = 0.0
+    worst = worst_small = 0.0
     for si in range(0, len(samples), 4):  # 每類別都取到（樣本依類別排列，每類 8 個）
         s = samples[si]
         for v in ("clean", "jpeg", "noise"):
             img, _, _ = perturb(s, v, np.random.default_rng([SEED, si, VARIANTS.index(v)]))
-            for k in (1, 3):
-                im = img if k == 1 else cv2.resize(img, (img.shape[1] * 3, img.shape[0] * 3), interpolation=cv2.INTER_CUBIC)
+            for k in (1, 3, 4):  # 放大後大於 560 px，也會走縮小的第二個尺度
+                im = img if k == 1 else cv2.resize(img, (img.shape[1] * k, img.shape[0] * k), interpolation=cv2.INTER_CUBIC)
                 why, st = photo_precheck(im, None, P)
                 assert why is None, f"{s.name}/{v}/×{k}：{why}"
                 worst = max(worst, st.get("photo_check_texture_de", 0.0))
-    print(f"\n插畫的平坦方塊殘差中位數最大 ΔE {worst:.2f}（門檻 {P['photo_check_texture_de']}）")
+                worst_small = max(worst_small, st.get("photo_check_small_texture_de", 0.0))
+    print(f"\n插畫的平坦方塊殘差中位數最大 ΔE {worst:.2f}（門檻 {P['photo_check_texture_de']}）；"
+          f"縮小後最大 ΔE {worst_small:.2f}（門檻 {P['photo_check_texture_de_small']}）")
+
+
+# =====================================================================================
+# 審查後補的案例
+# =====================================================================================
+
+
+def _jpeg(img: np.ndarray, q: int) -> np.ndarray:
+    import io
+
+    b = io.BytesIO()
+    Image.fromarray(img).save(b, "JPEG", quality=q)
+    return np.asarray(Image.open(io.BytesIO(b.getvalue())).convert("RGB")).copy()
+
+
+def _shape_error(geom: str, prm, r) -> float:
+    q = np.asarray(r.shape.quad, float)
+    if geom == "ellipse":
+        cx, cy, rad = prm
+        a, b = np.linalg.norm(q[1] - q[0]) / 2, np.linalg.norm(q[3] - q[0]) / 2
+        return float(max(np.abs(q.mean(axis=0) - (cx, cy)).max(), abs(a - rad), abs(b - rad)))
+    if geom in ("rect", "rounded_rect"):
+        return float(np.abs(np.r_[q.min(axis=0), q.max(axis=0)] - prm[:4]).max())
+    poly = np.asarray(r.shape.polygon, float)
+    return float(max(np.linalg.norm(poly - p, axis=1).min() for p in prm)) if len(poly) == len(prm) else 99.0
+
+
+@pytest.mark.parametrize("kind,n", [("grain", 1), ("grain", 3), ("texture", 1), ("texture", 3)])
+def test_full_bleed_photo_shapes_are_split(kind, n):
+    """滿版照片（整張都是照片，沒有頁面底色）：原本唯一、最大的那個形狀會被當成「頁面底色」而拆不出來。"""
+    cv = Canvas()
+    cv.photo((0, 0, 900, 620), kind, seed=7)
+    if n == 1:
+        cv.rect(200, 380, 700, 520, (40, 60, 90))
+    else:
+        cv.circle(230, 200, 90, (235, 200, 70))
+        cv.rect(430, 110, 650, 260, (40, 60, 90))
+        cv.rrect(140, 360, 390, 500, 30, (220, 60, 80))
+    img = cv.render()
+    regs = find_regions(img, np.zeros(img.shape[:2], bool))
+    photo = [r for r in regs if r.kind == "photo"]
+    assert len(photo) == 1 and photo[0].bbox == (0, 0, 900, 620)
+    over = {r.shape.geometry: r for r in regs if r.kind == "shape" and r.features.get("overlay") == 1.0}
+    assert sorted(over) == sorted(g for g, _, _ in cv.truth)
+    for geom, prm, col in cv.truth:
+        assert over[geom].z > photo[0].z and _de(over[geom].shape.fill, col) < 3.0
+        assert _shape_error(geom, prm, over[geom]) < 2.0
+
+
+@pytest.mark.parametrize("kind", ["grain", "texture"])
+def test_full_bleed_photo_without_shapes_keeps_the_old_reading(kind):
+    """滿版照片上沒有疊上去的圖形：照原本的讀法，結果與關掉這個功能時相同。"""
+    cv = Canvas()
+    cv.photo((0, 0, 900, 620), kind, seed=7)
+    img = cv.render()
+    tm = np.zeros(img.shape[:2], bool)
+    regs = find_regions(img, tm)
+    off = find_regions(img, tm, params={"overlay_enabled": False})
+    assert sorted((r.kind, r.bbox) for r in regs) == sorted((r.kind, r.bbox) for r in off)
+
+
+def test_thin_bar_over_photo_is_split():
+    """12 px 高的細條：內縮 7 px 後量不到顆粒，改用較小的高通再量（原本被一個哨兵值判成「顆粒與照片差不多」）。"""
+    cv = Canvas()
+    cv.photo((60, 60, 840, 560), "grain", seed=7)
+    cv.rect(150, 200, 650, 212, (235, 200, 70))
+    img = cv.render()
+    regs = find_regions(img, np.zeros(img.shape[:2], bool))
+    over = [r for r in regs if r.features.get("overlay") == 1.0]
+    assert len(over) == 1 and over[0].shape.geometry == "rect"
+    assert _shape_error("rect", cv.truth[0][1], over[0]) < 2.0 and over[0].features["overlay_hp_sigma"] == 1.0
+
+
+@pytest.mark.parametrize("kind,q", [("grain", 90), ("texture", 90), ("grain", 75), ("texture", 75)])
+def test_jpeg_shapes_over_photo(kind, q):
+    """JPEG 壓縮過的照片加形狀：橢圓、矩形、圓角矩形要拆對；三角形的尖角會被壓縮沿 8×8 區塊削掉，要補回來。
+    q90 三角形一定要拆成三個頂點、誤差 2 px 內；q75 只有部分情況補得回來（已知限制），這裡只檢查拆出來時不能錯，
+    而且拆出來的三角形要把真的三角形整個蓋住（不然照片裡會留下殘角）。"""
+    cv = _overlay_scene(kind)
+    img = _jpeg(cv.render(), q)
+    regs = find_regions(img, np.zeros(img.shape[:2], bool))
+    photo = next(r for r in regs if r.kind == "photo")
+    over = {r.shape.geometry: r for r in regs if r.kind == "shape" and r.features.get("overlay") == 1.0}
+    errs = {}
+    for geom, prm, col in cv.truth:
+        r = over.get(geom)
+        if geom == "polygon":
+            tri = [r for r in regs if r.features.get("overlay") == 1.0 and r.bbox[0] > 480 and r.bbox[1] > 300]
+            if q >= 90:
+                assert r is not None and len(r.shape.polygon) == 3
+            if tri and r is not None and len(r.shape.polygon) == 3:
+                errs[geom] = round(_shape_error(geom, prm, r), 2)
+                assert errs[geom] < 2.0
+                m = Image.new("L", (900, 620), 0)
+                ImageDraw.Draw(m).polygon([tuple(p) for p in prm], fill=255)
+                truth = cv2.erode((np.asarray(m) > 0).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+                x0, y0, x1, y1 = r.bbox
+                cov = np.zeros(truth.shape, bool)
+                cov[y0:y1, x0:x1] = r.mask
+                assert (truth & ~cov).sum() == 0
+            else:
+                errs[geom] = "沒拆成三角形" if tri else "沒拆"
+            continue
+        assert r is not None and r.z > photo.z and _de(r.shape.fill, col) < 3.0
+        errs[geom] = round(_shape_error(geom, prm, r), 2)
+        assert errs[geom] < 2.0
+    print(f"\n{kind} JPEG{q}：{errs}")
+
+
+def _wall(h: int, w: int, rng, base) -> np.ndarray:
+    return np.array(base, np.float32) + _fractal(h, w, rng, amp=35)
+
+
+def _brick(h: int, w: int, rng) -> np.ndarray:
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    off = ((yy // 28).astype(int) % 2) * 30
+    mortar = ((yy % 28) < 3) | (((xx + off) % 60) < 3)
+    base = np.array([150, 75, 55], np.float32) + _fractal(h, w, rng, amp=18)
+    return np.where(mortar[..., None], np.array([190, 185, 175], np.float32), base)
+
+
+def _true_photo_scene(name: str, seed: int) -> np.ndarray:
+    """照片內容與照片同一次「曝光」：最後才加整張的感光顆粒，所以照片裡的平坦處也帶著同樣的顆粒（除非截平）。"""
+    h, w = 500, 780
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    if name == "black_doorway":  # 有紋理的牆上一個暗到截成純黑的門洞
+        img = _wall(h, w, rng, (170, 160, 140))
+        m = (xx > 0.35 * w) & (xx < 0.6 * w) & (yy > 0.25 * h) & (yy < 0.9 * h)
+        img = np.where(m[..., None], np.float32(-30), img)
+    elif name == "white_window":  # 過曝成純白的窗
+        img = _wall(h, w, rng, (120, 110, 100))
+        m = (xx > 0.35 * w) & (xx < 0.6 * w) & (yy > 0.25 * h) & (yy < 0.7 * h)
+        img = np.where(m[..., None], np.float32(300), img)
+    elif name == "sign":  # 磚牆上一塊油漆招牌（均勻、邊緣銳利），整張同樣的顆粒
+        img = _brick(h, w, rng)
+        m = (xx > 0.3 * w) & (xx < 0.7 * w) & (yy > 0.3 * h) & (yy < 0.6 * h)
+        img = np.where(m[..., None], np.array([30, 90, 160], np.float32), img)
+    else:
+        raise ValueError(name)
+    img = img + _correlated_noise(h, w, 3.0, rng)
+    page = np.full((620, 900, 3), (246, 244, 238), np.uint8)
+    page[60:560, 60:840] = np.clip(np.rint(img), 0, 255).astype(np.uint8)
+    return page
+
+
+@pytest.mark.parametrize("name,q", [("black_doorway", 0), ("black_doorway", 75), ("white_window", 0), ("white_window", 85),
+                                    ("sign", 0), ("sign", 65), ("sign", 75)])
+def test_photo_content_is_not_split(name, q):
+    """照片自己的內容不可拆：截平成純黑、純白的門洞與窗（內部同樣沒有顆粒、邊緣同樣銳利）；磚牆上的招牌經 JPEG 後，
+    均勻處的顆粒被壓得比磚紋少（照片沒有本身平坦的地方，比值要求更嚴）。沒拆的原因合併成照片 notes 的一句。"""
+    img = _true_photo_scene(name, seed=1)
+    if q:
+        img = _jpeg(img, q)
+    regs = find_regions(img, np.zeros(img.shape[:2], bool))
+    assert not [r for r in regs if r.features.get("overlay") == 1.0]
+    photo = next(r for r in regs if r.kind == "photo")
+    said = [n for n in photo.notes if "沒有拆出來" in n]
+    assert len(said) <= 1  # 合併成一句（磚牆原本每塊磚各一句，四十幾句）；招牌沒壓縮時帶著顆粒，根本不是平坦候選
+    if name != "sign":
+        assert len(said) == 1 and ("純黑" in said[0] or "純白" in said[0])
+    print(f"\n{name} q{q}：{said[0][:120] if said else '（沒有平坦候選）'}")
+
+
+@pytest.mark.parametrize("alpha", [0.8, 0.95])
+def test_translucent_box_is_not_split(alpha):
+    """半透明的色塊壓在照片上：透明度 0.95 時內部只透出一點照片的顆粒，頁面底色又完全乾淨——當成半透明，不拆。"""
+    cv = Canvas()
+    cv.photo((60, 60, 840, 560), "grain", seed=7)
+    base = np.asarray(cv.img).astype(np.float32)
+    x0, y0, x1, y1 = 200 * SS, 150 * SS, 600 * SS, 400 * SS
+    base[y0:y1, x0:x1] = base[y0:y1, x0:x1] * (1 - alpha) + np.array((40, 60, 90), np.float32) * alpha
+    cv.img = Image.fromarray(np.clip(np.rint(base), 0, 255).astype(np.uint8))
+    img = cv.render()
+    regs = find_regions(img, np.zeros(img.shape[:2], bool))
+    assert not [r for r in regs if r.features.get("overlay") == 1.0]
+
+
+def test_fill_quality_tells_smooth_fills_apart():
+    """補圖品質：漸層加顆粒的照片補得好（中尺度紋理接近周圍），多尺度紋理的照片補出來是一團平滑的色塊。"""
+    from mortise.recognition.regions import fill_quality
+
+    q = {}
+    for kind in ("grain", "texture"):
+        img = _overlay_scene(kind).render()
+        regs = find_regions(img, np.zeros(img.shape[:2], bool))
+        photo = next(r for r in regs if r.kind == "photo")
+        cover = np.zeros(img.shape[:2], bool)
+        for r in regs:
+            if r.kind in ("shape", "illustration") and r.z > photo.z:
+                x0, y0, x1, y1 = r.bbox
+                cover[y0:y1, x0:x1] |= r.mask
+        filled, gen = fill_covered(img, photo, cover)
+        q[kind] = fill_quality(filled, gen, photo)
+    print(f"\n補圖品質（中尺度紋理比）：{q}")
+    assert q["grain"] >= 0.6 and q["texture"] < 0.5
+
+
+@pytest.mark.parametrize("kind,size", [("landscape", (1800, 1200)), ("texture", (2400, 1600)), ("landscape", (3000, 2000))])
+def test_vectorize_gives_up_fast_on_big_jpeg_photos(kind, size):
+    """大張、壓縮過的照片：固定 40 px 的方塊在高解析度下太平滑，原本擋不住（風景 2200×1500 的 JPEG 描了 498 秒）；
+    現在另外縮到 560 px 再看一次。"""
+    from mortise.recognition.vectorize import vectorize
+
+    w, h = size
+    img = _jpeg(np.clip(photo_content(kind, h, w, np.random.default_rng(5)), 0, 255).astype(np.uint8), 75)
+    t0 = time.time()
+    res = vectorize(img)
+    dt = time.time() - t0
+    print(f"\n{kind} {w}×{h} JPEG75：{dt:.2f} 秒；{res.notes[0]}")
+    assert not res.accepted and not res.paths and dt < 2.0 and "快速檢查" in res.notes[0]
