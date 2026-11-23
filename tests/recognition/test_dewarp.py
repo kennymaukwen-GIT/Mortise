@@ -248,3 +248,158 @@ def test_enhance_flags_glare():
     assert 0.002 < info["glare_frac"] < 0.05 and info["notes"] and "反光" in info["notes"][0]
     _, clean = PG.enhance(page, return_info=True)
     assert clean["glare_frac"] == 0.0 and not clean["notes"]
+
+
+# ------------------------------------------------------------------ 審查後修正：驗證不可跳過、學習式外框只當候選、下載
+
+
+FIX = __import__("pathlib").Path(__file__).resolve().parents[1] / "fixtures"
+
+
+def _flat_photo(name: str, seed: int, strength: float):
+    page = S.render_pdf_page(str(FIX / f"{name}.pdf"), 0, dpi=150)[0]
+    ph, Mh, _ = S.degrade(page, "photo", seed=seed, strength=strength)
+    h, w = page.shape[:2]
+    gt = S.apply_h(Mh, np.array([[0, 0], [w, 0], [w, h], [0, h]], float))
+    return ph, gt, page
+
+
+@pytest.mark.parametrize("name,seed,strength,bow_hint", [
+    ("slide_dark", 502, 2.0, None),  # 深色投影片：以前把字間的深色底量成線，攤平後只剩 1 條線卻「殘差變小」，p95 0.1 → 28 px
+    ("deck", 502, 1.0, None),
+    ("deck", 502, 1.0, [0.0, 0.0, 25.0, 0.0]),  # 底部色帶被量成弓高（頁內線少於 3 條）：以前不驗證直接攤平
+])
+def test_flat_slides_are_not_dewarped(name, seed, strength, bow_hint):
+    ph, gt, page = _flat_photo(name, seed, strength)
+    q = PG.find_page_quad(ph)
+    if bow_hint is not None:
+        q.edge_bow_px = bow_hint
+    r = D.dewarp(ph, q, {"uvdoc": "cache_only"})
+    assert not r.applied, r.notes
+    # 平的紙：維持透視攤平（與 rectify 的透視結果逐像素相同）
+    ref, _ = PG.rectify(ph, q)
+    assert np.array_equal(r.image, ref)
+
+
+def test_lines_must_be_kept_to_compare_residuals():
+    p = D._p(None)
+    assert D._lines_kept(10, 7, p) and not D._lines_kept(10, 6, p) and not D._lines_kept(10, 1, p)
+    assert D._lines_kept(2, 2, p) and not D._lines_kept(2, 1, p) and D._lines_kept(0, 0, p)
+
+
+def test_dark_page_lines_are_measured_on_the_text():
+    """深色底、亮字：量線前要反轉，量到的是文字行（直的），不是字間的深色底。"""
+    img = np.full((600, 800, 3), 30, np.uint8)
+    for k in range(8):
+        cv2.putText(img, "Market overview and quarterly plan 2027", (50, 70 + 65 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (235, 235, 235), 2, cv2.LINE_AA)
+    st = D.straightness(D.find_lines(img, D._p(None)), 800, 600)
+    assert st["n_h"] >= 7 and st["p95_px"] < 1.5, st
+    # 不反轉時量到的是字間的深色底（舊行為）：線數不對或偏離大
+    st_old = D.straightness(D.find_lines(img, D._p({"dark_page_luma": 0.0})), 800, 600)
+    assert st_old.get("n_h", 0) != st["n_h"] or st_old.get("p95_px", 0) > st["p95_px"], st_old
+
+
+def test_param_prefix_from_config_file():
+    p = D._p({"dewarp_bow_px": 7.5, "dewarp_flat_sag_median_pct": 0.2, "dewarp_uvdoc": "off", "dewarp_photos": True})
+    assert p["bow_px"] == 7.5 and p["flat_sag_median_pct"] == 0.2 and p["uvdoc"] == "off"
+    assert D._p({"dewarp_bow_px": 7.5, "bow_px": 3.0})["bow_px"] == 3.0  # 不帶前綴的優先
+    with pytest.warns(UserWarning):
+        D._p({"dewarp_bow_pxx": 1.0})
+
+
+def test_download_failure_is_remembered(monkeypatch, tmp_path):
+    monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(D, "_download", boom)
+    D.ensure_uvdoc_model({"uvdoc": "sync"})
+    path, notes = D.ensure_uvdoc_model({"uvdoc": "sync"})
+    assert path is None and len(calls) == 1 and "不再重試" in notes[0]  # 一小時內不再重試
+
+
+def test_partial_download_is_removed(monkeypatch, tmp_path):
+    class Resp:
+        def __init__(self):
+            self.n = 0
+
+        def read(self, k):
+            self.n += 1
+            if self.n > 2:
+                raise ConnectionResetError("cut")
+            return b"x" * 1000
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(D.urllib.request, "urlopen", lambda *a, **k: Resp())
+    dest = tmp_path / "w.pkl"
+    with pytest.raises(ConnectionResetError):
+        D._download("https://example.invalid/w.pkl", dest, "0" * 64, 10_000, 5.0)
+    assert not dest.exists() and not (tmp_path / "w.pkl.part").exists()
+
+
+def test_first_use_downloads_in_background(monkeypatch, tmp_path):
+    """快取裡沒有模型：攤平時不等下載（背景執行緒），這張先只用量測式。"""
+    import threading
+    import time as _t
+
+    monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    gate = threading.Event()
+
+    def slow(params=None):
+        gate.wait(5)
+        return None, ["假的"]
+
+    monkeypatch.setattr(D, "ensure_uvdoc_model", slow)
+    t0 = _t.time()
+    sess, notes = D._uvdoc_session(D._p({"uvdoc": "auto"}))
+    assert sess is None and _t.time() - t0 < 1.0 and "背景" in notes[0]
+    sess2, notes2 = D._uvdoc_session(D._p({"uvdoc": "auto"}))
+    assert "正在背景下載" in notes2[0]
+    gate.set()
+
+
+def _closeup_table():
+    page, _ = S.table_page(3, dpi=100)
+    h, w = page.shape[:2]
+    crop = np.ascontiguousarray(page[int(0.05 * h): int(0.75 * h), int(0.02 * w): int(0.98 * w)])
+    W, H = 1200, 900
+    src = np.float32([[0, 0], [crop.shape[1], 0], [crop.shape[1], crop.shape[0]], [0, crop.shape[0]]])
+    dst = np.float32([[-25, -25], [W + 25, -40], [W + 30, H + 30], [-15, H + 25]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(crop, M, (W, H), flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REPLICATE)
+
+
+@pytest.mark.skipif(not _uvdoc_cached(), reason="使用者快取裡沒有 UVDoc 模型（不在測試裡下載）")
+def test_no_paper_edges_uvdoc_outline_is_only_a_candidate():
+    """表格特寫，畫面裡沒有紙邊：學習式模型找的外框不可直接當答案（鐵律），維持整張圖，外框只放在候選。"""
+    ph = _closeup_table()
+    r = D.dewarp(ph, None, {"uvdoc": "cache_only"})
+    assert not r.applied and r.image is None and r.pseudo_quad is None, r.notes
+    assert len(r.candidate_outline) == 4 and r.needs_review
+    out, Hm, d = PG.rectify(ph, None, {"dewarp": True, "uvdoc": "cache_only"}, return_dewarp=True)
+    assert out.shape == ph.shape and np.allclose(Hm, np.eye(3))
+
+
+@pytest.mark.skipif(not _uvdoc_cached(), reason="使用者快取裡沒有 UVDoc 模型（不在測試裡下載）")
+def test_rectify_uses_measured_corners_when_detection_failed(table):
+    """find_page_quad 給整張圖時，攤平函數由紙邊量出的四角（至少三邊）要被 rectify 採用（平的紙做透視），並標成需要確認。"""
+    page, _ = table
+    Wp, Hp = page.shape[1], page.shape[0]
+    ph, pm, info = S.degrade_curved(page, "flat", 5, params=SYN)
+    full = PageQuad(corners=np.array([[0, 0], [ph.shape[1], 0], [ph.shape[1], ph.shape[0]], [0, ph.shape[0]]], float),
+                    confidence=0.15, method="full_image", aspect_ratio=ph.shape[0] / ph.shape[1])
+    out, Hm, d = PG.rectify(ph, full, {"dewarp": True, "uvdoc": "cache_only"}, return_dewarp=True)
+    assert d.pseudo_quad is not None and d.measured_sides >= 3 and d.needs_review, d.notes
+    assert out.shape[:2] == d.map_x.shape
+    g = M.dewarp_geometry(d.map_x, d.map_y, pm, (Wp, Hp))
+    assert g["dewarp_pos_p95_px"] < 2.0 and g["page_coverage"] > 0.95 and g["background_frac"] < 0.03, g

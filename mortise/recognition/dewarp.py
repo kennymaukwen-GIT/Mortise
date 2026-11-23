@@ -1354,7 +1354,8 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
     mode = p["dewarp_mode"]
     have_quad = quad is not None and getattr(quad, "method", "") != "full_image" and quad.corners is not None
     t0 = time.time()
-    img_f = cv2.GaussianBlur(img.astype(np.float32), (0, 0), p["edge_blur_sigma"])
+    img_f = img.astype(np.float32)
+    cv2.GaussianBlur(img_f, (0, 0), p["edge_blur_sigma"], dst=img_f)  # 就地模糊：大照片少一份 float32 全圖（12 MP 約 144 MB）
     R = max(p["edge_search_min_px"], p["edge_search_frac"] * diag)
     names = ["上", "右", "下", "左"]
 
@@ -1572,8 +1573,10 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
             sup = [float(sd["support"]) for sd in uv_sides]
             srt = sorted(sup)
             conf = 0.05 + 0.85 * float(np.clip((srt[1] - 0.3) / 0.5, 0.0, 1.0))
-            return perspective_result([f"沒有現成的四角：以學習式模型（UVDoc）找的外框為候選、由紙邊量出四角（四邊支持率 {', '.join(f'{v:.2f}' for v in sup)}）；"
-                                       f"判定為平的紙（四邊弓高 ≤ {max(bows):.1f} 像素、頁內 {st_before.get('n_lines', 0)} 條線都直）：只做透視攤平。"],
+            nm = int(pseudo_info.get("measured", 0))
+            return perspective_result([f"沒有現成的四角：以學習式模型（UVDoc）找的外框為候選、由紙邊量出四角（四邊支持率 {', '.join(f'{v:.2f}' for v in sup)}，"
+                                       f"{nm} 條邊是量到的紙邊{'' if nm >= 4 else '，其餘是學習式模型的推估'}）；"
+                                       f"判定為平的紙（四邊弓高 ≤ {max(bows):.1f} 像素、頁內 {st_before.get('n_lines', 0)} 條線都直）：只做透視攤平，四角請使用者確認。"],
                                       False, conf, sup)
         return perspective_result([f"判定為平的紙（四邊弓高 ≤ {max(bows):.1f} 像素、頁內 {st_before.get('n_lines', 0)} 條線都直）：只做透視攤平。"], False)
 

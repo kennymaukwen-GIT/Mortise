@@ -33,11 +33,17 @@
          「相鄰邊弓高 × bow_err_factor」「同一張紙其他框法的四角差異」「角落外邊緣延伸的長度」的最大值。
          信心值 = 0.05 + 0.93 × 支持率 × √對比 × 四角誤差（像素）× 角落在畫面外 × 直線度 × 與次佳不同區域候選的差距
          × 長寬比合理度 × 邊外內容 × 角落延伸 × 四角誤差（相對對角線 1%）。
-         status：cut_off（角落在畫面外或一條邊貼著畫面邊）、multiple_pages（另一區域的候選分數接近）、
-         curved_edge（紙邊彎曲）、low_contrast（信心 < review_conf 或某角誤差 > 對角線 1%）、not_found（照片卻找不到紙）、ok。
+         status：cut_off（角落在畫面外；或整張圖時，恰好一條邊貼著畫面邊、另外三條邊都量到而且一路延伸到畫面邊）、
+         multiple_pages（另一區域的候選分數接近）、curved_edge（紙邊彎曲）、low_contrast（信心 < review_conf 或某角誤差 > 對角線 1%）、
+         not_found（照片卻找不到紙；紙完整在畫面內卻量不到四邊也是這個）、ok。
          不是 ok 時，上層應請使用者拖曳四角確認；alternatives 列出其他候選四角（第二張紙、被切掉的紙的三邊＋畫面邊）。
-         合成照片校準（193 張，見研究筆記與 tests/recognition/test_page_detect_real.py）：信心 ≥ 0.6 的 88 張中，
-         四角誤差超過對角線 1% 的 1 張（捲邊的角往外翹，直線交點切掉翹出的部分）。
+         只有 method="full_image" 且 status="cut_off" 時，alternatives[0] 才是可以預選的「三條邊＋畫面邊」。
+         照片校準（193 張：synth.degrade 翻拍 116 張、彎曲與平放的紙 68 張（弓起、捲邊、捲角、折痕）、米色底加第二張紙 8 張、創辦人照片縮圖 1 張）：
+         信心 ≥ 0.6 的 97 張中，四角誤差超過對角線 1% 的 1 張（上緣捲起，捲起的角往外撐開；直線交點是看得到的平直紙邊的角）。
+      2a. 兩張並排的紙：最佳框裡有兩個互不重疊、都是完整紙張、合起來幾乎填滿它的候選時，最佳框是兩張紙一起框，
+         改以其中一張為答案（status 會是 multiple_pages）。
+      2c. 角點落在背景上（角內外同色、不像紙；例如紙的上緣捲起、上邊的直線被背景的亮折痕帶走）：沿相鄰的邊往內找到紙的角
+         （_snap_corners_to_paper；有多項檢查避免把紙上的深色色帶當成背景），移動量計入誤差。
          四邊都與影像軸平行（axis_tol_deg 內）且影像幾乎沒有感光雜訊時，視為截圖裡的色塊或表格而不是紙張。
          精修全部失敗但縮圖輪廓的四邊梯度支持率都夠高時，退回輪廓近似（method="contour"，低信心、誤差數像素）。
          畫面中有傾斜的長直邊（透視線索）卻湊不成四邊時，判為照片且頁面超出畫面或被遮住。
@@ -197,7 +203,7 @@ DEFAULT_PARAMS: dict = {
     "bow_line_support_g": 0.4,  # 直線（精修的紙邊）上的邊緣強度至少是該邊中位峰值的這個比例，才算「直線這裡有邊緣」
     "bow_line_support_frac": 0.8,  # 直線整段（或角落那一段）有這個比例以上都有邊緣：紙邊是直的，路徑偏開是跟到紙上的印刷，不算彎曲
     # ---- 角點落在背景上（_snap_corners_to_paper）----
-    "snap_same_de": 12.0,  # 角內外兩側的色差（ΔE）小於這個……
+    "snap_same_de": 8.0,  # 角內外兩側的色差（ΔE）小於這個（沿邊走過的那一段，邊內外也要小於這個）……
     "snap_not_paper_de": 25.0,  # ……而且角內側與紙色的色差大於這個，就判定角點不在紙邊上
     "snap_toward_paper": 0.4,  # 沿邊往內走時，邊內側的顏色從角內側的顏色往紙色走了這個比例以上，算「到紙了」
     "snap_max_frac": 0.08,  # 最多沿邊走這個比例的邊長
@@ -1173,6 +1179,7 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict, rounds: Optio
                 fit = {"n": init[0], "d": init[1], "w": np.zeros(ns), "sigma": 99.0, "var_off": 99.0, "var_th": 1.0, "c": 0.5 * (a + b)}
                 support = 0.0
                 inl = np.zeros(ns, bool)
+                r = np.full(ns, np.inf)
             else:
                 fit = _fit_line_robust(pts[keep], np.sqrt(peak[keep]), init, R / 2.0, p)
                 r = np.full(ns, np.inf)
@@ -1192,6 +1199,7 @@ def _refine(img: np.ndarray, quad: np.ndarray, r0: float, p: dict, rounds: Optio
                     "edge_sigma": float(np.median(fwhm[keep])) / 2.355 if keep.sum() >= 6 else 0.0,
                     "ts": ts,
                     "inl": inl,  # 每個取樣點是否有邊緣支持（沿邊由起點到終點）
+                    "resid": r,  # 每個取樣點的邊緣離擬合直線的距離（沒量到為 inf）
                     "valid": valid,
                 }
             )
@@ -1245,6 +1253,25 @@ def _robust_poly(t: np.ndarray, s: np.ndarray, w0: np.ndarray, deg: int, p: dict
     return coef, scale, w
 
 
+def _shares_side(q1: np.ndarray, q2: np.ndarray, tol: float) -> bool:
+    """兩個四邊形有沒有一條邊幾乎重合（端點離另一條邊的直線都在 tol 內，而且沿線重疊一半以上）。"""
+    for i in range(4):
+        a, b = q1[i], q1[(i + 1) % 4]
+        L = float(np.linalg.norm(b - a))
+        if L < 1e-6:
+            continue
+        t = (b - a) / L
+        n = np.array([-t[1], t[0]])
+        for j in range(4):
+            c, d = q2[j], q2[(j + 1) % 4]
+            if abs(float((c - a) @ n)) > tol or abs(float((d - a) @ n)) > tol:
+                continue
+            s0, s1 = sorted((float((c - a) @ t), float((d - a) @ t)))
+            if min(L, s1) - max(0.0, s0) >= 0.5 * min(L, s1 - s0):
+                return True
+    return False
+
+
 def _lab_of(rgb: np.ndarray) -> np.ndarray:
     a = np.clip(np.asarray(rgb, np.float32).reshape(-1, 1, 3), 0, 255).astype(np.uint8)
     lab = cv2.cvtColor(a, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
@@ -1253,7 +1280,7 @@ def _lab_of(rgb: np.ndarray) -> np.ndarray:
     return lab
 
 
-def _snap_corners_to_paper(img: np.ndarray, q: np.ndarray, p: dict) -> tuple[np.ndarray, list[tuple[int, float]]]:
+def _snap_corners_to_paper(img: np.ndarray, q: np.ndarray, p: dict, info: Optional[list] = None) -> tuple[np.ndarray, list[tuple[int, float]]]:
     """角點的檢查：角內側（沿角平分線往內幾個像素）與角外側顏色幾乎相同、又不像紙（頁內的眾數色）時，
     角點不在紙邊上（例如紙的上緣捲起、上邊的直線跟到了背景的折痕）。這時沿相鄰兩條邊往內走，
     走到「邊內側開始像紙」的地方（最多 snap_max_frac × 邊長），取走得最短的那條邊上的點當新的角。
@@ -1292,7 +1319,7 @@ def _snap_corners_to_paper(img: np.ndarray, q: np.ndarray, p: dict) -> tuple[np.
         if not (d_io < p["snap_same_de"] and d_ip > p["snap_not_paper_de"]):
             continue
         best_d = None
-        for u, L, other in ((u1, L1, u2), (u2, L2, u1)):
+        for u, L, other, side, from_end in ((u1, L1, u2, (k - 1) % 4, True), (u2, L2, u1, k, False)):
             # 沿這條邊走；邊的內側方向＝垂直於邊、指向另一條相鄰邊那一側
             n_in = np.array([-u[1], u[0]])
             if n_in @ other < 0:
@@ -1313,16 +1340,90 @@ def _snap_corners_to_paper(img: np.ndarray, q: np.ndarray, p: dict) -> tuple[np.
             # 連續 3 個點都像紙才算（避開雜點）
             run = np.convolve(like.astype(int), np.ones(3, int), mode="valid") == 3
             if run.any():
-                d = float(steps[int(np.argmax(run))])
+                i_d = int(np.argmax(run))
+                d = float(steps[i_d])
+                # 走過的這一段，邊的內外兩側也要幾乎同色（這段真的沒有紙邊）；有色差就表示角點是對的
+                # （例如深色背景上、紙的邊緣有一條深色色帶：角內外顏色接近，但沿著邊仍有一條弱的紙邊）
+                if info is not None:
+                    # 直線精修時在走過的這一段量到了邊緣（例如深色背景上的深色色帶，紙邊很弱但量得到）：角點是對的
+                    ts_, inl_, val_ = info[side]["ts"], info[side]["inl"], info[side]["valid"]
+                    seg = ((ts_ >= 1.0 - d / L) if from_end else (ts_ <= d / L)) & val_
+                    if seg.sum() >= 2 and float(inl_[seg].mean()) >= 0.5:
+                        continue
+                if i_d >= 2:
+                    po = a[None, :] + steps[:i_d, None] * u[None, :] - 4.0 * n_in[None, :]
+                    ok_o = np.all((po >= 0.5) & (po <= np.array([W - 0.5, H - 0.5])), axis=1) & inb[:i_d]
+                    if ok_o.sum() >= 2:
+                        de = np.linalg.norm(lab[:i_d][ok_o] - _lab_of(_sample(img, po[ok_o, 0], po[ok_o, 1])), axis=1)
+                        if float(np.median(de)) >= p["snap_same_de"]:
+                            continue
                 if best_d is None or d < best_d[0]:
-                    best_d = (d, a + d * u)
+                    best_d = (d, a + d * u, side)
         if best_d is not None:
-            q[k] = best_d[1]
-            moved.append((k, best_d[0]))
+            # 另一條相鄰邊（沒有沿著走、方向會跟著改變的那條）：原本的直線在角落附近若「內外的明暗」跟這條邊其他地方相反，
+            # 角落那段就不是紙邊（例如跟到了背景的亮折痕），可以移；明暗一致（例如紙底部的深色色帶貼著深色背景，
+            # 弱但仍是紙邊），就要求移過去之後這條邊更像紙邊（跨線色差不變小），否則不移
+            o = k if best_d[2] == (k - 1) % 4 else (k - 1) % 4
+            a_o, b_o = q[o], q[(o + 1) % 4]
+            flip = _polarity_flips(img, a_o, b_o, cen, corner_at_start=(o == k))
+            q2 = q.copy()
+            q2[k] = best_d[1]
+            if flip or _line_step(img, q2[o], q2[(o + 1) % 4]) >= 0.8 * _line_step(img, a_o, b_o):
+                q[k] = best_d[1]
+                moved.append((k, best_d[0]))
     return q, moved
 
 
-def _measure_bow(img: np.ndarray, q: np.ndarray, p: dict) -> list[dict]:
+def _polarity_flips(img: np.ndarray, a: np.ndarray, b: np.ndarray, cen: np.ndarray, corner_at_start: bool) -> bool:
+    """邊 a→b 上，靠角落那 15% 的「內側減外側亮度」與 30%～90% 那段的正負號相反（角落那段跟到的不是紙邊）。"""
+    H, W = img.shape[:2]
+    L = float(np.linalg.norm(b - a))
+    if L < 20:
+        return False
+    t = (b - a) / L
+    n = np.array([-t[1], t[0]])
+    if (0.5 * (a + b) - cen) @ n < 0:
+        n = -n  # n 朝外
+    ts = np.linspace(0.0, 1.0, int(np.clip(L / 2, 20, 400)))
+    if not corner_at_start:
+        ts = 1.0 - ts  # 由角落那端開始
+    base = a[None, :] + ts[:, None] * (b - a)[None, :]
+    pin, pout = base - 3.0 * n, base + 3.0 * n
+    ok = np.all((pin >= 0.5) & (pin <= np.array([W - 0.5, H - 0.5])) & (pout >= 0.5) & (pout <= np.array([W - 0.5, H - 0.5])), axis=1)
+    wl = np.array([0.299, 0.587, 0.114], np.float32)
+    d = np.full(len(ts), np.nan)
+    if ok.sum() < 8:
+        return False
+    d[ok] = _sample(img, pin[ok, 0], pin[ok, 1]).reshape(-1, 3) @ wl - _sample(img, pout[ok, 0], pout[ok, 1]).reshape(-1, 3) @ wl
+    u = np.abs(ts - (0.0 if corner_at_start else 1.0))  # 離角落的距離（佔邊長）
+    near = d[(u <= 0.15) & ok]
+    rest = d[(u >= 0.3) & (u <= 0.9) & ok]
+    if len(near) < 4 or len(rest) < 4:
+        return False
+    mn, mr = float(np.median(near)), float(np.median(rest))
+    return mn * mr < 0 and min(abs(mn), abs(mr)) >= 5.0
+
+
+def _line_step(img: np.ndarray, a: np.ndarray, b: np.ndarray, off: float = 2.0) -> float:
+    """沿 a→b 這條線（中段 10%～90%）的跨線色差中位數：線兩側 off 像素處的顏色差（RGB 歐氏距離）。"""
+    H, W = img.shape[:2]
+    L = float(np.linalg.norm(b - a))
+    if L < 8:
+        return 0.0
+    t = (b - a) / L
+    n = np.array([-t[1], t[0]])
+    ts = np.linspace(0.1, 0.9, int(np.clip(L / 4, 16, 200)))
+    base = a[None, :] + ts[:, None] * (b - a)[None, :]
+    p1, p2 = base + off * n, base - off * n
+    ok = np.all((p1 >= 0.5) & (p1 <= np.array([W - 0.5, H - 0.5])) & (p2 >= 0.5) & (p2 <= np.array([W - 0.5, H - 0.5])), axis=1)
+    if ok.sum() < 4:
+        return 0.0
+    c1 = _sample(img, p1[ok, 0], p1[ok, 1]).reshape(-1, 3 if img.ndim == 3 else 1)
+    c2 = _sample(img, p2[ok, 0], p2[ok, 1]).reshape(-1, 3 if img.ndim == 3 else 1)
+    return float(np.median(np.linalg.norm(c1 - c2, axis=1)))
+
+
+def _measure_bow(img: np.ndarray, q: np.ndarray, p: dict, line_inl: Optional[list] = None) -> list[dict]:
     """量每條邊的彎曲：沿法線較大範圍內，以動態規劃找一條連續、平滑、梯度最強的邊緣路徑，再擬合二次曲線。
 
     回傳每邊 dict：bow（二次曲線與其弦的最大距離＝弓高，像素）、curved（是否判為彎曲）、
@@ -1399,8 +1500,18 @@ def _measure_bow(img: np.ndarray, q: np.ndarray, p: dict) -> list[dict]:
             continue
         # 直線本身（精修量到的紙邊）沿線有沒有邊緣：紙邊真的彎了，弦的中段（或翹起的那一端）就不會有邊緣；
         # 直線整段都有邊緣、路徑卻偏到別處，偏到的是紙上的印刷（例如投影片底部色帶的交界），不是紙邊
-        jl = np.abs(offs) <= max(2.0, 2.0 * so)
-        line_ok = (G[:, jl].max(axis=1) >= p["bow_line_support_g"]) & rows
+        li = line_inl[k] if line_inl is not None else None
+        if line_inl is not None and li is None:
+            line_ok = np.zeros(ns, bool)  # 呼叫端說這條直線不能當紙邊的證據
+        elif li is not None and len(li[0]) >= 8:
+            # 直線精修時每個取樣點有沒有量到邊緣（它的搜尋範圍只在直線附近、強度門檻也是這條邊自己的，
+            # 紙邊比紙上印刷的交界弱時也量得到，例如深色背景上的深色底部色帶）
+            t_l, inl_l, val_l = li
+            near = np.clip(np.searchsorted(t_l, ts), 0, len(t_l) - 1)
+            line_ok = inl_l[near] & rows
+        else:
+            jl = np.abs(offs) <= max(2.0, 2.0 * so)
+            line_ok = (G[:, jl].max(axis=1) >= p["bow_line_support_g"]) & rows
         info["line_support"] = float(line_ok[rows].mean())
         tt = ts[ok] * L
         ss = offs[path[ok]]
@@ -1636,13 +1747,14 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
     contour_cand = None
     alt_quads: list[np.ndarray] = []  # 退路時也交給上層的候選四角（例如紙被畫面切掉時的三邊＋畫面邊）
     alt_scores: list[float] = []
-    cut_side = False  # 最佳候選有一條邊貼在畫面邊上（紙超出畫面）
+    cut_side = False  # 最佳候選有一條邊貼在畫面邊上（紙超出畫面），而且另外三條邊都量到（可以預選 alternatives[0]）
+    frame_weak = False  # 最佳候選缺的邊都貼著畫面邊（較寬鬆；只用來決定要不要用輪廓退路）
 
     def fallback(reason: str) -> PageQuad:
         glare = _overexposed_frac(small)
         if glare >= p["glare_note_frac"]:
             notes.append(f"畫面上有大片過曝（約 {glare:.0%}，可能是反光蓋住了紙邊或內容）：建議換個角度重拍")
-        if contour_cand is not None and not digital and not cut_side:
+        if contour_cand is not None and not digital and not cut_side and not frame_weak:
             qc = _order_corners(contour_cand)
             err = np.full(4, p["contour_corner_err_px"] / min(sx, sy))
             est, amethod, focal = estimate_aspect(qc, (W, H), err, p)
@@ -1719,7 +1831,8 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
                 best_sup, contour_cand = key, qs / np.array([sx, sy])
 
     # ---- 2. 原圖精修，精修後再用同一套評分（支持率改用精修量到的）----
-    img_f = cv2.GaussianBlur(img.astype(np.float32), (0, 0), p["refine_sigma"])
+    img_f = img.astype(np.float32)
+    cv2.GaussianBlur(img_f, (0, 0), p["refine_sigma"], dst=img_f)  # 就地模糊：大照片少一份 float32 全圖（12 MP 約 144 MB）
     r0 = 3.0 / min(sx, sy) + 4.0
     scale_s = np.array([sx, sy])
     def judge(res: dict) -> dict:
@@ -1816,7 +1929,6 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
                 if split is None or A["score"] + B["score"] > split[0]["score"] + split[1]["score"]:
                     split = (A, B) if A["score"] >= B["score"] else (B, A)
     if split is not None:
-        merged = best
         best = split[0]
         refined = [best] + [r for r in refined if r is not best]
         notes.append("找到的大框裡其實是兩張並排的紙（兩個互不重疊的完整紙張幾乎填滿大框）：改以其中一張為答案，另一張與大框列在其他候選")
@@ -1834,7 +1946,10 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
     diff_region = [r for r in others if r["iou"] < p["alt_iou"]]
     gap_ratio = max((r["score"] / bs for r in diff_region), default=0.0)
     f_gap = float(np.clip(1.0 - 0.5 * (gap_ratio - p["gap_lo"]) / (p["gap_hi"] - p["gap_lo"]), 0.5, 1.0))
-    same_region = [r for r in others if accept(r) and r["iou"] >= p["same_iou"] and r["score"] >= p["disagree_ratio"] * bs]
+    # 同一張紙的其他框法：分數接近的才算分歧。完全在最佳框裡、而且「相鄰兩邊越過它的角落還有邊緣」的（紙上的色帶、圖框；
+    # 例如投影片底部色帶上緣圍成的框），是紙上的印刷，不是另一種紙邊的框法，不計入分歧
+    same_region = [r for r in others if accept(r) and r["iou"] >= p["same_iou"] and r["score"] >= p["disagree_ratio"] * bs
+                   and not (r["factors"].get("ext", 1.0) < 0.9 and inside_frac(r) >= 0.97)]
 
     sup = best["support"]
     side_names = ["上", "右", "下", "左"]
@@ -1856,6 +1971,8 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
         miss = [side_names[k] for k in range(4) if sup[k] < p["min_side_support"]]
         msg = f"只找到{'、'.join(found) or '零'}邊（{'、'.join(miss)}邊缺乏邊緣支持，頁面可能超出畫面、被遮住或與背景同色）"
         weak = sup < p["min_side_support"]
+        if np.all(best["on_frame"][weak]) and (sup[~weak] >= p["min_side_support"]).sum() >= 2:
+            frame_weak = True  # 缺的邊都貼著畫面邊：紙多半超出畫面，不用縮圖輪廓退路（輪廓會框到紙的一部分）
         # 紙超出畫面（cut_off）要有把握才標：恰好一條邊貼著畫面邊，另外三條都量到、而且都是紙與背景的交界（內外有色差）。
         # 這時 alternatives[0]（三條邊＋畫面邊）可以直接預選；其他找不到的情況標 not_found，不讓介面預選錯的框
         strong = ~weak & (np.asarray(best["step"]) >= p["cut_off_min_step"])
@@ -1887,12 +2004,20 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
         return _full_image(img, p["conf_full_digital"], ["找到的四邊形與影像軸完全平行且影像無雜訊：判為截圖內的色塊或表格，整張圖就是頁面"])
 
     # ---- 2c. 角點落在背景上（例如紙的上緣捲起，上邊的直線被布料的折痕帶走）：沿相鄰的邊往內找到紙的實體角 ----
-    q, moved = _snap_corners_to_paper(img_f, q, p)
+    q, moved = _snap_corners_to_paper(img_f, q, p, best["info"])
     for k, d in moved:
         notes.append(f"{['左上', '右上', '右下', '左下'][k]}角原本落在背景上（角內外顏色相同、不像紙），已沿邊往內移到紙的實體角（{d:.1f} 像素）；誤差已計入")
 
     # ---- 3. 彎曲的邊：沿法線找連續的邊緣路徑、擬合二次曲線量弓高；彎曲時角點改用角落附近的路徑求 ----
-    bows = _measure_bow(img_f, q, p)
+    moved_k = {k for k, _ in moved}
+    # 第 k 邊連著第 k、k+1 角；角移過的邊不用精修時的支持。「直線上有邊緣」用固定的緊容許量（不用擬合殘差估的 σ：
+    # 紙邊真的彎時殘差 σ 會被撐大，整條都變成「支持」）
+    tol_line = max(p["inlier_px"], 2.0 * float(best.get("edge_sigma", 0.0)))
+    # 直線本身要是紙與背景的交界（內外有色差）才拿來否決彎曲；兩側同色的直線（框到頁內的表格外框）不算，那時偏開的路徑才是紙邊
+    step_k = np.asarray(best["step"])
+    line_inl = [None if (k in moved_k or (k + 1) % 4 in moved_k or step_k[k] < p["cut_off_min_step"]) else
+                (best["info"][k]["ts"], np.abs(best["info"][k]["resid"]) <= tol_line, best["info"][k]["valid"]) for k in range(4)]
+    bows = _measure_bow(img_f, q, p, line_inl)
     curved = [k for k in range(4) if bows[k]["curved"]]
     bow_px = [float(b["bow"]) if b["curved"] else 0.0 for b in bows]
     boundary = None
@@ -1951,6 +2076,8 @@ def find_page_quad(image: np.ndarray, params: dict | None = None) -> PageQuad:
         notes.append(f"{'、'.join(side_names[k] for k in curved)}邊彎曲（弓高最大 {max(bow_px):.1f} 像素）：紙張捲起或彎曲，四角仍取直線交點（彎出、翹起的部分可能被切掉，誤差已放大），外框另附；建議攤平（去彎曲）並請使用者確認")
     if gap_ratio > p["gap_lo"]:
         notes.append(f"照片裡另有分數接近的紙（次佳 ÷ 最佳 = {gap_ratio:.2f}），已列在其他候選；建議請使用者選擇")
+        if any(_shares_side(q, r["corners"], 0.015 * diag) for r in diff_region if r["score"] >= p["gap_lo"] * bs):
+            notes.append("兩張紙共用一條邊（可能是攤開的書）：建議兩頁分開確認四角，再分別攤平（書脊附近的壓縮目前量不到）")
     if fac["outtext"] < 0.8:
         notes.append("某條邊外側緊貼著還有字：頁面可能比框到的更大（例如標題色帶被切掉）")
     if fac["ext"] < 0.8:

@@ -226,3 +226,108 @@ def test_page_cut_off_by_frame_offers_three_side_candidate():
     top = top[np.argsort(top[:, 0])]
     assert np.abs(top - a[:2]).max() < 3.0, (top, a[:2])  # 看得到的兩個上角要準
     assert c[:, 1].max() >= H - 4.0  # 下緣貼著畫面邊
+
+
+# ------------------------------------------------------------------ 審查後修正（色帶、並排、cut_off、特寫、反光、角點落在背景上）
+
+
+def test_two_sheets_with_narrow_gap_are_split():
+    """兩張一樣大的紙貼近並排（縫只有約 30 px）：以前外圍大框（兩張一起）分數最高、還被標成 curved_edge。
+    現在要框到其中一張、status 是 multiple_pages，另一張在其他候選裡。"""
+    page = cv2.resize(page_image("doc_a4", 60), None, fx=0.9, fy=0.9, interpolation=cv2.INTER_AREA)
+    W, H = 1400, 1000
+    img = _desk(W, H, 3)
+    a = np.array([[90, 140], [640, 120], [660, 880], [80, 900]], dtype=np.float64)
+    b = np.array([[690, 122], [1240, 137], [1262, 893], [692, 880]], dtype=np.float64)
+    img = _warp_onto(img, page, a)
+    img = _warp_onto(img, page, b)
+    photo = _finish(img, 3)
+    q = find_page_quad(photo)
+    assert q.status == "multiple_pages", (q.status, q.notes)
+    main = min(corner_err(q.corners, gt).max() for gt in (a, b))
+    assert main < 3.0, (np.round(q.corners), q.notes)
+    other = b if corner_err(q.corners, a).max() < 3.0 else a
+    assert min(corner_err(f, other).max() for f in q.alternatives) < 3.0
+
+
+@pytest.mark.parametrize("seed,strength", [(501, 1.0), (502, 1.0)])
+def test_slide_with_bottom_color_band_is_not_curved(seed, strength):
+    """平的投影片底部有深色色帶（背景也深）：以前色帶的上緣被量成 25～53 px 的弓高、標 curved_edge，
+    四角誤差被放大到 74～158 px。現在不算彎曲，回報的四角誤差也要合理（< 對角線 1%）。"""
+    photo, gt = synth_photo("deck", seed, strength)
+    q = find_page_quad(photo)
+    diag = math.hypot(*photo.shape[:2])
+    assert q.status != "curved_edge", q.notes
+    assert corner_err(q.corners, gt).max() < 0.01 * diag
+    assert float(np.max(q.corner_error_px)) < 0.01 * diag, (q.corner_error_px, q.notes)
+    check_honest(q, gt, photo.shape, ("deck", seed, strength))
+
+
+def test_paper_inside_frame_but_not_found_is_not_cut_off():
+    """紙完整在畫面內，但右邊被大片反光蓋住：找不到時 status 要是 not_found（不是 cut_off，免得介面預選錯的框），
+    並提示可能有反光。"""
+    page = page_image("doc_a4", 60)
+    W, H = 900, 1100
+    img = _desk(W, H, 4) + 40.0
+    a = np.array([[140, 110], [700, 130], [735, 980], [105, 1000]], dtype=np.float64)
+    img = _warp_onto(img, page, a)
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    img = img + 255 * 1.6 * np.exp(-(((xx - 700) / 190) ** 2 + ((yy - 520) / 300) ** 2))[..., None]
+    photo = _finish(np.clip(img, 0, 255), 4)
+    q = find_page_quad(photo)
+    if q.method == "full_image":
+        assert q.status != "cut_off", q.notes
+    else:
+        check_honest(q, a, photo.shape, "glare")
+
+
+def test_closeup_without_paper_edges_is_not_framed():
+    """文字頁內部的特寫（畫面裡完全沒有紙邊）：以前輪廓退路把頁內的小表格當成紙。現在回整張圖、not_found。"""
+    page = page_image("doc_a4", 100)
+    h, w = page.shape[:2]
+    crop = np.ascontiguousarray(page[int(0.15 * h): int(0.6 * h), int(0.08 * w): int(0.92 * w)])
+    W, H = 1200, 900
+    dst = np.array([[-45, -30], [W + 38, -52], [W + 60, H + 45], [-30, H + 30]], dtype=np.float64)
+    img = _warp_onto(np.zeros((H, W, 3), np.float32), crop, dst)
+    photo = _finish(img, 5)
+    q = find_page_quad(photo)
+    assert q.method == "full_image" and q.status == "not_found", (q.method, q.status, q.notes)
+
+
+def _corner_case(band_on_paper: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """角點檢查用的小圖。band_on_paper=False：紙的上緣與背景之間有一條深色陰影楔形、上面是亮的布料折痕，
+    四邊形的上邊跟到折痕（創辦人照片的型態），左上角落在陰影上。True：紙的底部有深色色帶、背景也深（角點是對的）。"""
+    H, W = 420, 620
+    img = np.full((H, W, 3), 24.0, np.float32)
+    if not band_on_paper:
+        paper = np.array([[100, 100], [500, 90], [510, 380], [95, 390]], dtype=np.float64)
+        cv2.fillConvexPoly(img, np.int32(paper), (222, 222, 218))
+        cv2.fillConvexPoly(img, np.int32([[100, 80], [500, 90], [100, 100]]), (20, 20, 18))
+        cv2.line(img, (114, 76), (300, 81), (150, 140, 110), 6)
+        quad = np.array([[100, 80], [500, 90], [510, 380], [95, 390]], dtype=np.float64)
+        truth = paper
+    else:
+        paper = np.array([[100, 60], [500, 50], [510, 380], [95, 390]], dtype=np.float64)
+        cv2.fillConvexPoly(img, np.int32(paper), (222, 222, 218))
+        cv2.fillConvexPoly(img, np.int32([[96, 340], [508, 330], [510, 380], [95, 390]]), (24, 30, 44))
+        quad = truth = paper
+    return cv2.GaussianBlur(img, (0, 0), 1.0), quad, truth
+
+
+def test_corner_on_background_moves_to_paper_corner():
+    from mortise.recognition.page_geometry import _p, _snap_corners_to_paper
+
+    img, quad, truth = _corner_case(band_on_paper=False)
+    q2, moved = _snap_corners_to_paper(img, quad, _p(None))
+    assert [k for k, _ in moved] == [0], moved
+    assert np.linalg.norm(q2[0] - truth[0]) < 3.0, q2[0]
+    assert np.allclose(q2[1:], quad[1:])
+
+
+def test_corner_on_dark_band_of_paper_stays():
+    """紙底部的深色色帶貼著深色背景：角內外顏色接近，但角點是對的，不可移。"""
+    from mortise.recognition.page_geometry import _p, _snap_corners_to_paper
+
+    img, quad, truth = _corner_case(band_on_paper=True)
+    q2, moved = _snap_corners_to_paper(img, quad, _p(None))
+    assert moved == [] and np.allclose(q2, quad), moved

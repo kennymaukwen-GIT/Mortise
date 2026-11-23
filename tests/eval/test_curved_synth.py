@@ -92,3 +92,31 @@ def test_table_page_has_text_layer_and_grid():
     gray = img.mean(axis=2)
     dark_rows = (gray < 128).mean(axis=1) > 0.6  # 表格橫線：整列大半是黑的
     assert dark_rows.sum() >= 14
+
+
+def test_flat_corners_are_the_unfolded_corners():
+    """info["flat_corners"]：沒有折、捲的那片紙延伸到頁面四角的投影（捲角時四角偵測與透視攤平要找的角）。
+    平的紙與實體四角相同；捲角只有翹起的那個角不同；這組四角的透視對應，在平的那片紙上要對得上逐像素真值。"""
+    page, _ = _dots_page()
+    prm = dict(SMALL, curved_glare=False, curved_hard_shadow=False, curved_second_sheet=False)
+    _, _, info = S.degrade_curved(page, "flat", seed=3, params=prm)
+    assert np.allclose(info["flat_corners"], info["page_corners"], atol=1e-6)
+    _, pm, info = S.degrade_curved(page, "corner_curl", seed=4, params=prm)  # 右上角翹起，展平後的角差約 23 px
+    d = np.linalg.norm(np.array(info["flat_corners"]) - np.array(info["page_corners"]), axis=1)
+    assert (d > 2.0).sum() == 1, d
+    # 平的那片紙：照片像素 → 頁面座標，用 flat_corners 的單應矩陣預測，誤差要很小
+    h, w = page.shape[:2]
+    Hm = homography_from_points(np.array([[0, 0], [w, 0], [w, h], [0, h]], float), np.array(info["flat_corners"]))
+    ys, xs = np.mgrid[0:pm.shape[0]:7, 0:pm.shape[1]:7]
+    uv = pm[ys, xs]
+    ok = ~np.isnan(uv[..., 0])
+    k = int(np.argmax(d))
+    corner_uv = np.array([[0, 0], [w, 0], [w, h], [0, h]], float)[k]
+    far = ok & (np.hypot(uv[..., 0] - corner_uv[0], uv[..., 1] - corner_uv[1]) > 0.45 * min(w, h))  # 離翹起的角夠遠
+    Hi = np.linalg.inv(Hm)
+    x, y = xs[far] + 0.5, ys[far] + 0.5
+    den = Hi[2, 0] * x + Hi[2, 1] * y + Hi[2, 2]
+    pu = (Hi[0, 0] * x + Hi[0, 1] * y + Hi[0, 2]) / den
+    pv = (Hi[1, 0] * x + Hi[1, 1] * y + Hi[1, 2]) / den
+    err = np.hypot(pu - uv[..., 0][far], pv - uv[..., 1][far])
+    assert np.percentile(err, 95) < 1.5, np.percentile(err, 95)
