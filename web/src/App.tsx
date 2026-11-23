@@ -13,6 +13,7 @@ import * as storage from "./lib/storage";
 import type { RecentJob } from "./lib/storage";
 import { initialState, isWorking, reducer } from "./state/store";
 import { useController } from "./state/useController";
+import { useFeedback } from "./state/useFeedback";
 
 const FALLBACK_FORMATS: FormatInfo[] = Object.entries(FORMAT_LABELS_EN).map(([format, label_en]) => ({ format, label: label_en, label_en, available: false }));
 
@@ -92,6 +93,18 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   }, []);
 
   const ctl = useController(state, dispatch, { maxMb, accepted, presets, formats: formats ?? [], allowTraining, onRecent, onRecentRemoved, notify });
+  const feedback = useFeedback(state.jobId, state.phase === "done", state.resultVersion);
+  const exportFeedback = useCallback(async () => {
+    const id = state.jobId;
+    if (!id) return;
+    const base = (state.jobFilename ?? "mortise").replace(/\.[^.]+$/, "");
+    try {
+      const name = await api.downloadFeedbackBundle(id, `${base}.mortise-feedback.zip`);
+      setToast(t("file.exported", { name }));
+    } catch (e) {
+      setToast(t("file.exportFailed", { msg: e instanceof Error ? e.message : String(e) }));
+    }
+  }, [state.jobId, state.jobFilename, t]);
 
   // The job on screen is part of the address (?job=…), so a reload or a shared tab comes back to it.
   const started = useRef(false);
@@ -159,6 +172,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
             onDelete={() => void ctl.deleteFromServer()}
             canStartOver={state.phase !== "empty" && !isWorking(state)}
             canOpen={!isWorking(state)}
+            onExportFeedback={() => void exportFeedback()}
           />
           <AccountMenu
             lang={lang}
@@ -202,6 +216,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
           onCancel={() => void ctl.cancel()}
           onRetry={() => void ctl.retry()}
           onCorrect={ctl.correct}
+          feedback={feedback}
         />
         <SettingsCard
           state={state}
@@ -211,6 +226,7 @@ function Shell({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
           presets={presets}
           onConvert={() => formatsReady && void ctl.convert()}
           onConvertAgain={ctl.convertAgain}
+          feedback={feedback}
         />
       </main>
 

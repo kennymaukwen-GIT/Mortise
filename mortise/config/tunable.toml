@@ -86,3 +86,35 @@ min = 0.0
 max = 3.0
 step = 0.25
 note = "頁面尺寸吸附到標準規格的容差（pt）"
+
+# ---- ② 頁面（照片）：改這些會從②重跑；只改確認門檻時工作影像不變，③沿用快取 ----
+# 前兩個只決定「要不要請使用者確認四角」，不改輸出：用回饋庫裡使用者拖過的四角（system_value.within_tolerance 與信心值）校準最有效。
+# 範圍是工程判斷（合成照片 193 張的校準見 default.toml 的說明），待真實照片校正。
+
+[[param]]
+path = "page.quad_review_confidence"
+min = 0.3
+max = 0.85
+step = 0.05
+note = "照片的頁面四角信心值低於此值就請使用者確認（也決定 status 是否為 ok）"
+
+[[param]]
+path = "page.quad_max_corner_err_frac"
+min = 0.004
+max = 0.03
+step = 0.002
+note = "任一角的估計誤差超過影像對角線的此比例，就請使用者確認四角"
+
+[[param]]
+path = "page.dewarp_bow_px"
+min = 1.0
+max = 6.0
+step = 0.5
+note = "紙邊弓高超過 max(此值, 0.2% 邊長) 像素才算彎曲（彎的紙才攤平）"
+
+[[param]]
+path = "page.dewarp_flat_sag_median_pct"
+min = 0.05
+max = 0.3
+step = 0.025
+note = "頁內格線與文字行離直線的最大距離（佔頁寬 %）中位數低於此值才算平的紙（平的紙只做透視攤平）"

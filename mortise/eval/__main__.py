@@ -10,6 +10,12 @@
   python -m mortise.eval calibrate 標註.jsonl [--stage 3] [--field font_size]
   python -m mortise.eval vector --out 輸出目錄 [--samples 真實樣本目錄] [--limit N] [--variants clean,jpeg,...] [--no-vtracer]
                          [--baseline 基準.json] [--save-baseline 基準.json]      描圖向量化評測
+  python -m mortise.eval scorecard [--quick] --out 目錄 [--jobs 2] [--seed 0] [--config 覆寫檔.toml]   引擎成績單（見 scorecard.py）
+  python -m mortise.eval scorecard compare 舊.json 新.json [--gate 指標=容許量 ...]          比較兩份成績單，退步超過門檻時結束碼 1
+  python -m mortise.eval ocr-dataset --out 目錄 [--from-fixtures] [--pdf PDF ...] [--from-feedback 回饋來源 ...] [--include-unconsented]
+                         文字辨識（PaddleOCR 辨識模型）訓練資料（見 ocr_dataset.py）
+  python -m mortise.eval ocr-model 微調後.onnx --dict dict.txt --out 放回用.onnx   把字典寫進模型、檢查能不能用
+  python -m mortise.eval feedback-import 匯出的.mortise-feedback.zip --store 回饋庫目錄      也接受網頁匯出的回饋包
 
 樣本目錄的放法見 mortise/eval/runner.py 開頭的說明。
 """
@@ -26,6 +32,11 @@ from ..config import Config
 
 
 def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "scorecard":  # 成績單有自己的子指令（compare），整段交給它解析
+        from .scorecard import main_cli
+
+        return main_cli(args[1:], lambda s: print(s, file=sys.stderr))
     ap = argparse.ArgumentParser(prog="python -m mortise.eval", description="Mortise 評測、回饋與自動調參")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="批次評測")
@@ -50,8 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     tt = sub.add_parser("truth-template", help="由流水線結果產生標準答案草稿")
     tt.add_argument("file", type=Path)
     tt.add_argument("--out", type=Path)
-    fi = sub.add_parser("feedback-import", help="匯入樣本目錄中的 .feedback.json")
-    fi.add_argument("samples", type=Path)
+    fi = sub.add_parser("feedback-import", help="匯入樣本目錄中的 .feedback.json，或網頁匯出的回饋包（.mortise-feedback.zip）")
+    fi.add_argument("samples", type=Path, help="樣本目錄或回饋包")
     fi.add_argument("--store", type=Path, required=True)
     an = sub.add_parser("annotations", help="把回饋轉成標註資料（JSONL）")
     an.add_argument("--store", type=Path, required=True)
@@ -73,7 +84,23 @@ def main(argv: list[str] | None = None) -> int:
     vb.add_argument("--save-baseline", type=Path, help="把這次的分組數字存成基準檔")
     vb.add_argument("--seed", type=int)
     vb.add_argument("--config", type=Path)
-    a = ap.parse_args(argv)
+    sub.add_parser("scorecard", help="引擎成績單：scorecard [--quick] --out 目錄；scorecard compare 舊.json 新.json", add_help=False)
+    od = sub.add_parser("ocr-dataset", help="文字辨識（PaddleOCR 辨識模型）訓練資料")
+    od.add_argument("--out", type=Path, required=True)
+    od.add_argument("--from-fixtures", action="store_true", help="用 tests/fixtures 的原生 PDF 自我監督產生")
+    od.add_argument("--pdf", type=Path, action="append", default=[], help="另外加入的原生 PDF（檔案或目錄，可重複；授權要自己確認）")
+    od.add_argument("--from-feedback", type=Path, action="append", default=[], help="回饋來源：回饋庫目錄、匯出的 .mortise-feedback.zip 或工作目錄（可重複）")
+    od.add_argument("--jobs-root", type=Path, help="工作目錄的根目錄（讀回饋時找工作影像用，預設 MORTISE_JOBS 或 ./jobs）")
+    od.add_argument("--variants", default="clean,screenshot,scan,photo", help="原生 PDF 要做的干擾（逗號分隔；clean 表示不加干擾）")
+    od.add_argument("--seed", type=int, default=0)
+    od.add_argument("--max-pages", type=int, default=5, help="每份 PDF 最多用幾頁")
+    od.add_argument("--val", type=float, default=0.1, help="驗證集比例（依行數逼近；依頁切分，同一頁的行不會分到兩邊）")
+    od.add_argument("--include-unconsented", action="store_true", help="也收沒有勾選「同意用於改善辨識」或同意狀態不明的回饋（確定是你自己的資料時）")
+    om = sub.add_parser("ocr-model", help="把字典寫進微調好的辨識模型 ONNX，檢查能不能給 Mortise 用，並印出換上的設定")
+    om.add_argument("onnx", type=Path, help="paddle2onnx 轉出來的辨識模型")
+    om.add_argument("--dict", type=Path, required=True, help="訓練時用的字典（ocr-dataset 輸出的 dict.txt，或你擴充過的版本）")
+    om.add_argument("--out", type=Path, required=True, help="寫出的 ONNX（放在固定的位置，設定檔會指到它）")
+    a = ap.parse_args(args)
     say = lambda s: print(s, file=sys.stderr)  # noqa: E731
 
     if a.cmd == "run":
@@ -110,7 +137,24 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "feedback-import":
         from .feedback import FeedbackStore
 
-        print(f"匯入 {FeedbackStore(a.store).import_sample_dir(a.samples)} 份回饋")
+        store = FeedbackStore(a.store)
+        if a.samples.is_file() and a.samples.suffix.lower() == ".zip":  # 網頁匯出的回饋包
+            fb = store.import_bundle(a.samples)
+            print(f"匯入 1 份回饋包：{fb.sample}（修正 {len(fb.corrections)} 筆、評分 {len(fb.page_ratings)} 筆）")
+            return 0
+        print(f"匯入 {store.import_sample_dir(a.samples)} 份回饋")
+        return 0
+    if a.cmd == "ocr-dataset":
+        from .ocr_dataset import build_dataset
+
+        if not a.from_fixtures and not a.pdf and not a.from_feedback:
+            print("要給資料來源：--from-fixtures、--pdf 或 --from-feedback", file=sys.stderr)
+            return 2
+        res = build_dataset(a.out, from_fixtures=a.from_fixtures, pdfs=a.pdf, feedback=a.from_feedback, jobs_root=a.jobs_root,
+                            variants=[v for v in a.variants.split(",") if v.strip()], seed=a.seed, max_pages=a.max_pages, val_fraction=a.val,
+                            include_unconsented=a.include_unconsented, say=say)
+        print(f"寫出 {res['n_lines']} 行（訓練 {res['n_train']}、驗證 {res['n_val']}（{100 * res['val_fraction_actual']:.1f}%）；自我監督 {res['by_source'].get('self_supervised', 0)}、"
+              f"使用者修正 {res['by_source'].get('user_correction', 0)}）；字典外的字 {len(res['out_of_dict'])} 個：{a.out}")
         return 0
     if a.cmd == "annotations":
         from .feedback import FeedbackStore, correction_stats, read_annotations
@@ -134,6 +178,18 @@ def main(argv: list[str] | None = None) -> int:
         tab = calibration_from_annotations(read_annotations(a.annotations), a.stage, a.field)
         print(json.dumps(tab.to_dict(), ensure_ascii=False, indent=1))
         return 0 if tab.sufficient else 3
+    if a.cmd == "ocr-model":
+        from .ocr_dataset import embed_dictionary
+
+        try:
+            info = embed_dictionary(a.onnx, a.dict, a.out)
+        except (OSError, ValueError, RuntimeError) as e:
+            print(f"不能用：{e}", file=sys.stderr)
+            return 2
+        print(f"可以用：字典 {info['dict_size']} 個字、模型輸出 {info['model_classes']} 類。換上的方法：設定覆寫檔（例如 new_ocr.toml）寫")
+        print(f"\n[recognize.ocr_params]\nrec_model_path = \"{a.out.resolve()}\"\n")
+        print("再跑 python -m mortise.eval scorecard --config new_ocr.toml --out 目錄，用 scorecard compare 和舊的成績單比，沒有退步才採用。")
+        return 0
     if a.cmd == "vector":
         from . import vector_bench as vbm
 

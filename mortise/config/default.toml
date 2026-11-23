@@ -32,14 +32,14 @@ enhance_photos = true                # 照片與掃描檔先去陰影、白平�
 enhance_max_flat = 0.25              # 照片模式下，攤平後的頁面若有這個比例以上的成片完全同色像素（平塗的數位畫面），就不做去陰影與白平衡（初始值）
 enhance_flat_window = 9              # 「成片完全同色」的鄰域邊長（像素），要大於 JPEG 的 8×8 區塊
 enhance_uniform_max = 0.03           # 照片模式、找不到紙張四邊時，底色亮度落差（p95−p5）÷ 中位數低於此值就不做去陰影與白平衡（紙紋主題的截圖 0.004、合成手機照片 0.2 以上；初始值）
-# ---- 彎曲的紙攤平（recognition/dewarp.py；由 page_geometry.rectify 的 params["dewarp"] 開啟，s2 下一輪接進流程）----
+# ---- 彎曲的紙攤平（recognition/dewarp.py；②照片路線以 page_geometry.rectify 的 params["dewarp"] = dewarp_photos 開啟）----
 dewarp_photos = true                 # 照片判定紙是彎的（弓起、捲起、折痕）才攤平；平的紙只做透視攤平
 dewarp_uvdoc = "auto"                # 學習式外框候選 UVDoc（MIT）："auto" 第一次使用時下載到使用者快取並驗證 SHA-256、"cache_only" 不下載、"off" 不用
 dewarp_flat_sag_median_pct = 0.1     # 判定平的紙：頁內格線與文字行離直線的最大距離（佔頁寬 %）中位數低於此值……（合成資料初定，要用真實照片校正）
 dewarp_flat_sag_max_pct = 0.3        # ……而且第二大的線也低於此值
 dewarp_bow_px = 2.0                  # 判定紙邊彎曲：弓高超過 max(此值, 0.2% 邊長)（原照片像素）
 enhance_fine_side = 1600             # 去陰影時估照度圖的縮圖長邊（像素）：越大陰影的硬邊越準，越慢
-# ---- 照片裡找紙張邊界（recognition/page_geometry.find_page_quad；s2 下一輪接進流程）----
+# ---- 照片裡找紙張邊界（recognition/page_geometry.find_page_quad；②照片路線使用，下面兩個門檻同時決定 status 與要不要請使用者確認）----
 quad_review_confidence = 0.6         # 頁面四角的信心值低於此值、或 status 不是 ok，就請使用者拖曳四角確認（與 page_geometry 的 review_conf 相同；
                                      # 合成照片 193 張校準：信心 ≥ 0.6 的 97 張中 1 張四角誤差超過對角線 1%）
 quad_max_corner_err_frac = 0.01      # 任一角的估計誤差超過影像對角線的此比例，也請使用者確認（與 page_geometry 的 max_corner_err_frac 相同）
@@ -149,6 +149,10 @@ region_overlay_translucent_ratio = 0.05  # 頁面底色完全乾淨時，色塊�
 region_overlay_full_bleed = true     # 滿版照片（沒有頁面底色）也找疊在上面的平塗圖形；找不到就照原本的讀法
 region_overlay_fill_quality_warn = 0.5  # 補出來的地方的中尺度紋理不到周圍的此比例時，在 notes 提醒移動圖形會看得出是補的
 region_overlay_collinear_px = 3.5    # 疊在照片上的多邊形：頂點離前後兩頂點連線不到這麼多像素就併掉（JPEG 的振鈴把直邊壓出 1.5–3 px 的凹凸；初始值）
+# ---- 無框線表格與兩欄版面（recognition/regions.py 的 _bl_column_flow）----
+region_bl_flow_pair_min = 0.8        # 無框線表格候選的每一欄往上下延伸成「欄的文字流」後，有別欄同高鄰居的行至少要佔這個比例，
+                                     # 不然是兩欄版面（各欄自己排、只是剛好幾行同高），不當表格。量到：兩欄的虛構文件與真實履歷 0.27–0.68，
+                                     # 價目表、課表 1.00（初始值；設成 0 就是修正前的行為）
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）
@@ -162,6 +166,8 @@ master_min_pages = 3                 # 至少幾頁才做跨頁母片分析
 master_repeat_ratio = 0.6            # 元素在超過此比例的頁面重複出現，列為母片候選
 ai_role_confidence = 0.7             # 有段落的角色信心值低於此值，就請大型 AI 判斷角色與閱讀順序
 ai_min_paragraphs = 2                # 段落少於此數不必問 AI
+table_flow_min_continuations = 2     # ③推得的無框線表格裡，有這麼多處句子從上一列接到下一列（段落換行、項目的第二行），
+                                     # 就當成兩欄版面的段落、不做成表格（stages/s4_structure.py 的 _sentences_cross_rows）
 
 [settings]                           # ⑤ 設定
 size_snap_step_pt = 0.5              # 字級吸附的格距（pt）

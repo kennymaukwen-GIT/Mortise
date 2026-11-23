@@ -19,7 +19,9 @@
     GET  /api/jobs/{id}/events               進度串流（Server-Sent Events）
     GET  /api/jobs/{id}/report               還原度報告
     GET  /api/jobs/{id}/pages                各頁尺寸與預覽圖網址
-    GET  /api/jobs/{id}/pages/{n}/image      預覽圖：original（原圖）、result（某個輸出格式的成品渲染）、overlay（疊圖）
+    GET  /api/jobs/{id}/pages/{n}/image      預覽圖：original（原圖）、result（某個輸出格式的成品渲染）、overlay（疊圖）、
+                                             source（照片未攤平的原始畫面，拖曳四角用）
+    GET  /api/jobs/{id}/pages/{n}/geometry   頁面幾何：照片裡找到的紙張四角、狀態、其他候選、是否需要使用者確認
     GET  /api/jobs/{id}/pages/{n}/elements   可修正的元素清單（文字框、表格、圖片、形狀，含信心值與問題）
     POST /api/jobs/{id}/corrections          送出修正，只從受影響的階段重跑
     GET  /api/jobs/{id}/download/{format}    下載輸出檔（format 為輸出格式或 report）
@@ -64,6 +66,7 @@ from ..stages import s6_export
 from ..tools import pdfium as pdf
 from ..tools.units import to_pt
 from ..verify.lines import CODES as LINE_CODES
+from .feedback_api import router as feedback_router
 from .jobs import JobManager
 
 CFG = Config.load()
@@ -352,7 +355,9 @@ def _outputs_summary(pipe) -> list[dict[str, Any]]:
 @app.get("/api/jobs/{job_id}/pages")
 def job_pages(job_id: str) -> list[dict[str, Any]]:
     """各頁的尺寸（輸出頁面，pt）、原始內容在輸出頁面上的位置（placement；沒有指定輸出尺寸時為 null）與預覽圖網址。
-    images 的 result、overlay 不帶 format，畫的是這份工作的第一個輸出格式；result_images 列出每個輸出格式各自的網址。"""
+    images 的 result、overlay 不帶 format，畫的是這份工作的第一個輸出格式；result_images 列出每個輸出格式各自的網址。
+    needs_review：照片的頁面四角需要使用者確認；quad_status：照片的頁面偵測狀態（見 geometry 端點；PDF 與截圖為 null）；
+    geometry：頁面幾何的網址。"""
     pipe = _job(job_id)
     doc = _load(pipe, "s1/source_doc", SourceDoc)
     styled = pipe.store.load("s5/styled_doc", StyledDoc) if pipe.store.has("s5/styled_doc") else None
@@ -361,6 +366,7 @@ def job_pages(job_id: str) -> list[dict[str, Any]]:
     for ref in doc.pages:
         n = ref.page_index + 1
         item: dict[str, Any] = {"page": n, "input_type": ref.input_type.value.value, "input_type_confidence": ref.input_type.confidence, "placement": None}
+        spec = None
         if pipe.store.has(f"s2/page-{n:03d}"):
             spec = pipe.store.load(f"s2/page-{n:03d}", PageSpec)
             item.update({"width_pt": spec.page_width_pt.value, "height_pt": spec.page_height_pt, "size_source": spec.page_width_pt.source.value, "size_confidence": spec.page_width_pt.confidence, "notes": spec.notes})
@@ -369,9 +375,15 @@ def job_pages(job_id: str) -> list[dict[str, Any]]:
             sp = styled.pages[ref.page_index]
             item.update({"width_pt": sp.width_pt, "height_pt": sp.height_pt, "placement": _box_json(sp.placement) if sp.placement else None})
         base = f"/api/jobs/{job_id}/pages/{n}/image"
-        item["images"] = {k: f"{base}?kind={k}" for k in ("original", "result", "overlay")}
+        item["images"] = {k: f"{base}?kind={k}" for k in ("original", "result", "overlay", "source")}
         item["result_images"] = {f: f"{base}?kind=result&format={f}" for f in outputs}
         item["elements"] = f"/api/jobs/{job_id}/pages/{n}/elements"
+        # 頁面幾何（照片要不要請使用者確認四角）：詳細內容在 geometry 網址；PDF 與截圖 needs_review 為 false、quad_status 為 null
+        item["needs_review"], item["quad_status"] = False, None
+        if spec is not None and ref.input_type.value.value == "photo":
+            item["needs_review"] = bool(spec.quad_needs_review) and spec.quad_method != "user"
+            item["quad_status"] = "user" if spec.quad_method == "user" else spec.quad_status
+        item["geometry"] = f"/api/jobs/{job_id}/pages/{n}/geometry"
         out.append(item)
     return out
 
@@ -522,11 +534,13 @@ def _cached_png(pipe, job_id: str, key: str, stamp: str, make, cacheable: bool =
 
 @app.get("/api/jobs/{job_id}/pages/{n}/image")
 def page_image(
-    request: Request, job_id: str, n: int, kind: Literal["original", "result", "overlay"] = "original",
+    request: Request, job_id: str, n: int, kind: Literal["original", "result", "overlay", "source"] = "original",
     width: int = Query(1200, ge=100, le=4000), format: Optional[str] = Query(None, description="result、overlay 要畫哪個輸出格式；省略時用這份工作的第一個輸出格式"),
 ) -> Response:
     """original：原圖（攤平後的工作影像）；result：某個輸出格式的成品畫出來的樣子；
-    overlay：兩者半透明疊在一起，並用紅框標出低信心或有問題的元素。
+    overlay：兩者半透明疊在一起，並用紅框標出低信心或有問題的元素；
+    source：未攤平的原圖（照片的原始畫面，套用 EXIF 方向後；geometry 端點的四角就是這張圖的像素座標，寬為 width 時座標乘上 width ÷ 原圖寬）。
+    影像上傳後就有 source（不必等處理完）；原生 PDF 沒有「未攤平的原圖」，source 與 original 相同。
 
     format（只對 result、overlay 有意義）：pdf、ai_pdf 用 PDFium 直接畫輸出檔；svg 用 resvg 現畫（不行就用驗證時的渲染）；
     pptx 用⑦以 LibreOffice 轉出的 PDF；其他格式或沒有渲染結果時，退回成品文件的中性渲染（ai_pdf 輸出器畫出來的 PDF）。
@@ -539,6 +553,11 @@ def page_image(
     intent = _intent(pipe)
     if pipe.store.has("s1/source_doc") and not 1 <= n <= len(pipe.store.load("s1/source_doc", SourceDoc).pages):
         raise HTTPException(404, "沒有這一頁。")
+    if kind == "source":
+        src = _source_image_path(pipe)
+        if src is not None:
+            return _source_image(request, pipe, job_id, n, width, src)
+        kind = "original"  # 原生 PDF：沒有未攤平的原圖，給工作影像
     fmt = None
     if kind != "original":
         if format is None:
@@ -612,6 +631,132 @@ def page_image(
     if meta.get("render"):
         headers["X-Mortise-Render"] = meta["render"]
     return Response(data, media_type="image/png", headers=headers)
+
+
+def _source_image_path(pipe) -> Optional[Path]:
+    """上傳的檔案是影像（PNG、JPEG）時回傳它的路徑；PDF 或讀不到時回傳 None。"""
+    rel = pipe.state.get("source")
+    if not rel:
+        return None
+    path = pipe.dir / rel
+    if not path.exists():
+        return None
+    if pipe.store.has("s1/source_doc"):
+        return None if pipe.store.load("s1/source_doc", SourceDoc).media_type == "application/pdf" else path
+    try:
+        with Image.open(path) as im:
+            return path if im.format in ("PNG", "JPEG", "MPO") else None
+    except Exception:
+        return None
+
+
+def _source_image(request: Request, pipe, job_id: str, n: int, width: int, path: Path) -> Response:
+    """未攤平的原圖（套用 EXIF 方向後，與②找四角用的是同一張），縮放到寬 width。影像只有一頁。"""
+    from PIL import ImageOps
+
+    if n != 1:
+        raise HTTPException(404, "沒有這一頁。")
+    stt = path.stat()
+    stamp = hashlib.sha256(f"{_RENDER_VERSION}|{path.name}|{stt.st_size}|{stt.st_mtime_ns}".encode("utf-8")).hexdigest()[:16]
+    key = f"source-p{n}-w{width}"
+    etag = f'"{stamp}-{key}"'
+    headers = {"Cache-Control": "private, no-cache", "ETag": etag, "X-Mortise-Render": "source"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+
+    def make():
+        with Image.open(path) as im0:
+            im = ImageOps.exif_transpose(im0).convert("RGB")
+        im = im.resize((width, max(1, round(width * im.size[1] / im.size[0]))), Image.LANCZOS)
+        return im, {"render": "source"}
+
+    data, _ = _cached_png(pipe, job_id, key, stamp, make, cacheable=width in _CACHED_WIDTHS)
+    return Response(data, media_type="image/png", headers=headers)
+
+
+# ---------------------------------------------------------------------- 頁面幾何（照片的四角確認）
+
+
+def _pt_list(points) -> list[list[float]]:
+    return [[round(float(p.x), 2), round(float(p.y), 2)] for p in points]
+
+
+@app.get("/api/jobs/{job_id}/pages/{n}/geometry")
+def page_geometry(job_id: str, n: int) -> dict[str, Any]:
+    """頁面幾何：照片裡找到的紙張四角（原圖像素，左上、右上、右下、左下）、狀態、其他候選、彎曲外框、攤平與反光，
+    以及要不要請使用者確認（needs_review、review_reason）。
+
+    status：ok、low_contrast（邊緣不清楚）、curved_edge（紙邊彎曲）、multiple_pages（不只一張紙）、cut_off（紙超出畫面）、
+    not_found（找不到紙，用整張圖）、user（使用者拉過四角）、not_photo（原生 PDF 或截圖：整張就是頁面，不必確認）。
+    使用者確認四角：POST /api/jobs/{id}/corrections，[{"field": "corners", "page": n, "value": [[x, y] × 4]}]（原圖像素）；
+    選「整張圖當頁面」就送原圖的四個角。送出後工作從②重跑。
+    還沒處理到②、或剛送出四角修正而②還沒重跑完時回 409。"""
+    pipe = _job(job_id)
+    doc = _load(pipe, "s1/source_doc", SourceDoc)
+    if not 1 <= n <= len(doc.pages):
+        raise HTTPException(404, "沒有這一頁。")
+    ref = doc.pages[n - 1]
+    spec = _load(pipe, f"s2/page-{n:03d}", PageSpec)
+    itype = ref.input_type.value.value
+    pending = [c for c in pipe.corrections if c.field == "corners" and (c.page_index or 0) == n - 1]
+    if pending and JOBS.status(job_id)["status"] in ("queued", "running") and not _same_corners(spec, pending[-1].new_value):
+        raise HTTPException(409, "正在依你拉的四角重新處理這一頁，請稍候。")
+    image_url = f"/api/jobs/{job_id}/pages/{n}/image?kind=source"
+    if doc.media_type == "application/pdf":
+        w, h = spec.working_image_size
+        return {
+            "page": n, "input_type": itype, "source": {"width": int(w), "height": int(h), "image": image_url},
+            "corners": [[0.0, 0.0], [float(w), 0.0], [float(w), float(h)], [0.0, float(h)]], "method": spec.quad_method or "pdf_box",
+            "confidence": float(spec.quad_confidence), "status": "not_photo", "corner_error_px": None, "needs_review": False, "review_reason": "",
+            "alternatives": [], "preselect": None, "outline": None,
+            "dewarp": {"applied": False, "source": None, "residual_px": None, "needs_review": False},
+            "glare": None, "user_set": False, "notes": list(spec.notes),
+        }
+    if spec.source_size:
+        sw, sh = spec.source_size
+    else:  # 舊版②的產物沒有記原圖大小：讀原圖
+        path = _source_image_path(pipe)
+        sw, sh = ref.pixel_size if path is None else _exif_size(path)
+    user_set = spec.quad_method == "user"
+    photo = itype == "photo"
+    status = "user" if user_set else (spec.quad_status if photo else "not_photo")
+    needs = bool(spec.quad_needs_review) and photo and not user_set
+    alts = []
+    for i, pts in enumerate(spec.quad_alternatives):
+        alts.append({"corners": _pt_list(pts),
+                     "score": float(spec.quad_alternative_scores[i]) if i < len(spec.quad_alternative_scores) else 0.0,
+                     "label": spec.quad_alternative_labels[i] if i < len(spec.quad_alternative_labels) else "其他候選"})
+    pre = spec.quad_preselect if spec.quad_preselect is not None and 0 <= spec.quad_preselect < len(alts) and not user_set else None
+    return {
+        "page": n, "input_type": itype, "source": {"width": int(sw), "height": int(sh), "image": image_url},
+        "corners": _pt_list(spec.source_corners), "method": spec.quad_method, "confidence": float(spec.quad_confidence),
+        "status": status, "corner_error_px": [float(v) for v in spec.quad_corner_error_px] if (spec.quad_corner_error_px and not user_set) else None,
+        "needs_review": needs, "review_reason": spec.quad_review_reason if needs else "",
+        "alternatives": alts, "preselect": pre,
+        "outline": _pt_list(spec.source_outline) if spec.source_outline else None,
+        "dewarp": {"applied": spec.dewarp_map is not None, "source": spec.dewarp_source or None,
+                   "residual_px": spec.dewarp_residual_px, "needs_review": bool(spec.dewarp_needs_review)},
+        "glare": spec.glare_frac, "user_set": user_set, "notes": list(spec.notes),
+    }
+
+
+def _same_corners(spec: PageSpec, value: Any) -> bool:
+    """②的四角是不是已經是這張修正單的四角（②已經依它重跑完）。"""
+    if spec.quad_method != "user":
+        return False
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in value]
+        cur = sorted((float(p.x), float(p.y)) for p in spec.source_corners)
+        return len(pts) == 4 and all(abs(a[0] - b[0]) <= 0.5 and abs(a[1] - b[1]) <= 0.5 for a, b in zip(sorted(pts), cur))
+    except (TypeError, ValueError, IndexError):
+        return True  # 修正單格式不對（②會略過它）：不必等
+
+
+def _exif_size(path: Path) -> tuple[int, int]:
+    from PIL import ImageOps
+
+    with Image.open(path) as im:
+        return ImageOps.exif_transpose(im).size
 
 
 def _flagged(report: FidelityReport, page_index: int, fmt: Optional[OutputFormat] = None) -> dict[str, list[str]]:
@@ -728,6 +873,9 @@ def post_feedback(job_id: str, fb: FeedbackIn) -> dict[str, Any]:
     _job(job_id)
     path = JOBS.save_feedback(job_id, fb.model_dump())
     return {"ok": True, "id": path.stem}
+
+
+app.include_router(feedback_router)  # GET /api/jobs/{id}/feedback、/feedback/export、/api/engine（見 feedback_api.py）
 
 
 # ====================================================================== 下載與刪除

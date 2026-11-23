@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { getEngine } from "../api/client";
+import type { EngineInfo } from "../api/types";
 import type { Lang } from "../i18n/dict";
 import { useI18n } from "../i18n/I18n";
 import { shortName } from "../lib/files";
@@ -26,6 +28,54 @@ function when(ms: number, lang: Lang): string {
   }
 }
 
+function pct(v: unknown, digits = 0): string | null {
+  return typeof v === "number" && Number.isFinite(v) ? (v * 100).toFixed(digits) : null;
+}
+
+/** "About": the recognition engine's version (GET /api/engine) and its latest test run. */
+function EngineAbout({ engine, failed }: { engine: EngineInfo | null; failed: boolean }) {
+  const { t, lang } = useI18n();
+  const card = engine?.scorecard ?? null;
+  const fid = pct(card?.headline?.e2e_score?.mean);
+  const cer = pct(card?.headline?.page_cer?.mean, 1);
+  const date = typeof card?.created === "string" ? card.created.slice(0, 10) : "";
+  return (
+    <section className="acct-section" aria-labelledby="acct-about" data-testid="engine-about">
+      <h2 className="acct-heading" id="acct-about">
+        {t("account.about")}
+      </h2>
+      {!engine ? (
+        <p className="acct-muted">{failed ? t("account.engineUnknown") : t("account.engineLoading")}</p>
+      ) : (
+        <>
+          <p className="acct-engine">
+            <span>{t("account.engine")}</span>
+            <strong lang={engine.name && /[\u3400-\u9fff]/.test(engine.name) ? "zh-Hant" : undefined} data-testid="engine-name">
+              {engine.name || "—"}
+            </strong>
+          </p>
+          <p className="acct-version">
+            {t("account.engineVersion")} <code data-testid="engine-version">{engine.version}</code>
+          </p>
+          {card ? (
+            <p className="acct-muted">
+              {t("account.scorecard", { date, suite: String(card.suite ?? "") })}
+              {fid && ` · ${t("account.scoreFidelity", { pct: fid })}`}
+              {cer && ` · ${t("account.scoreCer", { pct: cer })}`}
+              {card.matches_current === false && ` ${t("account.scorecardOld")}`}
+            </p>
+          ) : (
+            <p className="acct-muted">{t("account.noScorecard")}</p>
+          )}
+          <p className="acct-muted" lang={lang}>
+            {t("account.engineHint")}
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
 export function AccountMenu(p: AccountMenuProps) {
   const { t, lang } = useI18n();
   const [open, setOpen] = useState(false);
@@ -42,6 +92,20 @@ export function AccountMenu(p: AccountMenuProps) {
   useEffect(() => {
     if (open) panel.current?.focus();
   }, [open]);
+  // The engine version is read the first time the menu opens (it does not change while the server runs).
+  const [engine, setEngine] = useState<EngineInfo | null>(null);
+  const [engineFailed, setEngineFailed] = useState(false);
+  useEffect(() => {
+    if (!open || engine) return;
+    let alive = true;
+    setEngineFailed(false);
+    getEngine()
+      .then((e) => alive && setEngine(e))
+      .catch(() => alive && setEngineFailed(true));
+    return () => {
+      alive = false;
+    };
+  }, [open, engine]);
 
   const langs: { id: Lang; label: string }[] = [
     { id: "en", label: t("lang.en") },
@@ -167,6 +231,8 @@ export function AccountMenu(p: AccountMenuProps) {
               </ul>
             )}
           </section>
+
+          <EngineAbout engine={engine} failed={engineFailed} />
         </PopoverPanel>
       )}
     </div>

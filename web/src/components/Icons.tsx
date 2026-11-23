@@ -99,6 +99,29 @@ export const Pencil = (p: P) => (
     <path d="M4 20h4L19 9l-4-4L4 16z" />
   </svg>
 );
+/** Four corner marks: adjust the page's corners. */
+export const Corners = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" />
+  </svg>
+);
+export const More = (p: P) => (
+  <svg {...base(p)} stroke="none" fill="currentColor">
+    <circle cx="5" cy="12" r="2" />
+    <circle cx="12" cy="12" r="2" />
+    <circle cx="19" cy="12" r="2" />
+  </svg>
+);
+export const Flag = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M5 21V4M5 4h11l-2 4 2 4H5" />
+  </svg>
+);
+export const Star = ({ filled, ...p }: P & { filled?: boolean }) => (
+  <svg {...base(p)} fill={filled ? "currentColor" : "none"} strokeWidth={1.7}>
+    <path d="m12 3.2 2.7 5.6 6.1.8-4.5 4.2 1.1 6-5.4-2.9-5.4 2.9 1.1-6-4.5-4.2 6.1-.8z" />
+  </svg>
+);
 export const User = (p: P) => (
   <svg {...base(p)} strokeWidth={1.6}>
     <circle cx="12" cy="9" r="3.5" />

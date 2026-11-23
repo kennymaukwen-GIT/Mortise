@@ -1,11 +1,14 @@
-import { useId, useRef, useState, type Dispatch } from "react";
+import { useEffect, useId, useRef, useState, type Dispatch } from "react";
 import { downloadUrl } from "../api/client";
 import type { FormatInfo, PageSizePreset } from "../api/types";
 import { useI18n } from "../i18n/I18n";
 import { formatLabel, shortFormatLabel } from "../lib/catalog";
 import { fmtMm, orient, ptToMm, SIZE_MAX_MM, SIZE_MIN_MM, type Orientation } from "../lib/units";
 import { blocks, effectiveOrientation, resolveOrigin, resolveTarget, sourceOrientation } from "../state/derive";
+import { ratingFeedback } from "../state/feedback";
 import type { Action, State } from "../state/store";
+import type { FeedbackState } from "../state/useFeedback";
+import { FeedbackNote, RatingStars, SavedCount } from "./Feedback";
 import { ArrowCircle, Caret, Landscape, Portrait } from "./Icons";
 
 export interface SettingsCardProps {
@@ -16,6 +19,38 @@ export interface SettingsCardProps {
   presets: PageSizePreset[];
   onConvert: () => void;
   onConvertAgain: () => void;
+  /** Ratings and reports of the job on screen. */
+  feedback?: FeedbackState;
+}
+
+/** "Rate page n" with stars, what was saved, and what happens with feedback. */
+function PageRating({ page, feedback, disabled }: { page: number; feedback: FeedbackState; disabled?: boolean }) {
+  const { t } = useI18n();
+  const [fresh, setFresh] = useState(false);
+  useEffect(() => {
+    if (!fresh) return;
+    const id = setTimeout(() => setFresh(false), 5000);
+    return () => clearTimeout(id);
+  }, [fresh]);
+  useEffect(() => setFresh(false), [page]);
+  return (
+    <div className="result-card__rate" data-testid="page-rating">
+      <div className="result-card__rate-row">
+        <span className="result-card__label result-card__label--small">{t("fb.rateTitle", { n: page })}</span>
+        <RatingStars
+          page={page}
+          value={feedback.ratings[page] ?? null}
+          disabled={disabled}
+          onRate={async (n) => {
+            await feedback.send(ratingFeedback(page, n));
+            setFresh(true);
+          }}
+        />
+      </div>
+      <SavedCount count={feedback.items.length} fresh={fresh} />
+      <FeedbackNote consented={feedback.consented} className="fb-note--card" />
+    </div>
+  );
 }
 
 function PairInputs(props: {
@@ -74,7 +109,7 @@ function PairInputs(props: {
   );
 }
 
-export function SettingsCard({ state, dispatch, formats, formatsError, presets, onConvert, onConvertAgain }: SettingsCardProps) {
+export function SettingsCard({ state, dispatch, formats, formatsError, presets, onConvert, onConvertAgain, feedback }: SettingsCardProps) {
   const { t, lang } = useI18n();
   const uid = useId();
   const [touched, setTouched] = useState({ origin: false, target: false });
@@ -336,6 +371,7 @@ export function SettingsCard({ state, dispatch, formats, formatsError, presets, 
               </button>
             )}
           </div>
+          {feedback && <PageRating page={state.pageIndex + 1} feedback={feedback} disabled={state.progress.background} />}
         </section>
       )}
     </div>

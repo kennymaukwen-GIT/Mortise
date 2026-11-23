@@ -11,8 +11,9 @@
   s4.same_style  同樣式分群（發放 same_style 編號，供⑤歸納樣式表）
   s4.order       閱讀順序與圖層順序、對齊線
   s4.cross_page  跨頁重複元素 → 母片候選
-  s4.tables     表格：列、欄、合併儲存格（相鄰兩格之間沒有格線就是合併）、表頭、儲存格內的段落
-尚未實作：清單階層、分欄、無框線表格、圖說配對、網格編號、大型 AI 仲裁。
+  s4.tables     表格：列、欄、合併儲存格（相鄰兩格之間沒有格線就是合併）、表頭、儲存格內的段落；
+                ③推得的無框線表格裡，若有句子一列接一列排下去（兩欄版面的段落），不做成表格（_sentences_cross_rows）
+尚未實作：清單階層、分欄、圖說配對、網格編號、大型 AI 仲裁。
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from ..config import Config
 from ..tools.fonts import is_cjk
 
 NAME = "s4"
-VERSION = "3"
+VERSION = "4"
 
 _BULLET = re.compile(r"^\s*([•‧·●○■□▪◆◇▶➤\-–—*]|\(?\d{1,2}[.)、]|[a-zA-Z][.)]|[一二三四五六七八九十]+[、.])\s*")
 _PAGE_NUMBER = re.compile(r"^[\-–— ]*(第\s*)?\d{1,4}(\s*頁)?(\s*[/／]\s*\d{1,4})?[\-–— ]*$")
@@ -80,7 +81,7 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
     lines.sort(key=lambda t: (round(t.baseline[0].y, 4), t.baseline[0].x))
 
     # ---------- s4.tables：表格先處理，儲存格裡的字不參與一般的文字流 ----------
-    tables, table_pars, in_tables = _tables(elements, lines, spec, c)
+    tables, table_pars, in_tables = _tables(elements, lines, spec, c, notes)
     lines = [t for t in lines if t.id not in in_tables]
 
     # ---------- s4.text_flow：行 → 區塊 ----------
@@ -224,10 +225,12 @@ def _covered(segments: list[tuple[float, float, float, float]], vertical: bool, 
     return got >= need
 
 
-def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dict) -> tuple[list[TableStructure], list[Paragraph], set[str]]:
+def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dict, notes: list[str] | None = None) -> tuple[list[TableStructure], list[Paragraph], set[str]]:
     """s4.tables：③的表格區 → 列、欄、合併儲存格、表頭，並把文字行分給儲存格。
 
     合併儲存格的判斷：相鄰兩格之間的格線若不存在（線段蓋不到六成），兩格就是同一格。
+    無框線表格（③由文字對齊推得）先過一道保險（_sentences_cross_rows）：欄裡的句子一列接一列排下去的，
+    是兩欄版面的段落，不做成表格，那些行照一般的文字流處理（原因寫進 notes）。
     回傳（表格結構、儲存格內的段落、被表格吸收的文字行編號）。"""
     step = f"{NAME}.tables@{VERSION}"
     tol = c.get("table_line_tolerance", 0.004)
@@ -235,6 +238,13 @@ def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dic
     pars: list[Paragraph] = []
     used: set[str] = set()
     for reg in elements.table_regions:
+        if not reg.ruled:
+            n_cont = _sentences_cross_rows(reg, lines)
+            if n_cont >= int(c.get("table_flow_min_continuations", 2)):
+                if notes is not None:
+                    notes.append(f"③由文字對齊推得的無框線表格（{len(reg.h_lines) - 1} 列 × {len(reg.v_lines) - 1} 欄）裡，有 {n_cont} 處句子從上一列"
+                                 "接到下一列（段落換行或項目的第二行），比較像兩欄各自排的文字，不做成表格，照一般段落處理。")
+                continue
         ys, xs = reg.h_lines, reg.v_lines
         nr, nc = len(ys) - 1, len(xs) - 1
         parent = {(r, k): (r, k) for r in range(nr) for k in range(nc)}
@@ -299,6 +309,49 @@ def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dic
             cells=cells, header_rows=header_rows, ruled=reg.ruled, confidence=reg.confidence * (0.95 if all(cs == 1 and rs == 1 for _, _, rs, cs in spans) else 0.8),
         ))
     return out, pars, used
+
+
+def _sentences_cross_rows(reg, lines: list[TextLine]) -> int:
+    """無框線表格的某一欄裡，有幾處「句子從上一列接到下一列」。
+
+    無框線表格的每一列各自獨立，儲存格裡的字不會接到下一列；兩欄版面（例如履歷右欄的經歷）的一欄卻是一段一段排下去的。
+    ③只看得到文字框的位置；這裡看得到字，所以多看一層：同一欄上下相鄰的兩行（不同列），符合下面全部條件就算一處接續：
+      - 字級相同（差不到一成二）、行距是一般的行距（基線距離在字級的 0.8 到 1.8 倍之間）；
+      - 上一行排到這一欄的右緣附近：右邊剩下的空間放不下下一行的第一個詞（被迫換行，同 text_flow 的硬換行判斷）；
+      - 下一行不是新的項目（不以項目符號開頭），左緣和上一行差不多（或在項目符號後面縮排）；
+      - 看得出是同一句：下一行以小寫英文字母開頭、上一行以連字號或逗號結尾，或上一行是項目而下一行縮排接在符號後面。
+    欄太窄（不到 8 個字寬）時不看：短的儲存格本來就不會換行。"""
+    xs = reg.v_lines
+    l, t, r, b = reg.quad.bbox
+    inside = [ln for ln in lines if l <= ln.quad.center.x <= r and t <= ln.quad.center.y <= b]
+    count = 0
+    for k in range(len(xs) - 1):
+        col = sorted((ln for ln in inside if xs[k] <= ln.quad.center.x <= xs[k + 1]), key=lambda ln: ln.baseline[0].y)
+        if len(col) < 2:
+            continue
+        right = max(ln.quad.bbox[2] for ln in col)
+        size = statistics.median(ln.font_size for ln in col)
+        if right - min(ln.quad.bbox[0] for ln in col) < 8 * size:
+            continue
+        for a, nxt in zip(col, col[1:]):
+            sa = a.font_size
+            if abs(sa - nxt.font_size) > 0.12 * max(sa, nxt.font_size):
+                continue
+            pitch = nxt.baseline[0].y - a.baseline[0].y
+            if not 0.8 * sa <= pitch <= 1.8 * sa:
+                continue
+            if right - a.quad.bbox[2] > _first_token_width(nxt) + 0.3 * sa:
+                continue  # 上一行放得下卻沒放：硬換行，不是同一句
+            if _BULLET.match(nxt.text):
+                continue
+            dx = nxt.quad.bbox[0] - a.quad.bbox[0]
+            if not -0.6 * sa <= dx <= 2.5 * sa:
+                continue
+            first, last = nxt.text.strip()[:1], a.text.rstrip()[-1:]
+            hanging = bool(_BULLET.match(a.text)) and dx >= 0.3 * sa
+            if (first.isalpha() and first.islower()) or last in ("-", ",", "，", "、") or hanging:
+                count += 1
+    return count
 
 
 def _cell_groups(lines: list[TextLine]) -> list[list[TextLine]]:

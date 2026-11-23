@@ -15,9 +15,11 @@ export interface FileMenuProps {
   canStartOver: boolean;
   /** False while a file is uploading or converting (opening another file would drop that job). */
   canOpen?: boolean;
+  /** Download this job's feedback bundle (zip). */
+  onExportFeedback?: () => void;
 }
 
-export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, onDelete, canStartOver, canOpen = true }: FileMenuProps) {
+export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, onDelete, canStartOver, canOpen = true, onExportFeedback }: FileMenuProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
@@ -78,6 +80,7 @@ export function FileMenu({ fileName, jobId, format, done, onOpen, onStartOver, o
           <div className="menu-sep" role="separator" />
           {item(t("file.download"), null, { href: done && jobId && format ? downloadUrl(jobId, format) : undefined })}
           {item(t("file.downloadReport"), null, { href: done && jobId ? downloadUrl(jobId, "report") : undefined })}
+          {item(t("file.exportFeedback"), done && jobId && onExportFeedback ? onExportFeedback : null)}
           <div className="menu-sep" role="separator" />
           {item(t("file.startOver"), canStartOver ? onStartOver : null)}
           {item(t("file.delete"), jobId ? onDelete : null, { danger: true })}

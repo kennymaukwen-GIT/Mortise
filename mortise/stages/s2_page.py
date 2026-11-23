@@ -2,10 +2,16 @@
 
 步驟：
   s2.box        原生 PDF：選頁框（裁切框與媒體框的交集）、套用旋轉
-  s2.corners    照片：四邊擬合找頁面四角（找不到就以整張圖為頁面，使用者可以手動拉四角）；截圖與掃描以整張圖為頁面
-  s2.rectify    透視攤平，建立頁面座標系（頁寬為 1）
+  s2.corners    照片：recognition/page_geometry.find_page_quad 找頁面四角，連同狀態（ok、low_contrast、curved_edge、multiple_pages、
+                cut_off、not_found）、各角誤差、其他候選（第二張紙、三條邊＋畫面邊）與彎曲外框寫進 PageSpec 的 quad_* 欄位；
+                找不到就以整張圖為頁面（紙被畫面切掉、三條邊都量到時預選「三條邊＋畫面邊」）。截圖與掃描以整張圖為頁面。
+                使用者拉過四角（修正單 corners，原圖像素）時一律用使用者的四角，不再自動找。
+  s2.rectify    透視攤平，建立頁面座標系（頁寬為 1）。照片另試彎曲攤平（recognition/dewarp.py；設定 dewarp_photos）：
+                判定彎曲、驗證比透視好才採用，逐像素對應圖存進 dewarp_map。找不到四角時採用攤平量出的外框四角（需確認）。
+  s2.review     要不要請使用者確認四角：status 不是 ok、信心值低於 quad_review_confidence、任一角誤差超過
+                quad_max_corner_err_frac × 對角線、或攤平建議確認外框（quad_needs_review、quad_review_reason）。
   s2.enhance    去陰影、白平衡，產生工作影像（只對照片模式、像白紙、又不是平塗數位畫面的頁面做；找不到紙張四邊又光照均勻的照片也不做；
-                未增強的影像另存 color_image）
+                未增強的影像另存 color_image）；反光只標記（glare_frac），寫進備註提醒重拍
   s2.size       尺寸判斷：使用者輸入永遠優先，其次檔案內建，都沒有才依長寬比推論候選規格
   s2.working    產生工作影像，計算有效解析度
 """
@@ -24,7 +30,7 @@ from ..tools import pdfium as pdf
 from ..tools.units import to_pt
 
 NAME = "s2"
-VERSION = "4"
+VERSION = "5"
 
 
 def _png(im: Image.Image) -> bytes:
@@ -98,7 +104,7 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
             file_width = exact(dw, w_step)
         aspect = dh / dw
     else:
-        image, color, matrix, corners, aspect, quad_method, quad_conf, geo_notes = _image_geometry(doc, ref, c, corrections, store)
+        image, color, matrix, corners, aspect, quad_method, quad_conf, geo_notes, geo = _image_geometry(doc, ref, c, corrections, store)
         notes += geo_notes
         rotation, box_used = 0, None
         pw = image.size[0]
@@ -111,7 +117,8 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
             # 長寬比對上了規格家族，但同家族的大小分不出來（單張照片的常態）：先預填第一名，請使用者確認
             file_width = measured(top["width_pt"], top["confidence"], Provenance.INFERRED, w_step)
             others = "、".join(x["name"] for x in size_candidates[1:3] if x["confidence"] > 0.05)
-            notes.append(f"長寬比符合「{top['name']}」，但單張影像量不出實際大小（也可能是 {others}）。已先用「{top['name']}」，請確認或輸入實際尺寸。")
+            maybe = f"（也可能是 {others}）" if others else ""
+            notes.append(f"長寬比符合「{top['name']}」，但單張影像量不出實際大小{maybe}。已先用「{top['name']}」，請確認或輸入實際尺寸。")
         elif ref.dpi_hint and quad_method in ("full_image", ""):
             file_width = measured(pw * 72 / ref.dpi_hint, 0.4, Provenance.INFERRED, w_step)
             notes.append(f"尺寸依檔案標記的 {ref.dpi_hint:.0f} dpi 推算，可能不準，建議輸入實際尺寸。")
@@ -137,7 +144,7 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
         extra = {
             "color_image": store.put_blob(_png(color), "image/png", "png") if color is not image else None,
             "size_candidates": size_candidates, "quad_method": quad_method, "quad_confidence": quad_conf,
-            "enhanced": color is not image,
+            "enhanced": color is not image, **geo,
         }
     else:
         extra = {"quad_method": "pdf_box", "quad_confidence": 1.0}
@@ -156,16 +163,54 @@ def run(doc: SourceDoc, page_index: int, cfg: Config, corrections: list[Correcti
 _ASPECT_ERR: dict[int, Optional[float]] = {}  # 工作影像 → 透視反推的長寬比誤差（給尺寸判斷用）
 
 
-def _user_corners(corrections: list[Correction]):
+def _user_corners(corrections: list[Correction], size: Optional[tuple[int, int]] = None, notes: Optional[list[str]] = None):
+    """最新一張四角修正單（原圖像素，左上、右上、右下、左下）。格式不對、四邊形自我交叉或面積太小的修正單略過（寫進備註），
+    改用前一張；點的順序不是順時針時自動排成左上、右上、右下、左下。角落可以在畫面外（紙超出畫面）。"""
+    import math
+
+    import numpy as np
+
     for c in reversed(corrections):
-        if c.field == "corners" and c.new_value:
-            return [tuple(map(float, pt)) for pt in c.new_value]
+        if c.field != "corners" or not c.new_value:
+            continue
+        try:
+            try:
+                pts = np.array([[float(v) for v in pt] for pt in c.new_value], dtype=np.float64)
+            except (TypeError, ValueError):
+                raise ValueError("要四個 [x, y] 點，依左上、右上、右下、左下")
+            if pts.shape != (4, 2) or not np.all(np.isfinite(pts)):
+                raise ValueError("要四個 [x, y] 點，依左上、右上、右下、左下")
+            from ..recognition import page_geometry as pg
+
+            if not _clockwise_convex(pts):  # 照順序不是順時針的凸四邊形：重新排序（順時針時保留使用者的起點，可用來轉正頁面）
+                pts = pg._order_corners(pts)
+            area = pg._poly_area(pts)
+            if size is not None:
+                w, h = size
+                if area < 0.002 * w * h or not _clockwise_convex(pts) or np.abs(pts).max() > 4 * math.hypot(w, h):
+                    raise ValueError("四邊形自我交叉、太小或超出畫面太遠")
+            return [tuple(map(float, pt)) for pt in pts]
+        except (TypeError, ValueError) as e:
+            if notes is not None:
+                notes.append(f"有一張四角修正單的格式不對（{e}），已略過。")
     return None
 
 
+def _clockwise_convex(q) -> bool:
+    """四點依序是影像座標（y 向下）裡順時針的凸四邊形。"""
+    cross = [(q[(i + 1) % 4][0] - q[i][0]) * (q[(i + 2) % 4][1] - q[(i + 1) % 4][1]) - (q[(i + 1) % 4][1] - q[i][1]) * (q[(i + 2) % 4][0] - q[(i + 1) % 4][0]) for i in range(4)]
+    return all(v > 0 for v in cross)
+
+
 def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction], store: Store):
-    """找頁面四角、透視攤平、增強。照片才找四角；截圖與一般影像以整張圖為頁面。
-    回傳（工作影像、未增強的影像、來源到頁面的矩陣、四角、長寬比、四角的來源、信心值、備註）。"""
+    """找頁面四角、攤平（透視；彎曲的紙另做攤平）、增強。照片才找四角；截圖與一般影像以整張圖為頁面。
+    回傳（工作影像、未增強的影像、來源到頁面的矩陣、四角、長寬比、四角的來源、信心值、備註、要寫進 PageSpec 的頁面確認欄位）。
+
+    照片：find_page_quad 找四角（status、alternatives、各角誤差、彎曲外框一併交出）→ rectify（開 dewarp_photos 時先試攤平，
+    判定彎曲、驗證比透視好才採用，對應圖存進 dewarp_map）→ 去陰影（反光只標記、寫進備註）。
+    只有「整張圖＋紙被畫面切掉（cut_off）」時預選 alternatives[0]（三條量到的紙邊＋畫面邊）；找不到（not_found）不預選。
+    找不到四角、但攤平時由紙邊量出外框四角（至少三邊有量測支持）時，用那組四角，標成需要確認。
+    使用者拉過四角（修正單 corners）時一律用使用者的四角（method "user"、信心值 1.0、不攤平，其他處理照常）。"""
     import numpy as np
 
     raw = ImageOps.exif_transpose(Image.open(store.blob_path(doc.source))).convert("RGB")
@@ -173,41 +218,94 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
     notes: list[str] = []
     aspect_err = None
     full = ([1 / pw, 0, 0, 0, 1 / pw, 0, 0, 0, 1], [(0, 0), (pw, 0), (pw, ph), (0, ph)], ph / pw)
-    user = _user_corners(corrections)
+    user = _user_corners(corrections, (pw, ph), notes)
     kind = ref.input_type.value
+    geo: dict = {"source_size": (pw, ph), "quad_status": "not_photo" if kind != InputType.PHOTO else "ok"}
+    if user is not None:
+        geo["quad_status"] = "user"
     try:
         from ..recognition import page_geometry as pg
         from ..recognition.types import PageQuad
     except Exception:  # 模組還沒有或壞掉：以整張圖為頁面
-        return raw, raw, *full, "full_image", 0.5, ["頁面幾何模組無法載入，以整張圖為頁面。"]
+        return raw, raw, *full, "full_image", 0.5, ["頁面幾何模組無法載入，以整張圖為頁面。"], _review(geo, True, "頁面幾何模組無法載入，請確認頁面四角。")
     arr = np.asarray(raw)
+    diag = float(np.hypot(pw, ph))
     try:
+        quad = None
         if user is not None:
             corners = np.array(user, dtype=np.float64)
-            quad = PageQuad(corners=corners, confidence=1.0, method="user", aspect_ratio=_aspect_from_corners(corners))
+            try:
+                est, amethod, focal = pg.estimate_aspect(corners, (pw, ph), np.full(4, 2.0))
+                a_user = float(est.value)
+            except Exception:  # 透視反推失敗：退回邊長比
+                est, amethod, focal, a_user = None, "side_ratio", None, _aspect_from_corners(corners)
+            quad = PageQuad(corners=corners, confidence=1.0, method="user", aspect_ratio=a_user, aspect=est, aspect_method=amethod,
+                            focal_px=focal, corner_error_px=np.zeros(4), status="user")
         elif kind == InputType.PHOTO:
-            quad = pg.find_page_quad(arr, {"input_type": kind.value})
+            quad = pg.find_page_quad(arr, {"input_type": kind.value, "review_conf": float(c.get("quad_review_confidence", 0.6)),
+                                           "max_corner_err_frac": float(c.get("quad_max_corner_err_frac", 0.01))})
+        dres = None
+        method, conf = "full_image", 1.0
+        if quad is not None and user is None:
+            geo.update(_quad_fields(quad, pw, ph))
+            if quad.method == "full_image" and quad.status == "cut_off" and quad.alternatives:
+                # 紙被畫面切掉、三條邊都量到：預選「三條邊＋畫面邊」的框當四角（仍需確認）
+                alt0 = np.asarray(quad.alternatives[0], dtype=np.float64)
+                est, amethod, focal = pg.estimate_aspect(alt0, (pw, ph), np.full(4, 0.01 * diag))
+                quad = PageQuad(corners=alt0, confidence=float(quad.confidence), method="frame_edges", aspect_ratio=float(est.value), notes=list(quad.notes),
+                                corner_error_px=np.full(4, 0.01 * diag), aspect=est, aspect_method=amethod, focal_px=focal, status="cut_off",
+                                alternatives=list(quad.alternatives), alternative_scores=list(quad.alternative_scores))
+                geo["quad_preselect"] = 0
+            notes += list(getattr(quad, "notes", []))
+        if quad is not None:
+            # 攤平只給照片、而且不是使用者拉的四角；find_page_quad 判定「整張圖就是頁面」（status ok 的整張圖，例如沒有雜訊的數位畫面）時也不試
+            whole_ok = quad.method == "full_image" and quad.status == "ok"
+            params = {**c, "dewarp": bool(c.get("dewarp_photos", True)) and kind == InputType.PHOTO and user is None and not whole_ok}
+            flat, H, dres = pg.rectify(arr, quad, params, return_dewarp=True)
+            from_dres = dres is not None and dres.image is not None and flat is dres.image
+            if from_dres:
+                corners_src = dres.corners if dres.corners is not None else (dres.pseudo_quad if dres.pseudo_quad is not None else quad.corners)
+                if quad.method == "full_image":
+                    method, conf = "outline", float(dres.confidence)
+                    geo["quad_status"] = quad.status if quad.status != "ok" else "low_contrast"
+                    notes.append("照片中找不到完整的頁面四角；已由紙邊量出外框的四角（至少三條邊有量測支持）先用，請確認四角。")
+                else:
+                    method, conf = quad.method, float(quad.confidence)
+                    if np.max(np.linalg.norm(np.asarray(corners_src) - np.asarray(quad.corners), axis=1)) > 0.01 * diag:
+                        geo["quad_alternatives"] = [_pts(quad.corners)] + geo.get("quad_alternatives", [])
+                        geo["quad_alternative_scores"] = [1.0] + geo.get("quad_alternative_scores", [])
+                        geo["quad_alternative_labels"] = ["原本找到的四角"] + geo.get("quad_alternative_labels", [])
+                        geo["quad_preselect"] = None  # 目前的四角是攤平時量出的外框，不是任何一組候選
+            else:
+                corners_src = quad.corners
+                method, conf = quad.method, float(quad.confidence)
+            if method == "full_image":
+                image_arr = arr
+                matrix, corners_l, aspect = full
+                if user is None:
+                    notes.append("照片中找不到清楚的頁面邊緣，以整張圖為頁面。可以手動拉出四個角。")
+            else:
+                image_arr = flat
+                fw = flat.shape[1]
+                Hn = np.diag([1 / fw, 1 / fw, 1.0]) @ np.asarray(H, dtype=np.float64)
+                matrix = [float(v) for v in (Hn / Hn[2, 2]).ravel()]
+                corners_l = [tuple(map(float, pt)) for pt in corners_src]
+                aspect = flat.shape[0] / flat.shape[1]
+                if getattr(quad, "aspect", None) is not None and method not in ("outline",):
+                    aspect_err = float(quad.aspect.error)
+                if method == "user":
+                    notes.append("頁面四角使用你拉的位置，已透視攤平。")
+                else:
+                    notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
+            if dres is not None:
+                geo.update(_dewarp_fields(dres, from_dres, store, geo))
+                if dres.applied or from_dres or dres.curved:
+                    notes += list(dres.notes)
+                elif any("UVDoc" in n and ("下載" in n or "無法取得" in n) for n in dres.notes):
+                    notes += [n for n in dres.notes if "UVDoc" in n]
         else:
-            quad = None
-        if quad is None or quad.method == "full_image":
-            if quad is not None:
-                notes.append("照片中找不到清楚的頁面邊緣，以整張圖為頁面。可以手動拉出四個角。")
             image_arr = arr
             matrix, corners_l, aspect = full
-            method, conf = ("full_image", quad.confidence) if quad is not None else ("full_image", 1.0)
-        else:
-            flat, H = pg.rectify(arr, quad)
-            image_arr = flat
-            fw = flat.shape[1]
-            Hn = np.diag([1 / fw, 1 / fw, 1.0]) @ np.asarray(H, dtype=np.float64)
-            matrix = [float(v) for v in (Hn / Hn[2, 2]).ravel()]
-            corners_l = [tuple(map(float, pt)) for pt in quad.corners]
-            aspect = flat.shape[0] / flat.shape[1]
-            if getattr(quad, "aspect", None) is not None:
-                aspect_err = float(quad.aspect.error)
-            method, conf = quad.method, quad.confidence
-            notes += list(getattr(quad, "notes", []))
-            notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
         color = Image.fromarray(np.ascontiguousarray(image_arr))
         work = color
         if kind in (InputType.PHOTO, InputType.SCANNED_PDF) and c.get("enhance_photos", True) and _paper_like(image_arr, c):
@@ -221,12 +319,167 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
                 # 而是底色有細紋理的截圖（例如閱讀軟體的紙紋主題）或乾淨的掃描。沒有陰影可去；白平衡只會把米色、灰色的底改成白色
                 notes.append(f"沒有找到紙張四邊，整頁的光照又很均勻（底色亮度落差 {spread:.1%}），不做去陰影與白平衡，顏色照原圖。")
             else:
-                work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
+                enhanced, info = pg.enhance(image_arr, c, return_info=True)
+                work = Image.fromarray(np.ascontiguousarray(enhanced))
+                geo["glare_frac"] = round(float(info.get("glare_frac", 0.0)), 5)
                 notes.append("頁面像一般紙張，已去陰影與白平衡後再辨識；工作影像的顏色因此與原圖不同，未增強的原圖另外保留（color_image）。")
+                notes += list(info.get("notes", []))
         _ASPECT_ERR[id(work)] = aspect_err
-        return work, color, matrix, corners_l, aspect, method, conf, notes
+        if kind == InputType.PHOTO and user is None:
+            _decide_review(geo, conf, diag, c, method)
+        return work, color, matrix, corners_l, aspect, method, conf, notes, geo
     except Exception as e:  # 幾何處理失敗不中斷：退回整張圖
-        return raw, raw, *full, "full_image", 0.3, [f"頁面幾何處理失敗（{e}），以整張圖為頁面。"]
+        geo = {"source_size": (pw, ph), "quad_status": "user" if user is not None else ("not_found" if kind == InputType.PHOTO else "not_photo")}
+        return raw, raw, *full, "full_image", 0.3, [f"頁面幾何處理失敗（{e}），以整張圖為頁面。"], _review(geo, kind == InputType.PHOTO and user is None, "頁面幾何處理失敗，請確認頁面四角。")
+
+
+def _pts(corners) -> list[Point]:
+    return [Point(x=float(x), y=float(y)) for x, y in corners]
+
+
+def _review(geo: dict, needs: bool, reason: str) -> dict:
+    geo["quad_needs_review"] = bool(needs)
+    geo["quad_review_reason"] = reason if needs else ""
+    return geo
+
+
+def _poly_iou(a, b) -> float:
+    import cv2
+    import numpy as np
+
+    pa, pb = np.asarray(a, np.float32).reshape(-1, 1, 2), np.asarray(b, np.float32).reshape(-1, 1, 2)
+    try:
+        inter, _ = cv2.intersectConvexConvex(pa, pb)
+    except cv2.error:
+        return 0.0
+    ua = abs(cv2.contourArea(pa)) + abs(cv2.contourArea(pb)) - inter
+    return float(inter / ua) if ua > 0 else 0.0
+
+
+def _alt_label(alt, main, pw: int, ph: int, quad, index: int) -> str:
+    """其他候選四角的白話短標籤（給介面列出讓使用者選）。"""
+    import cv2
+    import numpy as np
+
+    a = np.asarray(alt, np.float64)
+    tol = 0.01 * min(pw, ph)
+    on = [(abs(a[k, 1]) <= tol and abs(a[(k + 1) % 4, 1]) <= tol) or (abs(a[k, 1] - ph) <= tol and abs(a[(k + 1) % 4, 1] - ph) <= tol)
+          or (abs(a[k, 0]) <= tol and abs(a[(k + 1) % 4, 0]) <= tol) or (abs(a[k, 0] - pw) <= tol and abs(a[(k + 1) % 4, 0] - pw) <= tol) for k in range(4)]
+    if quad.method == "full_image" and quad.status == "cut_off" and index == 0:
+        return "三條邊＋畫面邊"
+    if sum(on) == 1:
+        return "三條邊＋畫面邊"
+    if quad.method == "full_image":
+        return "可能的紙張範圍"
+    iou = _poly_iou(a, main)
+    area_a = abs(cv2.contourArea(a.astype(np.float32)))
+    area_m = abs(cv2.contourArea(np.asarray(main, np.float32)))
+    if iou < 0.3:
+        return "另一張紙"
+    if area_a > 1.15 * area_m:
+        return "較大的框（可能連旁邊的紙一起框）"
+    if area_a < 0.85 * area_m:
+        return "較小的框（可能是紙上的一塊）"
+    return "另一種框法"
+
+
+def _quad_fields(quad, pw: int, ph: int) -> dict:
+    """find_page_quad 的結果 → PageSpec 的 quad_* 欄位（四角誤差、其他候選與標籤、彎曲外框）。"""
+    import numpy as np
+
+    out: dict = {"quad_status": quad.status or "ok"}
+    if quad.corner_error_px is not None and quad.method != "full_image":
+        out["quad_corner_error_px"] = [round(float(v), 2) for v in np.asarray(quad.corner_error_px).ravel()[:4]]
+    alts = [np.asarray(a, np.float64) for a in (quad.alternatives or [])]
+    scores = list(quad.alternative_scores or [])
+    out["quad_alternatives"] = [_pts(a) for a in alts]
+    out["quad_alternative_scores"] = [round(float(np.clip(scores[i] if i < len(scores) else 0.0, 0.0, 1.0)), 3) for i in range(len(alts))]
+    out["quad_alternative_labels"] = [_alt_label(a, quad.corners, pw, ph, quad, i) for i, a in enumerate(alts)]
+    if quad.boundary is not None and len(quad.boundary) >= 4:
+        out["source_outline"] = _pts(np.asarray(quad.boundary, np.float64))
+    return out
+
+
+def _outline_from_sides(sides, per_side: int = 24) -> list:
+    """四條外框曲線（上、右、下、左；上與下由左到右、左與右由上到下）→ 順時針一圈的點（左上 → 右上 → 右下 → 左下）。"""
+    import numpy as np
+
+    if not sides or len(sides) != 4:
+        return []
+    t, r, b, l = (np.asarray(s, np.float64) for s in sides)
+
+    def sub(a):
+        if len(a) <= per_side:
+            return a
+        idx = np.linspace(0, len(a) - 1, per_side).round().astype(int)
+        return a[idx]
+    ring = np.vstack([sub(t)[:-1], sub(r)[:-1], sub(b)[::-1][:-1], sub(l)[::-1][:-1]])
+    return _pts(ring)
+
+
+def _dewarp_fields(dres, used: bool, store: Store, geo: dict) -> dict:
+    """攤平結果 → PageSpec 的 dewarp_* 欄位（採用時存對應圖）；沒採用的外框候選放進其他候選。"""
+    import numpy as np
+
+    # 攤平建議確認外框，只在真的採用了它的結果（攤平、或它量出的四角）時才算；沒採用的外框只放進其他候選
+    out: dict = {"dewarp_confidence": round(float(dres.confidence), 3), "dewarp_needs_review": bool(dres.needs_review) and used}
+    if dres.applied and dres.map_x is not None:
+        out["dewarp_map"] = store.put_blob(dres.maps_npz(), "application/x-npz", "npz")
+        out["dewarp_source"] = dres.source or "measured"
+        out["dewarp_residual_px"] = None if dres.residual_px is None else round(float(dres.residual_px), 3)
+        ring = _outline_from_sides(dres.boundary)
+        if ring:
+            out["source_outline"] = ring
+    alts = list(geo.get("quad_alternatives", []))
+    scores = list(geo.get("quad_alternative_scores", []))
+    labels = list(geo.get("quad_alternative_labels", []))
+    if dres.pseudo_quad is not None and not used:
+        alts.append(_pts(dres.pseudo_quad))
+        scores.append(round(float(np.clip(dres.confidence, 0, 1)), 3))
+        labels.append("由紙邊量出的外框")
+    if dres.candidate_outline and len(dres.candidate_outline) == 4 and dres.corners is not None and not used:
+        alts.append(_pts(dres.corners))
+        scores.append(round(float(np.clip(np.mean(dres.support) if dres.support else 0.0, 0, 1)), 3))
+        labels.append("模型推估的外框（未經量測）")
+    out.update({"quad_alternatives": alts, "quad_alternative_scores": scores, "quad_alternative_labels": labels})
+    return out
+
+
+_STATUS_REASON = {
+    "low_contrast": "紙的邊緣不夠清楚，四角可能不準",
+    "curved_edge": "紙邊是彎的，四角與外框可能不準",
+    "multiple_pages": "照片裡有不只一張紙，請確認要的是哪一張",
+    "cut_off": "紙有一部分超出畫面，已先用量到的三條邊加畫面邊",
+    "not_found": "找不到紙張的邊緣，目前以整張圖為頁面",
+}
+
+
+def _decide_review(geo: dict, conf: float, diag: float, c: dict, method: str) -> None:
+    """要不要請使用者確認四角：status 不是 ok、信心值低於 quad_review_confidence、任一角誤差超過 quad_max_corner_err_frac × 對角線、
+    或攤平建議確認外框。理由寫成白話一句。"""
+    reasons = []
+    status = geo.get("quad_status", "ok")
+    if method == "outline":
+        reasons.append("照片中找不到完整的頁面四角，四角是由紙邊量出的外框先填上的")
+    elif status == "cut_off" and method != "frame_edges":
+        reasons.append("紙的一角超出畫面，那個角是由紙邊延長推出來的")
+    elif status not in ("ok", "user", "not_photo"):
+        reasons.append(_STATUS_REASON.get(status, "四角可能不準"))
+    if conf < float(c.get("quad_review_confidence", 0.6)) and method != "full_image":
+        reasons.append(f"四角的信心值偏低（{conf:.2f}）")
+    errs = geo.get("quad_corner_error_px") or []
+    lim = float(c.get("quad_max_corner_err_frac", 0.01)) * diag
+    if errs and max(errs) > lim:
+        reasons.append(f"有一個角的位置可能差到約 {max(errs):.0f} 像素")
+    if geo.get("dewarp_needs_review"):
+        reasons.append("彎曲紙張攤平的外框有推估的部分")
+    # 同樣的理由只留一個，最多兩個串成一句
+    seen, uniq = set(), []
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    _review(geo, bool(uniq), ("，".join(uniq[:2]) + "：請拖曳四角確認。") if uniq else "")
 
 
 def _paper_like(arr, c: dict) -> bool:

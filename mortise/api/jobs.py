@@ -234,7 +234,8 @@ class JobManager:
         return path
 
     def record_corrections(self, job_id: str, corrections: list[Correction]) -> None:
-        """使用者的修正也是回饋：連同系統當時的值與信心值一起收進回饋資料庫（需同意）。"""
+        """使用者的修正也是回饋：連同系統當時的值與信心值一起收進回饋資料庫（需同意）。
+        四角（corners）的 system_value 是頁面偵測的快照（四角、status、信心值、各角誤差、使用者拉動的位移，見 corners_snapshot）。"""
         pipe = self.pipeline(job_id)
         items = []
         try:
@@ -246,6 +247,12 @@ class JobManager:
             arts, resolve_value = None, None
         for c in corrections:
             item = c.model_dump(mode="json")
+            if c.field == "corners":
+                snap = corners_snapshot(pipe, c)
+                if snap is not None:
+                    item["system_value"], item["system_confidence"] = snap, snap.get("confidence")
+                items.append(item)
+                continue
             if arts is not None:
                 try:
                     snap = resolve_value(arts, c.target_stage, c.field, c.element_id, c.page_index)
@@ -316,6 +323,47 @@ class JobManager:
                 self.progress.pop(d.name, None)
                 removed.append(d.name)
         return removed
+
+
+def corners_snapshot(pipe: Pipeline, c: Correction) -> Optional[dict[str, Any]]:
+    """使用者拖過四角時，系統當時給的頁面四角（校準「什麼時候該請使用者確認」用）：
+    四角（原圖像素）、怎麼來的、status、信心值、各角誤差、當時是否請使用者確認、原圖大小，
+    以及使用者的四角與系統的差（最大位移，像素）與是否在容許範圍內（quad_max_corner_err_frac × 對角線，與②判斷要不要確認的門檻相同）。
+    還沒有②的產物（還沒處理到）時回傳 None。"""
+    import math
+
+    from ..artifacts import PageSpec
+
+    page = c.page_index or 0
+    name = f"s2/page-{page + 1:03d}"
+    try:
+        if not pipe.store.has(name):
+            return None
+        spec = pipe.store.load(name, PageSpec)
+    except Exception:
+        return None
+    sys_c = [[float(p.x), float(p.y)] for p in spec.source_corners]
+    size = list(spec.source_size) if spec.source_size else None
+    snap: dict[str, Any] = {
+        "corners": sys_c, "method": spec.quad_method, "status": spec.quad_status, "confidence": float(spec.quad_confidence),
+        "corner_error_px": list(spec.quad_corner_error_px) or None, "needs_review": bool(spec.quad_needs_review),
+        "review_reason": spec.quad_review_reason, "dewarp_source": spec.dewarp_source or None, "source_size": size,
+    }
+    try:
+        user = [[float(v) for v in pt] for pt in c.new_value]
+        if len(user) == 4 and all(len(pt) == 2 for pt in user):
+            shift = [math.dist(a, b) for a, b in zip(sys_c, user)]
+            snap["shift_px"] = [round(v, 2) for v in shift]
+            if size:
+                frac = 0.01
+                try:
+                    frac = float(pipe.cfg.section("page").get("quad_max_corner_err_frac", 0.01))
+                except Exception:
+                    pass
+                snap["within_tolerance"] = max(shift) <= frac * math.hypot(*size)
+    except (TypeError, ValueError):
+        pass
+    return snap
 
 
 def _safe_id(job_id: str) -> bool:

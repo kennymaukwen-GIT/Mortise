@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch } from "react";
 import * as api from "../api/client";
 import { ApiError } from "../api/client";
-import type { CorrectionIn, PageElements, PageInfo } from "../api/types";
+import type { CorrectionIn, PageElements, PageGeometry, PageInfo } from "../api/types";
 import { useI18n } from "../i18n/I18n";
 import { LIBREOFFICE_PREVIEW, targetApp } from "../lib/catalog";
 import { hasCjk } from "../lib/errors";
@@ -10,9 +10,15 @@ import type { LocalDoc } from "../lib/localDoc";
 import { loadServerImage, renderKind } from "../lib/serverImages";
 import { fmtMm, widthBucket } from "../lib/units";
 import { detectedSizeMm, pageGeometry } from "../state/derive";
+import { cornersCorrection } from "../lib/quad";
+import { PAGE_TAGS } from "../state/feedback";
+import type { FeedbackState } from "../state/useFeedback";
 import { pageCount, type Action, type FrameMessage, type State, type View } from "../state/store";
 import { EditDialog, EditLayer } from "./EditLayer";
-import { Alert, ChevronLeft, ChevronRight, Close, Grid, Info, Pencil, Upload } from "./Icons";
+import { PageReportDialog } from "./Feedback";
+import { Alert, ChevronLeft, ChevronRight, Close, Corners, Grid, Info, More, Pencil, Upload } from "./Icons";
+import { onMenuKeyDown, PopoverPanel, usePopoverDismiss } from "./Popover";
+import { QuadEditor, reasonKey } from "./QuadEditor";
 import { preload, SmartImg } from "./SmartImg";
 import { Viewer, type ViewerRenderInfo } from "./Viewer";
 
@@ -29,6 +35,8 @@ export interface StageProps {
   onCorrect: (items: CorrectionIn[]) => Promise<void>;
   /** A request about the current job failed with 404: check whether the job is gone. */
   onJobMissing: () => void;
+  /** Ratings and reports of the job on screen. */
+  feedback?: FeedbackState;
 }
 
 function useFrameMessage(m: FrameMessage | null): string | null {
@@ -83,7 +91,8 @@ function ServerLayer({ jobId, page, kind, format, version, info, alt, onInfo, re
 }) {
   const { t, lang } = useI18n();
   const bucket = widthBucket(info.pixelWidth);
-  const url = api.pageImageUrl(jobId, page, kind, { width: bucket, format: format ?? undefined, v: kind === "original" ? undefined : version });
+  // The original (the page as Mortise straightened it) changes too when the user moves the paper's corners: versioned like the result.
+  const url = api.pageImageUrl(jobId, page, kind, { width: bucket, format: format ?? undefined, v: version });
   const [err, setErr] = useState<ApiError | null>(null);
   const [st, setSt] = useState<"loading" | "ready" | "error">("loading");
   const infoRef = useRef(onInfo);
@@ -205,10 +214,10 @@ function Thumb({ state, index, active, onClick }: { state: State; index: number;
   const doc = state.doc;
   const load = useCallback(() => {
     if (doc) return doc.render(index, 160, "thumb");
-    if (state.jobId) return preload(api.pageImageUrl(state.jobId, index + 1, "original", { width: 160 }));
+    if (state.jobId) return preload(api.pageImageUrl(state.jobId, index + 1, "original", { width: 160, v: state.resultVersion }));
     return Promise.reject(new Error("none"));
-  }, [doc, state.jobId, index]);
-  const base = doc ? `l:${doc.id}:${index}` : `s:${state.jobId}:${index}`;
+  }, [doc, state.jobId, index, state.resultVersion]);
+  const base = doc ? `l:${doc.id}:${index}` : `s:${state.jobId}:${index}:${state.resultVersion}`;
   return (
     <button
       ref={ref}
@@ -242,7 +251,19 @@ function useStepAnnouncement(state: State): string {
 
 /* ------------------------------------------------------------------ stage */
 
-export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile, onDropFile, onCancel, onRetry, onCorrect, onJobMissing }: StageProps) {
+/** Pages whose paper corners the user should check (photos), 1-based. */
+export function pagesToReview(pages: PageInfo[] | null): number[] {
+  return (pages ?? []).filter((p) => p.needs_review).map((p) => p.page);
+}
+
+/** The paper's corners can be moved on this page: a photo, or any page of an uploaded picture. */
+export function canAdjustPage(page: PageInfo | undefined, filename: string | null): boolean {
+  if (!page) return false;
+  if (page.quad_status != null || page.input_type === "photo") return true;
+  return /\.(png|jpe?g)$/i.test(filename ?? "");
+}
+
+export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile, onDropFile, onCancel, onRetry, onCorrect, onJobMissing, feedback }: StageProps) {
   const { t, lang } = useI18n();
   const [dragOver, setDragOver] = useState(false);
   const dragDepth = useRef(0);
@@ -254,6 +275,15 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   const frameMsg = useFrameMessage(state.frameError);
   const announcement = useStepAnnouncement(state);
   const editReturnFocus = useRef<HTMLElement | null>(null);
+  // "Adjust the page" (drag the paper's corners): the 1-based page being adjusted, or null.
+  const [adjust, setAdjust] = useState<number | null>(null);
+  const [geo, setGeo] = useState<{ key: string; data: PageGeometry | null; status: "loading" | "ready" | "error" | "pending" } | null>(null);
+  const [pageMenu, setPageMenu] = useState(false);
+  const [pageReport, setPageReport] = useState<number | null>(null);
+  const pageMenuBtn = useRef<HTMLButtonElement>(null);
+  const pageMenuPanel = useRef<HTMLDivElement>(null);
+  const adjustRef = useRef(adjust);
+  adjustRef.current = adjust;
 
   const total = pageCount(state);
   const index = state.pageIndex;
@@ -272,6 +302,59 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   );
 
   useEffect(() => setSelected(null), [index, state.editMode, state.resultVersion]);
+
+  // Leave "adjust the page" when the job is no longer shown as finished (re-running, another file, …).
+  useEffect(() => {
+    if (!isDone || state.progress.background) setAdjust(null);
+  }, [isDone, state.progress.background]);
+  useEffect(() => {
+    setAdjust(null);
+    setPageReport(null);
+  }, [state.jobId]);
+
+  // Page geometry (where the paper is in the photo) for the page on screen, when it is needed.
+  const adjusting = isDone && adjust != null && adjust === index + 1;
+  const reviewPages = useMemo(() => pagesToReview(isDone ? state.pages : null), [isDone, state.pages]);
+  const wantGeo = isDone && !state.progress.background && !!page && (!!page.needs_review || adjusting);
+  const geoKey = `${state.jobId}:${index + 1}:${state.resultVersion}`;
+  useEffect(() => {
+    if (!wantGeo || !state.jobId) return;
+    if (geo?.key === geoKey && geo.status !== "error") return;
+    let alive = true;
+    setGeo({ key: geoKey, data: null, status: "loading" });
+    api
+      .getGeometry(state.jobId, index + 1)
+      .then((data) => alive && setGeo({ key: geoKey, data, status: "ready" }))
+      .catch((e) => {
+        if (!alive) return;
+        if (e instanceof ApiError && e.status === 404) onJobMissing();
+        // 409: page step ② is still running (for example after new corners were sent).
+        setGeo({ key: geoKey, data: null, status: e instanceof ApiError && e.status === 409 ? "pending" : "error" });
+      });
+    return () => {
+      alive = false;
+    };
+  }, [wantGeo, geoKey, adjust]); // eslint-disable-line react-hooks/exhaustive-deps
+  const pageGeo = geo?.key === geoKey ? geo : null;
+
+  usePopoverDismiss(
+    pageMenu,
+    (why) => {
+      setPageMenu(false);
+      if (why === "escape") pageMenuBtn.current?.focus();
+    },
+    [pageMenuBtn, pageMenuPanel],
+  );
+  useEffect(() => {
+    if (pageMenu) pageMenuPanel.current?.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')?.focus();
+  }, [pageMenu]);
+
+  const startAdjust = (n: number) => {
+    setPageMenu(false);
+    dispatch({ type: "SET_EDIT", on: false });
+    if (n !== index + 1) dispatch({ type: "SET_PAGE", index: n - 1 });
+    setAdjust(n);
+  };
 
   // Elements for Edit mode.
   const elKey = `${state.jobId}:${index + 1}:${state.resultVersion}`;
@@ -296,7 +379,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   // ← → change pages unless the focus is on a control that uses the arrow keys itself.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || adjustRef.current != null) return;
       const el = e.target as HTMLElement | null;
       if (
         el &&
@@ -348,7 +431,9 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   let content: ((info: ViewerRenderInfo) => React.ReactNode) | null = null;
   const alt = (kind: string) => `${kind} — ${t("nav.pageLabel", { n: index + 1, total })}`;
 
-  if (isDone && state.jobId) {
+  if (adjusting) {
+    content = null; // the corner editor draws the photo itself
+  } else if (isDone && state.jobId) {
     const jobId = state.jobId;
     const fmt = state.jobFormat;
     const v = state.resultVersion;
@@ -433,6 +518,23 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   }
   const scoreNone = isDone && state.score == null;
 
+  // Pale yellow bar above the view: a photo's paper corners should be checked.
+  let review: { text: string; lang?: string; page: number } | null = null;
+  if (isDone && !adjusting && !prog.background && reviewPages.length) {
+    const here = reviewPages.includes(index + 1);
+    if (here) {
+      const g = pageGeo?.data;
+      const serverReason = g?.review_reason && (lang === "zh-Hant" || !hasCjk(g.review_reason)) ? g.review_reason : null;
+      // The server's sentence may already ask for the corners ("…請拖曳四角確認。"): then it is shown as it is.
+      const text = serverReason && /拖曳四角|drag the (four )?corners/i.test(serverReason) ? serverReason : t("review.bar", { reason: (serverReason ?? t(reasonKey(g?.status ?? page?.quad_status ?? ""))).replace(/[。.]\s*$/, "") });
+      review = { text: total > 1 ? t("review.onPage", { n: index + 1, text }) : text, page: index + 1 };
+    } else {
+      const n = reviewPages[0];
+      review = { text: reviewPages.length > 1 ? t("review.otherPages", { n, count: reviewPages.length }) : t("review.otherPage", { n }), page: n };
+    }
+  }
+  const canAdjust = isDone && canAdjustPage(page, state.jobFilename);
+
   return (
     <section
       className={"stage" + (dragOver ? " is-dragover" : "") + (state.phase === "empty" ? " is-empty" : "")}
@@ -471,15 +573,49 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
           aspect={aspect}
           resetKey={`${index}:${view === "original" ? "o" : "r"}:${state.jobId ?? "local"}:${state.doc?.id ?? 0}`}
           label={t("nav.pageLabel", { n: index + 1, total })}
-          inset={{ top: isDone ? 72 + (renderNote || scoreNone ? 46 : 0) : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0), left: 24 }}
+          inset={{ top: isDone ? 72 + (renderNote || scoreNone ? 46 : 0) + (review ? 58 : 0) : 24, right: 24, bottom: (showNav ? 76 : 24) + (thumbs ? 112 : 0), left: 24 }}
           disabled={busy}
         >
           {(info) => <div className={"page-sheet" + (view === "compare" && isDone ? " page-sheet--compare" : "")}>{content!(info)}</div>}
         </Viewer>
       )}
 
+      {/* "Adjust the page": drag the paper's corners on the untouched photo. */}
+      {adjusting && state.jobId && (
+        <>
+          {pageGeo?.status === "ready" && pageGeo.data ? (
+            <QuadEditor
+              key={geoKey}
+              jobId={state.jobId}
+              geometry={pageGeo.data}
+              onCancel={() => setAdjust(null)}
+              onApply={async (q) => {
+                await onCorrect(cornersCorrection(index + 1, q));
+                setAdjust(null);
+              }}
+            />
+          ) : (
+            <div className="stage__center quad-wait" role="status">
+              {pageGeo?.status === "error" || pageGeo?.status === "pending" ? (
+                <>
+                  <p>{pageGeo.status === "pending" ? t("adjust.pending") : t("adjust.loadFailed")}</p>
+                  <button type="button" className="btn btn--outline-light" onClick={() => setAdjust(null)}>
+                    {t("adjust.cancel")}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <Spinner />
+                  <span className="visually-hidden">{t("adjust.loading")}</span>
+                </>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
       {/* Top bar when finished: score, view switch, edit. */}
-      {isDone && (
+      {isDone && !adjusting && (
         <div className="stage-top">
           <div className="chips">
             <span className="chip chip--score" data-testid="frame-score">
@@ -541,8 +677,15 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
         </div>
       )}
 
-      {isDone && (renderNote || scoreNone || (view === "overlay") || (state.editMode && view === "result")) && (
+      {isDone && !adjusting && (review || renderNote || scoreNone || view === "overlay" || (state.editMode && view === "result")) && (
         <div className="stage-notes">
+          {review && (
+            <button type="button" className="review-bar" data-testid="review-bar" onClick={() => startAdjust(review!.page)}>
+              <Corners size={18} className="review-bar__icon" />
+              <span className="review-bar__text">{review.text}</span>
+              <span className="review-bar__action">{review.page === index + 1 ? t("review.action") : t("review.go", { n: review.page })}</span>
+            </button>
+          )}
           {view === "overlay" && <p className="stage-note">{t("view.overlayHint")}</p>}
           {state.editMode && view === "result" && (
             <p className="stage-note" aria-live="polite">
@@ -579,7 +722,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
       )}
 
       {/* Bottom: pages. */}
-      {showNav && (
+      {showNav && !adjusting && (
         <div className="stage-bottom">
           {thumbs && total > 0 && (
             <div className="thumbs" role="list" aria-label={t("nav.thumbs")}>
@@ -613,6 +756,50 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
             >
               <Grid size={18} />
             </button>
+            {isDone && (
+              <span className="page-menu-anchor">
+                <button
+                  ref={pageMenuBtn}
+                  type="button"
+                  className={"tool-btn" + (pageMenu ? " is-on" : "")}
+                  aria-haspopup="menu"
+                  aria-expanded={pageMenu}
+                  aria-controls="page-menu"
+                  aria-label={t("page.menu")}
+                  title={t("page.menu")}
+                  disabled={prog.background}
+                  onClick={() => setPageMenu((v) => !v)}
+                  data-testid="page-menu-button"
+                >
+                  <More size={18} />
+                </button>
+                {pageMenu && (
+                  <PopoverPanel id="page-menu" role="menu" label={t("page.menu")} panelRef={pageMenuPanel} className="popover--menu popover--page" onKeyDown={(e) => onMenuKeyDown(e)}>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="menu-item"
+                      aria-disabled={!canAdjust || undefined}
+                      title={!canAdjust ? t("page.adjustNotPhoto") : undefined}
+                      onClick={() => canAdjust && startAdjust(index + 1)}
+                    >
+                      {t("page.adjust")}
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="menu-item"
+                      onClick={() => {
+                        setPageMenu(false);
+                        setPageReport(index + 1);
+                      }}
+                    >
+                      {t("page.report")}
+                    </button>
+                  </PopoverPanel>
+                )}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -724,6 +911,21 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
             requestAnimationFrame(() => back?.isConnected && back.focus());
           }}
           onApply={onCorrect}
+          report={feedback ? { onSend: feedback.send, count: feedback.items.length, consented: feedback.consented, reported: feedback.reported } : undefined}
+        />
+      )}
+
+      {pageReport != null && feedback && isDone && (
+        <PageReportDialog
+          page={pageReport}
+          tags={PAGE_TAGS}
+          onSend={feedback.send}
+          count={feedback.items.length}
+          consented={feedback.consented}
+          onClose={() => {
+            setPageReport(null);
+            requestAnimationFrame(() => pageMenuBtn.current?.focus());
+          }}
         />
       )}
     </section>

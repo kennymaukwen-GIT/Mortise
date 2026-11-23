@@ -99,7 +99,7 @@ export interface PageInfo {
   size_source?: string;
   size_confidence?: number;
   notes?: string[];
-  images: { original: string; result: string; overlay: string };
+  images: { original: string; result: string; overlay: string; source?: string };
   /** Result image URL per output format of this job. */
   result_images?: Record<string, string>;
   elements: string;
@@ -108,6 +108,84 @@ export interface PageInfo {
   /** Size the system detected for the source page (pt), before any output scaling. */
   source_width_pt?: number;
   source_height_pt?: number;
+  /** Photos: the paper's corners should be checked by the user (GET geometry says why). */
+  needs_review?: boolean;
+  /** Photos: how the paper was found (ok, cut_off, user, …); null for PDFs and screenshots. */
+  quad_status?: string | null;
+  /** URL of GET /api/jobs/{id}/pages/{n}/geometry. */
+  geometry?: string;
+}
+
+/** A point in source-image pixels: [x, y]. */
+export type Pt = [number, number];
+/** Four corners in source-image pixels: top-left, top-right, bottom-right, bottom-left. */
+export type Quad = [Pt, Pt, Pt, Pt];
+
+export type QuadStatus = "ok" | "low_contrast" | "curved_edge" | "multiple_pages" | "cut_off" | "not_found" | "user" | "not_photo" | (string & {});
+
+export interface QuadAlternative {
+  corners: Quad;
+  score: number;
+  /** Plain-language short label from the server (Traditional Chinese). */
+  label: string;
+}
+
+/** GET /api/jobs/{id}/pages/{n}/geometry: where the paper is in the photo. */
+export interface PageGeometry {
+  page: number;
+  input_type: string;
+  source: { width: number; height: number; image: string };
+  corners: Quad;
+  method: string;
+  confidence: number;
+  status: QuadStatus;
+  corner_error_px: number[] | null;
+  needs_review: boolean;
+  /** One plain sentence (Traditional Chinese); "" when no check is needed. */
+  review_reason: string;
+  alternatives: QuadAlternative[];
+  /** Index into alternatives to pre-select, or null. */
+  preselect: number | null;
+  /** Curved outline of the paper (source pixels) or null. */
+  outline: Pt[] | null;
+  dewarp: { applied: boolean; source: "measured" | "uvdoc_prior" | null | (string & {}); residual_px: number | null; needs_review: boolean };
+  glare: number | null;
+  /** The corners were set by the user. */
+  user_set: boolean;
+  notes: string[];
+}
+
+/** One feedback record as GET /api/jobs/{id}/feedback lists it. */
+export interface FeedbackItem extends FeedbackIn {
+  id: string;
+  created?: string | number;
+  [key: string]: unknown;
+}
+
+/** GET /api/jobs/{id}/feedback */
+export interface FeedbackList {
+  items: FeedbackItem[];
+  corrections: number;
+  consented: boolean;
+}
+
+/** GET /api/engine */
+export interface EngineInfo {
+  version: string;
+  name?: string;
+  components?: Record<string, unknown>;
+  scorecard: EngineScorecard | null;
+}
+
+export interface EngineScorecard {
+  version?: string;
+  name?: string;
+  created?: string;
+  suite?: string;
+  matches_current?: boolean;
+  headline?: Record<string, { label?: string; mean?: number | null; n?: number; scope?: string; [key: string]: unknown }>;
+  errors?: number;
+  [key: string]: unknown;
 }
 
 export interface RunInfo {
@@ -232,6 +310,20 @@ export interface CorrectionIn {
   page?: number | null;
 }
 
+/** Tags the feedback API understands (POST /api/jobs/{id}/feedback). */
+export type FeedbackTag =
+  | "text_wrong"
+  | "font_wrong"
+  | "size_wrong"
+  | "color_wrong"
+  | "position_wrong"
+  | "missing"
+  | "extra"
+  | "table_wrong"
+  | "layout_broken"
+  | "corners_wrong"
+  | "other";
+
 export interface FeedbackIn {
   rating?: number;
   page?: number;
@@ -241,7 +333,7 @@ export interface FeedbackIn {
   tags?: string[];
 }
 
-export type ImageKind = "original" | "result" | "overlay";
+export type ImageKind = "original" | "result" | "overlay" | "source";
 
 export interface CreateJobInput {
   file: File;

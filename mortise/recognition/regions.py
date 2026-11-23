@@ -47,7 +47,9 @@
 12. 圖層：每對區域在「補全後遮罩」的重疊處，看得到誰的像素誰就在上；巢狀時內層自然在上。
     以拓撲排序給 z，無關係者面積大的在下。
 13. 無框線表格：由 text_quads 分列、找跨列貫通的空白帶（欄間河道），至少兩欄三列，信心值較低；
-    儲存格幾乎填滿整欄（分欄長文）者不算。
+    儲存格幾乎填滿整欄（分欄長文）者不算。兩欄版面（各欄自己排、只是剛好有幾行同高）也不算：候選的各欄
+    一起往上下延伸成「欄的文字流」，流裡大多數的行在別的欄沒有同高度的鄰居，就是兩欄版面（_bl_column_flow）；
+    放棄之後在每一個獨立的欄裡再找一次（兩欄版面的其中一欄裡夾著的真正表格仍找得到）。
 附加的清理步驟：相鄰同色平坦區塊合併（JPEG 區塊邊界會切開色塊）；外框線碎段（平坦段＋轉角紋理）
 連成環狀就併成一個候選；緊貼色塊、顏色接近色塊或背景的薄紋理視為邊緣殘影（JPEG 振鈴、模糊殘邊）；
 像素其實是背景色的候選（平滑造成的殘影）丟棄；緊貼文字遮罩的小塊視為文字殘渣丟棄；
@@ -214,6 +216,9 @@ DEFAULT_PARAMS: dict = {
     "bl_max_col_fill": 0.75,  # 儲存格寬 ÷ 欄寬的中位數上限（比例）；分欄長文每行幾乎填滿整欄
     "bl_conf_base": 0.25,  # 無框表格信心值基數
     "bl_conf_gain": 0.35,  # 無框表格信心值隨支持度增加的幅度
+    "bl_flow_pair_min": 0.8,  # 各欄往上下延伸成文字流後，別的欄有同高鄰居的行所佔比例下限（比例；兩欄版面量到 0.27–0.68，表格約 1）
+    "bl_flow_gap_max": 2.5,  # 欄的文字流往上下延伸時，下一行與目前邊緣（各欄一起算）的最大垂直間距（倍字高）
+    "bl_flow_right_slack": 0.1,  # 最後一欄的右界多放寬候選寬度的這個比例（右欄的長行常比候選裡的長）
     # ---------------- 裁切 ----------------
     "crop_feather_px": 0.7,  # 遮罩羽化的高斯 σ（像素）
     "crop_supersample": 4,  # 以幾何外形畫透明度時的超取樣倍數（倍）
@@ -1939,11 +1944,19 @@ def _borderless_tables(text_quads, taken, P: dict, H: int, W: int):
         if y1 - y0 < 2:
             continue
         boxes.append((x0, y0, x1, y1))
+    if len(boxes) < int(P["bl_min_rows"]) * int(P["bl_min_cols"]):
+        return []
+    hmed = float(np.median([b[3] - b[1] for b in boxes]))
+    return _bl_find(boxes, list(taken), P, hmed, nested=False)
+
+
+def _bl_find(boxes, taken, P: dict, hmed: float, nested: bool):
+    """無框線表格的主體：分列 → 每列切成儲存格 → 連續多格的列成為候選 → 找欄間空白帶 → 檢查。
+    nested=True 表示在兩欄版面的某一欄裡面再找一次（只找一層）。"""
     out = []
     if len(boxes) < int(P["bl_min_rows"]) * int(P["bl_min_cols"]):
         return out
-    hmed = float(np.median([b[3] - b[1] for b in boxes]))
-    boxes.sort(key=lambda b: (b[1] + b[3]) / 2)
+    boxes = sorted(boxes, key=lambda b: (b[1] + b[3]) / 2)
     rows: list[list] = []
     for b in boxes:
         yc = (b[1] + b[3]) / 2
@@ -2014,13 +2027,103 @@ def _borderless_tables(text_quads, taken, P: dict, H: int, W: int):
         if frac < float(P["bl_row_align_min"]) or mean_w > float(P["bl_max_cell_frac"]) * (X1 - X0) or fill_med > float(P["bl_max_col_fill"]):
             continue  # 儲存格填滿整欄（長文分欄）不算表格
         box = (X0, int(math.floor(Y0)), X1, int(math.ceil(Y1)))
-        if any(_box_iou(box, t) > 0.3 for t in taken):
+        if any(_box_iou(box, t) > 0.3 or _inside_frac(box, t) > 0.5 for t in taken):
+            continue  # 和已經找到的表格重疊，或大半落在有框表格裡（有框表格裡的幾列不是另一張表）
+        flow = _bl_column_flow(boxes, (X0, Y0, X1, Y1), rivers, P, hmed)
+        if flow["lines"] and flow["pair_ratio"] < float(P["bl_flow_pair_min"]):
+            # 兩欄版面：各欄的文字往表格範圍外一路排下去，兩欄的行只是剛好有幾列落在同一高度
+            dbg = P.get("_debug")
+            if isinstance(dbg, list):
+                dbg.append({"borderless_rejected": box, "reason": "two_column_flow",
+                            **{k: v for k, v in flow.items() if k in ("lines", "outside", "pair_ratio")}})
+            if not nested:
+                # 兩欄版面的其中一欄裡面也可能有真正的表格（例如右欄裡的一張小表）：每一欄自己再找一次
+                zy0, zy1 = flow["zone"]
+                for lo, hi in (flow["flows"] if len(flow["flows"]) > 1 else []):
+                    sub = [b for b in boxes if b[0] >= lo and b[2] <= hi and zy0 <= (b[1] + b[3]) / 2 <= zy1]
+                    for t in _bl_find(sub, taken + [o["box"] for o in out], P, hmed, nested=True):
+                        if not any(_box_iou(t["box"], o["box"]) > 0.3 for o in out):
+                            t["notes"].append("位在兩欄版面的其中一欄裡（只用這一欄的文字找）")
+                            out.append(t)
             continue
         ys = [Y0] + [(max(c[3] for c in run[i]) + min(c[1] for c in run[i + 1])) / 2 for i in range(len(run) - 1)] + [Y1]
         conf = float(P["bl_conf_base"]) + float(P["bl_conf_gain"]) * frac * min(1.0, len(run) / 5.0)
         out.append({"box": box, "grid": TableGrid([round(float(y), 2) for y in ys], [round(float(x), 2) for x in edges], False), "conf": conf,
                     "notes": [f"由文字對齊推得的無框線表格：{len(run)} 列 × {ncols} 欄，跨欄對齊比例 {frac:.2f}"]})
     return out
+
+
+def _bl_column_flow(boxes, box, rivers, P: dict, hmed: float) -> dict:
+    """無框線表格候選的「欄的文字流」：分辨真正的表格與兩欄版面。
+
+    為什麼需要：上面的分列是整頁一起分的。兩欄版面（例如履歷：左欄聯絡方式與技能、右欄經歷）兩欄各自排、行距不同，
+    但總有幾段剛好連續三四行落在同一高度；那幾行切出來看，和無框線表格一模一樣（兩欄之間有一條貫通的空白、每列兩格）。
+    差別在候選範圍外：
+      表格的每一欄在表格上下就結束了（上面是標題或橫跨整個表格的說明，下面是下一段），欄裡的每一行都有同一列的鄰居；
+      兩欄版面的每一欄往上、往下還有自己的一大段（自己的標題、段落、行距），而且那些行在別的欄多半沒有同高度的鄰居。
+    做法：
+      1. 欄界：欄間空白帶的中線。第一欄往左、最後一欄往右各多放一點（往右多放：右欄的長行常比候選裡的長）；
+         完全在範圍外的行（頁面上別的欄）不管。每一行記下它從第幾欄排到第幾欄（跨過幾條欄界）。
+      2. 從候選的上下緣往外延伸：下一行與目前的邊緣相距不超過 bl_flow_gap_max 個字高就接上；所有的欄都空了一大段、
+         或碰到橫跨全部欄的行（表題、說明）就停止。各欄一起延伸（不是各欄各自停）：表格裡只有第一欄有字的分組列、
+         某一欄的空格，不會讓其他欄提早停住。只跨過部分欄界的行（例如右欄的段落跨過右欄裡那張小表的欄界）照樣收進來。
+      3. 收進來的行裡，「別的欄（不重疊的欄）在同一高度（bl_row_tol 個字高內）也有行」的比例＝成對比例。
+         真正的表格接近 1（上下多一行表題、分組名稱也只少一點）；兩欄版面量到 0.27–0.68（兩份虛構的兩欄文件與一份真實履歷）。
+         成對比例低於 bl_flow_pair_min 就不當表格。
+      4. 收進來的行都沒有跨過的欄界是「頁面的欄間」：據此把範圍切成幾個獨立的文字流（flows），呼叫端在每一個裡面再找一次表格
+         （兩欄版面的右欄裡夾著一張真正的表格時，跨到左欄的候選放棄，右欄自己找得到那張表）。
+    回傳 {"lines": 收進來的行數, "outside": 候選範圍外的行數, "pair_ratio": 成對比例,
+          "flows": 各個獨立文字流的左右界 [(左, 右), ...], "zone": 延伸後的上下範圍 (上, 下)}。"""
+    X0, Y0, X1, Y1 = box
+    mids = [(a + b) / 2 for a, b in rivers]
+    river = float(P["bl_river_min"]) * hmed
+    lo = X0 - river
+    hi = X1 + max(river, float(P["bl_flow_right_slack"]) * (X1 - X0))
+    ncol = len(mids) + 1
+    tol_in = float(P["bl_row_tol"]) * hmed
+    inside, below, above = [], [], []
+    for b in boxes:
+        if b[2] <= lo or b[0] >= hi:
+            continue  # 頁面上別的欄
+        k0 = sum(1 for m in mids if m <= b[0])
+        k1 = sum(1 for m in mids if m < b[2])
+        item = (k0, k1, b)
+        yc = (b[1] + b[3]) / 2
+        if Y0 - tol_in <= yc <= Y1 + tol_in:
+            inside.append(item)
+        elif yc > Y1:
+            below.append(item)
+        else:
+            above.append(item)
+    gap = float(P["bl_flow_gap_max"]) * hmed
+    flow = list(inside)
+    for direction, cands in ((1, sorted(below, key=lambda t: t[2][1])), (-1, sorted(above, key=lambda t: -t[2][3]))):
+        edge = Y1 if direction > 0 else Y0  # 文字流目前延伸到的邊緣（往下是下緣、往上是上緣；所有的欄一起算）
+        for k0, k1, b in cands:
+            if ncol >= 2 and k0 == 0 and k1 == ncol - 1:
+                break  # 橫跨全部欄的行：表格（或多欄區）在這裡結束
+            if (b[1] - edge if direction > 0 else edge - b[3]) > gap:
+                break  # 所有的欄都空了一大段：到這裡為止
+            flow.append((k0, k1, b))
+            edge = max(edge, b[3]) if direction > 0 else min(edge, b[1])
+    paired = 0
+    for k0, k1, b in flow:
+        yc = (b[1] + b[3]) / 2
+        if any((j1 < k0 or j0 > k1) and abs((b2[1] + b2[3]) / 2 - yc) <= tol_in for j0, j1, b2 in flow):
+            paired += 1
+    n = len(flow)
+    gutters = [j for j in range(ncol - 1) if not any(k0 <= j < k1 for k0, k1, _ in flow)]
+    cuts = [lo] + [mids[j] for j in gutters] + [hi]
+    zone = (min([b[1] for _, _, b in flow] + [Y0]), max([b[3] for _, _, b in flow] + [Y1]))
+    return {"lines": n, "outside": n - len(inside), "pair_ratio": paired / n if n else 1.0,
+            "flows": list(zip(cuts[:-1], cuts[1:])), "zone": zone}
+
+
+def _inside_frac(a, b) -> float:
+    """方框 a 有多少比例的面積落在方框 b 裡。"""
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    return ix * iy / max((a[2] - a[0]) * (a[3] - a[1]), 1)
 
 
 def _box_iou(a, b) -> float:

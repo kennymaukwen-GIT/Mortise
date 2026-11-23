@@ -233,6 +233,8 @@ p {
   min-height: 520px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--card-w);
+  /* One row exactly as tall as the window allows: a tall side column scrolls instead of stretching the frame. */
+  grid-template-rows: minmax(0, 1fr);
   gap: var(--gap);
   padding-right: var(--side-extra-right);
 }
@@ -1355,9 +1357,12 @@ input.field__input {
   min-height: 0;
   display: grid;
   /* The card sits in the middle row (centred on the frame, as in the mockup) whether or not the result card is shown:
-     the result card goes in the bottom row, so nothing above it moves. Rows grow instead of clipping when space runs out. */
-  grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr);
+     the result card goes in the bottom row, so nothing above it moves. Rows grow instead of clipping when space runs out:
+     when the result card is taller than the space below the card, the card moves up just enough (never under the fold). */
+  grid-template-rows: minmax(0, 1fr) auto minmax(min-content, 1fr);
   overflow-y: auto;
+  /* Its contents never make the window taller than the screen (they scroll inside instead). */
+  contain: size;
   padding: 6px 0; /* room for focus rings */
 }
 .side > .card {
@@ -1681,6 +1686,508 @@ input.field__input {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
 
+/* ------------------------------------------------------------------ page review (photo corners) */
+
+/* Pale yellow, low opacity: "please check this" (docs/design/questions-feature.md). */
+.review-bar {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(100%, 760px);
+  padding: 7px 8px 7px 14px;
+  border-radius: 16px;
+  border: 1.5px solid rgba(255, 230, 90, 0.62);
+  background: rgba(255, 230, 90, 0.28);
+  color: #fff8d6;
+  font-size: var(--fs-small);
+  font-weight: 500;
+  text-align: left;
+  backdrop-filter: blur(2px);
+}
+.review-bar:hover {
+  background: rgba(255, 230, 90, 0.36);
+}
+.review-bar:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px #000, 0 0 0 4px #ffe65a;
+}
+.review-bar__icon {
+  flex: none;
+  color: #ffe65a;
+}
+.review-bar__text {
+  flex: 1;
+  min-width: 0;
+}
+.review-bar__action {
+  flex: none;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: #ffe65a;
+  color: #000;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.quad-editor {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+}
+.quad-box {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  --quad-stroke: 2px;
+}
+.quad-photo {
+  position: absolute;
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+  pointer-events: none;
+}
+.quad-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+.quad-svg__photo-edge {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.35);
+  stroke-width: 1px;
+  stroke-dasharray: 3 4;
+}
+.quad-svg__shade {
+  fill: rgba(0, 0, 0, 0.5);
+}
+.quad-svg__outline {
+  fill: none;
+  stroke: #ffe65a;
+  stroke-width: var(--quad-stroke);
+  stroke-dasharray: 7 6;
+}
+.quad-svg__quad-halo {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.55);
+  stroke-width: calc(var(--quad-stroke) * 2.5);
+  stroke-linejoin: round;
+}
+.quad-svg__quad {
+  fill: rgba(47, 107, 255, 0.08);
+  stroke: #5b8cff;
+  stroke-width: var(--quad-stroke);
+  stroke-linejoin: round;
+}
+.quad-handle {
+  position: absolute;
+  width: 44px; /* comfortable to grab with a finger */
+  height: 44px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  cursor: grab;
+  touch-action: none;
+  display: grid;
+  place-items: center;
+  z-index: 2;
+}
+.quad-handle__dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(47, 107, 255, 0.25);
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 1.5px #000, 0 2px 8px rgba(0, 0, 0, 0.5);
+  transition: transform 0.12s;
+}
+.quad-handle:hover .quad-handle__dot,
+.quad-handle.is-active .quad-handle__dot {
+  transform: scale(1.18);
+  background: rgba(47, 107, 255, 0.55);
+}
+.quad-handle.is-active {
+  cursor: grabbing;
+}
+.quad-handle:focus-visible {
+  outline: none;
+}
+.quad-handle:focus-visible .quad-handle__dot {
+  box-shadow: 0 0 0 2px #000, 0 0 0 5px #ffe65a;
+}
+.quad-mag {
+  position: absolute;
+  z-index: 30;
+  border-radius: 50%;
+  border: 3px solid #fff;
+  box-shadow: 0 0 0 1.5px #000, 0 8px 24px rgba(0, 0, 0, 0.6);
+  background-color: #222;
+  background-repeat: no-repeat;
+  overflow: hidden;
+  pointer-events: none;
+}
+.quad-mag svg {
+  display: block;
+}
+.quad-mag__edge {
+  fill: none;
+  stroke: #5b8cff;
+  stroke-width: 2;
+}
+.quad-mag__cross {
+  fill: none;
+  stroke: #ffe65a;
+  stroke-width: 1.5;
+}
+.quad-top {
+  position: absolute;
+  top: 14px;
+  left: 20px;
+  right: 20px;
+  z-index: 14;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+.quad-top > * {
+  pointer-events: auto;
+}
+.quad-top__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 100%;
+}
+.quad-title {
+  flex: none;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 0 14px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  background: #ffe65a;
+  color: #000;
+}
+.quad-choices {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 999px;
+  background: var(--c-chrome);
+  border: 1.5px solid var(--c-chrome-line);
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.quad-chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.quad-chip:hover {
+  background: var(--c-hover-dark);
+}
+.quad-chip[aria-checked="true"] {
+  background: #fff;
+  color: #000;
+}
+.quad-chip__hint {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #ffe65a;
+  color: #000;
+  font-size: 11px;
+  font-weight: 600;
+}
+.quad-hint {
+  max-width: min(100%, 760px);
+  padding: 6px 12px;
+  border-radius: 14px;
+  background: var(--c-chrome);
+  border: 1.5px solid var(--c-chrome-line);
+  color: #fff;
+  font-size: var(--fs-small);
+  text-align: center;
+}
+.quad-hint__reason {
+  color: #ffe65a;
+  font-weight: 600;
+}
+.quad-actions {
+  position: absolute;
+  left: 20px;
+  bottom: 20px;
+  z-index: 14;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: calc(100% - 220px);
+}
+.quad-actions__buttons {
+  display: flex;
+  gap: 10px;
+}
+.quad-actions .btn--outline-light {
+  background: #000;
+}
+.quad-error {
+  padding: 6px 12px;
+  border-radius: 12px;
+  background: #3a0d0b;
+  border: 1.5px solid var(--c-danger);
+  color: #fff;
+  font-size: var(--fs-small);
+}
+.quad-wait {
+  pointer-events: auto;
+  gap: 12px;
+  text-align: center;
+  color: #fff;
+}
+.quad-wait .spinner {
+  position: relative;
+  left: auto;
+  top: auto;
+  margin: 0;
+}
+
+/* page menu (bottom toolbar) */
+.page-menu-anchor {
+  position: relative;
+  display: inline-flex;
+}
+.popover--page {
+  top: auto;
+  bottom: calc(100% + 12px);
+  left: -6px;
+  right: auto;
+}
+
+/* ------------------------------------------------------------------ feedback */
+
+.result-card__rate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid #e3e5e8;
+}
+.result-card__rate-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.result-card__label--small {
+  font-size: var(--fs-body);
+}
+.rating {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rating__stars {
+  display: inline-flex;
+  gap: 0;
+}
+.rating__star {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: #9a9da2;
+  display: inline-grid;
+  place-items: center;
+}
+.rating__star.is-on {
+  color: #000;
+}
+.rating__star:hover {
+  background: var(--c-hover-light);
+}
+.rating__star:disabled {
+  opacity: 0.45;
+}
+.rating__word {
+  min-width: 4.5em;
+  font-size: var(--fs-small);
+  color: var(--c-muted-light);
+}
+.rating__error {
+  width: 100%;
+  color: var(--c-danger-ink);
+  font-size: var(--fs-small);
+}
+.fb-saved {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--fs-small);
+  color: var(--c-muted-light);
+}
+.fb-saved.is-fresh strong {
+  color: #0b6b2e;
+}
+.fb-saved.is-fresh svg {
+  color: #0b6b2e;
+}
+.fb-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--c-muted-light);
+}
+
+.dialog__report {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #e3e5e8;
+}
+.report-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  border: 1.5px solid rgba(214, 170, 0, 0.7);
+  border-radius: 12px;
+  background: rgba(255, 230, 90, 0.28);
+  color: #000;
+  font-weight: 600;
+  font-size: var(--fs-body);
+  text-align: left;
+}
+.report-toggle:hover {
+  background: rgba(255, 230, 90, 0.42);
+}
+.report-toggle__done {
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #000;
+  color: #fff;
+  font-size: 12px;
+}
+.report-toggle__caret {
+  margin-left: auto;
+  transition: transform 0.15s;
+}
+.report-toggle.is-open .report-toggle__caret {
+  transform: rotate(180deg);
+}
+.report {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+.report__tags {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.report__tags legend {
+  margin-bottom: 6px;
+  padding: 0;
+}
+.report__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1.5px solid #000;
+  background: #fff;
+  color: #000;
+  font-size: 14px;
+  font-weight: 500;
+}
+.tag-chip:hover {
+  background: var(--c-hover-light);
+}
+.tag-chip[aria-pressed="true"] {
+  background: #000;
+  color: #fff;
+}
+.field__input--light,
+input.field__input.field__input--light {
+  height: 38px;
+  border: 1.5px solid #b7babe;
+  border-radius: 10px;
+  background: #fff;
+  color: #000;
+  font-weight: 400;
+}
+.field__input--light:focus-visible {
+  border-color: #000;
+}
+.report__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.btn--small {
+  height: 36px;
+  padding: 0 16px;
+}
+.fb-note--dialog {
+  margin-top: -2px;
+}
+
+.acct-engine {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: var(--fs-body);
+}
+.acct-engine strong {
+  font-size: 17px;
+}
+.acct-version {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--c-muted-dark);
+}
+.acct-version code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  color: #d6d8db;
+}
+
 /* ------------------------------------------------------------------ narrower screens */
 
 /* 900–1099 px: keep frame and card side by side (a narrower card), so CONVERT stays on the first screen. */
@@ -1708,6 +2215,7 @@ input.field__input {
     height: auto;
     min-height: 0;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
   }
   .stage {
     height: min(78vh, 900px, calc(100dvh - var(--header-h) - 200px));
@@ -1717,6 +2225,7 @@ input.field__input {
     display: flex;
     flex-direction: column;
     overflow: visible;
+    contain: none;
     align-items: center;
     justify-content: flex-start;
     gap: 16px;
@@ -1838,6 +2347,41 @@ input.field__input {
   }
   .steps__name {
     display: none;
+  }
+}
+
+/* Phones: the corner editor and the yellow bar stack; buttons stay reachable with a thumb. */
+@media (max-width: 600px) {
+  .review-bar {
+    font-size: 12px;
+    padding: 6px 6px 6px 10px;
+  }
+  .review-bar__action {
+    padding: 5px 10px;
+  }
+  .quad-top {
+    top: 10px;
+    left: 10px;
+    right: 10px;
+  }
+  .quad-title {
+    display: none;
+  }
+  .quad-hint {
+    font-size: 12px;
+  }
+  /* Phones are used with a finger: the arrow-key tip only takes room there. */
+  .quad-hint__keys {
+    display: none;
+  }
+  .quad-actions {
+    left: 10px;
+    bottom: 12px;
+    max-width: calc(100% - 150px);
+  }
+  .quad-actions .btn {
+    height: 38px;
+    padding: 0 14px;
   }
 }
 

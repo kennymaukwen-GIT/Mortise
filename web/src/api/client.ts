@@ -2,7 +2,9 @@
 import type {
   CorrectionIn,
   CreateJobInput,
+  EngineInfo,
   FeedbackIn,
+  FeedbackList,
   FidelityReportJson,
   FormatInfo,
   Health,
@@ -10,6 +12,7 @@ import type {
   JobEvent,
   JobStatus,
   PageElements,
+  PageGeometry,
   PageInfo,
   PageSizePreset,
 } from "./types";
@@ -165,13 +168,77 @@ export function postFeedback(id: string, fb: FeedbackIn): Promise<{ ok: boolean;
   });
 }
 
+/** Where the paper is in a photo (409 while page step ② has not finished, or is re-running after new corners). */
+export function getGeometry(id: string, page: number): Promise<PageGeometry> {
+  return request<PageGeometry>(`/api/jobs/${encodeURIComponent(id)}/pages/${page}/geometry`);
+}
+
+/** Feedback already sent for a job, the number of corrections, and whether the job may be used to improve recognition. */
+export function getFeedback(id: string): Promise<FeedbackList> {
+  return request<FeedbackList>(`/api/jobs/${encodeURIComponent(id)}/feedback`);
+}
+
+export function feedbackExportUrl(id: string): string {
+  return apiUrl(`/api/jobs/${encodeURIComponent(id)}/feedback/export`);
+}
+
+export function getEngine(): Promise<EngineInfo> {
+  return request<EngineInfo>("/api/engine");
+}
+
+/** File name from a Content-Disposition header (prefers the UTF-8 filename*). */
+export function dispositionName(header: string | null, fallback: string): string {
+  if (!header) return fallback;
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(header);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      /* fall through */
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/.exec(header);
+  return plain ? plain[1].trim() : fallback;
+}
+
+/** Download a job's feedback bundle (zip). Fetched first so a failure can be shown instead of saving an error page. */
+export async function downloadFeedbackBundle(id: string, fallbackName: string): Promise<string> {
+  let res: Response;
+  try {
+    res = await fetch(feedbackExportUrl(id), { credentials: "same-origin" });
+  } catch (e) {
+    throw new ApiError(0, e instanceof Error ? e.message : String(e));
+  }
+  if (!res.ok) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(res.status, errorMessage(body, `HTTP ${res.status}`));
+  }
+  const name = dispositionName(res.headers.get("Content-Disposition"), fallbackName);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  return name;
+}
+
 export function deleteJob(id: string): Promise<void> {
   return request<void>(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 export function pageImageUrl(id: string, page: number, kind: ImageKind, opts: { width?: number; format?: string; v?: number } = {}): string {
   const q = new URLSearchParams({ kind });
-  if (opts.format && kind !== "original") q.set("format", opts.format);
+  if (opts.format && kind !== "original" && kind !== "source") q.set("format", opts.format);
   if (opts.width) q.set("width", String(Math.round(opts.width)));
   if (opts.v) q.set("v", String(opts.v)); // cache-buster after a re-run
   return apiUrl(`/api/jobs/${encodeURIComponent(id)}/pages/${page}/image?${q.toString()}`);

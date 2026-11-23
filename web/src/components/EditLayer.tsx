@@ -1,10 +1,22 @@
 // Clickable element boxes drawn over the Result view, and the text correction dialog.
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { Box, CorrectionIn, PageElements, TextBoxInfo } from "../api/types";
+import type { Box, CorrectionIn, FeedbackIn, PageElements, TextBoxInfo } from "../api/types";
 import { useI18n } from "../i18n/I18n";
 import { hasCjk, visibleIssues } from "../lib/errors";
 import { diffForm, initialForm, normalizeHex, type TextForm } from "../state/corrections";
-import { Caret, Close } from "./Icons";
+import { tagsFor } from "../state/feedback";
+import { ReportForm } from "./Feedback";
+import { Caret, Close, Flag } from "./Icons";
+
+/** "Something is wrong here" inside the element panel. */
+export interface ElementReport {
+  onSend: (fb: FeedbackIn) => Promise<void>;
+  /** Notes saved for this job so far. */
+  count: number;
+  consented: boolean | null;
+  /** Elements already reported as wrong. */
+  reported: Set<string>;
+}
 
 const LOW = 0.7;
 
@@ -59,12 +71,13 @@ export function EditLayer({ elements, onSelect, selectedId }: { elements: PageEl
   );
 }
 
-export function EditDialog({ elements, elementId, page, onClose, onApply }: {
+export function EditDialog({ elements, elementId, page, onClose, onApply, report }: {
   elements: PageElements;
   elementId: string;
   page: number;
   onClose: () => void;
   onApply: (items: CorrectionIn[]) => Promise<void>;
+  report?: ElementReport;
 }) {
   const { t, lang } = useI18n();
   const uid = useId();
@@ -75,15 +88,19 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const panel = useRef<HTMLDivElement>(null);
+  // Only text boxes can be corrected here, so for anything else "something is wrong here" is open from the start.
+  const [reportOpen, setReportOpen] = useState(!tb);
 
   useEffect(() => {
     setForm(before);
     setError(null);
   }, [before]);
+  useEffect(() => setReportOpen(!tb), [elementId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     // Start in the first text field (the close button comes first in the markup).
-    const first = panel.current?.querySelector<HTMLElement>("textarea") ?? panel.current?.querySelector<HTMLElement>("input, select, button");
+    const first =
+      panel.current?.querySelector<HTMLElement>("textarea") ?? panel.current?.querySelector<HTMLElement>("[data-tag]") ?? panel.current?.querySelector<HTMLElement>("input, select, button");
     first?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -249,6 +266,35 @@ export function EditDialog({ elements, elementId, page, onClose, onApply }: {
               </button>
             </div>
           </form>
+        )}
+
+        {report && (
+          <section className="dialog__report" aria-label={t("fb.wrong")}>
+            <button
+              type="button"
+              className={"report-toggle" + (reportOpen ? " is-open" : "")}
+              aria-expanded={reportOpen}
+              onClick={() => setReportOpen((v) => !v)}
+              data-testid="report-toggle"
+            >
+              <Flag size={16} />
+              <span>{t("fb.wrong")}</span>
+              {report.reported.has(el.id) && <span className="report-toggle__done">{t("fb.alreadyReported")}</span>}
+              <Caret className="report-toggle__caret" />
+            </button>
+            {reportOpen && (
+              <ReportForm
+                page={page}
+                elementId={el.id}
+                tags={tagsFor(el.kind)}
+                onSend={report.onSend}
+                count={report.count}
+                consented={report.consented}
+                autoFocus={!!tb}
+                key={el.id}
+              />
+            )}
+          </section>
         )}
       </div>
     </div>

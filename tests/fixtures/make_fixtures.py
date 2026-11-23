@@ -4,6 +4,7 @@
     python tests/fixtures/make_fixtures.py vectors    只產生向量圖的三個（vector_*.pdf；不需要 LibreOffice，輸出的位元組固定）
     python tests/fixtures/make_fixtures.py flattened  只產生被扁平化內容的兩個（flattened_*.pdf；不需要 LibreOffice，輸出的位元組固定）
     python tests/fixtures/make_fixtures.py cv         只產生假資料的兩欄履歷（cv_two_column.pdf；不需要 LibreOffice，輸出的位元組固定）
+    python tests/fixtures/make_fixtures.py columns    只產生假資料的兩欄講義與無框線表格（two_column_notes.pdf、borderless_tables.pdf；不需要 LibreOffice，輸出的位元組固定）
 """
 
 from __future__ import annotations
@@ -883,12 +884,177 @@ def cv_two_column() -> None:
     c.save()
 
 
+def _wrap(s: str, font: str, size: float, width: float) -> list[str]:
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    lines, cur = [], ""
+    for word in s.split():
+        trial = (cur + " " + word).strip()
+        if stringWidth(trial, font, size) <= width or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    return lines + [cur]
+
+
+def two_column_notes() -> None:
+    """假資料的兩欄講義（社區菜園工作坊，內容全部虛構）：和 cv_two_column 相反，左邊是寬的主欄（約六成）、右邊是窄欄，
+    兩欄用同一個字級與行距（行有時會剛好對齊，最容易被誤認成表格），欄內有粗體小標題、多行段落與項目符號；
+    最上面的標題與最下面的頁尾橫跨兩欄。用來測兩欄版面不被當成無框線表格（tests/recognition/test_two_column_layout.py）。
+    不需要 LibreOffice，輸出的位元組固定。"""
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("two_column_notes.pdf", (w, h))
+    ink, accent, grey = HexColor("#1E1E1E"), HexColor("#3B6E3B"), HexColor("#444444")
+    size, lead = 9.5, 13.0
+
+    def text(x, top, s, sz=size, font="LS", color=grey):
+        c.setFillColor(color)
+        c.setFont(font, sz)
+        c.drawString(x, h - top, s)
+
+    text(48, 64, "Greenway Community Garden", 22, "LSB", ink)
+    text(48, 86, "Spring workshop notes · Plot holders and volunteers", 10.5, color=accent)
+    c.setStrokeColor(HexColor("#CCCCCC"))
+    c.setLineWidth(0.6)
+    c.line(48, h - 100, w - 48, h - 100)
+
+    def column(x0, x1, top, blocks):
+        for kind, body in blocks:
+            if kind == "head":
+                top += 8
+                text(x0, top, body, 10.5, "LSB", accent)
+                top += lead + 3
+            elif kind == "para":
+                for line in _wrap(body, "LS", size, x1 - x0):
+                    text(x0, top, line)
+                    top += lead
+                top += 5
+            else:  # 項目符號
+                for item in body:
+                    for k, line in enumerate(_wrap(item, "LS", size, x1 - x0 - 12)):
+                        if k == 0:
+                            text(x0 + 2, top, "•")
+                        text(x0 + 12, top, line)
+                        top += lead
+                top += 5
+        return top
+
+    column(48, 330, 124, [
+        ("head", "Why we start early"),
+        ("para", "Cold frames go in during the first dry week of March. Seedlings that start under glass are ready for the open beds "
+                 "about three weeks sooner, and the soil has time to warm before the first planting day."),
+        ("para", "Each plot holder looks after one frame. The frames are shared, so please label every tray with your plot "
+                 "letter and the sowing date."),
+        ("head", "What to bring"),
+        ("bullets", ["Gloves and a hand trowel; the shed has spare forks for the heavy beds.",
+                     "Seed packets in a paper bag, not plastic, so they stay dry.",
+                     "A water bottle; the garden tap is switched off until April."]),
+        ("head", "Compost rota"),
+        ("para", "The compost bays are turned every second Saturday. Bay one takes fresh green waste only. Bay two is resting "
+                 "and should not be opened until the thermometer reads below twenty degrees."),
+        ("bullets", ["Chop woody stems before they go in the bay.",
+                     "Never add cooked food, meat or dairy.",
+                     "Write the date on the board when you turn a bay."]),
+        ("head", "Watering"),
+        ("para", "Water in the early morning or after six in the evening. One full can per square metre is enough for most beds; "
+                 "seedlings need a fine rose and a lighter hand."),
+    ])
+    column(360, w - 48, 124, [
+        ("head", "This month"),
+        ("bullets", ["Sow broad beans and early peas.", "Lift the last leeks.", "Mend the north fence before the windy weeks."]),
+        ("head", "Tool shed"),
+        ("para", "The shed code changes on the first of every month. Ask a coordinator for the new code."),
+        ("bullets", ["Return forks clean.", "Hang the hoses on the hooks.", "Report broken handles."]),
+        ("head", "Contact"),
+        ("para", "Coordinators answer messages on weekday evenings. For anything urgent, leave a note on the board by the gate."),
+        ("head", "Next meeting"),
+        ("para", "The next plot holders meeting is in the potting shed after the spring planting day."),
+    ])
+    c.setStrokeColor(HexColor("#CCCCCC"))
+    c.line(48, 70, w - 48, 70)
+    s = "Greenway Community Garden · Workshop notes, page 1"
+    text((w - stringWidth(s, "LS", 8.5)) / 2, h - 56, s, 8.5)
+    c.showPage()
+    c.save()
+
+
+def borderless_tables() -> None:
+    """假資料的無框線表格（內容全部虛構）：一頁裡有價目表（3 欄 × 8 列，含表頭）與課表（6 欄 × 6 列，含表頭），
+    都沒有任何格線，只靠文字對齊成欄；表格上下各有一段橫跨整頁的說明文字。
+    用來確認修正兩欄版面之後，真正的無框線表格仍然認得出來（tests/recognition/test_two_column_layout.py）。
+    不需要 LibreOffice，輸出的位元組固定。"""
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("borderless_tables.pdf", (w, h))
+    ink, grey = HexColor("#1E1E1E"), HexColor("#444444")
+
+    def text(x, top, s, sz=10.0, font="LS", color=grey, align="left"):
+        c.setFillColor(color)
+        c.setFont(font, sz)
+        c.drawString(x - (stringWidth(s, font, sz) if align == "right" else 0), h - top, s)
+
+    text(56, 70, "Harbour Lane Café", 22, "LSB", ink)
+    top = 100
+    for line in _wrap("Prices for the spring season. All drinks can be made with oat or soya milk at no extra cost, and every "
+                      "cake is baked in our own kitchen each morning.", "LS", 10, w - 112):
+        text(56, top, line)
+        top += 14
+    # 價目表：品項（靠左）、份量（靠左）、價格（靠右）
+    top += 22
+    rows = [("Item", "Size", "Price"), ("Filter coffee", "Mug", "2.40"), ("Flat white", "Small", "2.90"), ("Hot chocolate", "Large", "3.30"),
+            ("Mint tea", "Pot", "2.60"), ("Lemon cake", "Slice", "2.80"), ("Cheese scone", "One", "2.20"), ("Soup of the day", "Bowl", "4.50")]
+    for r, (item, sz, price) in enumerate(rows):
+        f = "LSB" if r == 0 else "LS"
+        col = ink if r == 0 else grey
+        text(56, top, item, 10, f, col)
+        text(230, top, sz, 10, f, col)
+        text(380, top, price, 10, f, col, align="right")
+        top += 19
+    top += 18
+    for line in _wrap("Weekly classes in the upstairs room. Places are free for regulars; please sign the sheet by the counter "
+                      "so we know how many chairs to set out.", "LS", 10, w - 112):
+        text(56, top, line)
+        top += 14
+    # 課表：時間＋五天
+    top += 22
+    days = ["Time", "Mon", "Tue", "Wed", "Thu", "Fri"]
+    slots = [("09:00", ["Yoga", "Knitting", "Yoga", "Choir", "Pilates"]), ("10:30", ["Chess", "Drawing", "Chess", "Poetry", "Drawing"]),
+             ("12:00", ["Lunch", "Lunch", "Lunch", "Lunch", "Lunch"]), ("14:00", ["French", "Sewing", "Spanish", "Sewing", "Quiz"]),
+             ("16:00", ["Homework", "Lego", "Homework", "Lego", "Films"])]
+    xs = [56, 130, 210, 290, 370, 450]
+    for k, d in enumerate(days):
+        text(xs[k], top, d, 10, "LSB", ink)
+    top += 19
+    for t, acts in slots:
+        text(xs[0], top, t)
+        for k, a in enumerate(acts, start=1):
+            text(xs[k], top, a)
+        top += 19
+    top += 18
+    for line in _wrap("Opening hours are on the door. Groups of more than eight should call a day ahead.", "LS", 10, w - 112):
+        text(56, top, line)
+        top += 14
+    c.showPage()
+    c.save()
+
+
 if __name__ == "__main__":
     import sys
 
     if sys.argv[1:] == ["cv"]:
         cv_two_column()
         print(["cv_two_column.pdf"])
+        sys.exit(0)
+    if sys.argv[1:] == ["columns"]:
+        two_column_notes()
+        borderless_tables()
+        print(["two_column_notes.pdf", "borderless_tables.pdf"])
         sys.exit(0)
     if sys.argv[1:] == ["flattened"]:
         flattened_outlined()
@@ -907,4 +1073,6 @@ if __name__ == "__main__":
         flattened_outlined()
         flattened_embedded()
         cv_two_column()
+        two_column_notes()
+        borderless_tables()
     print(sorted(p.name for p in HERE.glob("*.pdf")))

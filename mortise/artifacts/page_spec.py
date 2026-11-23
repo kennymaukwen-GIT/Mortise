@@ -38,6 +38,17 @@ class PageSpec(Model):
     dewarp_map: Optional[BlobRef] = None  # 彎曲的紙攤平時：工作影像每個像素對應到來源影像哪裡（npz：map_x、map_y，float32）；沒有攤平就留空
     dewarp_source: str = ""  # 攤平的依據：measured（由紙邊、格線、文字行量出）、uvdoc_prior（學習式模型給的初值再量測修正）；沒有攤平就留空
     dewarp_residual_px: Optional[float] = None  # 攤平後格線與文字行離直線的殘差（工作影像像素，第 95 百分位）
+    # ---- 照片的頁面確認（②接上找紙與攤平後追加；給「拖曳四角確認」的介面與校準用；PDF 與截圖留預設值）----
+    # quad_method 另有："frame_edges"（紙被畫面切掉：三條量到的紙邊＋畫面邊，預選、需確認）、"outline"（找不到四角，由紙邊量出的外框四角，預填、需確認）
+    quad_needs_review: bool = False  # 需要請使用者確認頁面四角（status 不是 ok、信心低、某角誤差太大、或攤平的外框需要確認）
+    quad_review_reason: str = ""  # 為什麼要確認（白話一句；不需要確認時為空字串）
+    quad_alternative_scores: list[float] = []  # quad_alternatives 各組的分數（0 到 1，相對於最佳候選）
+    quad_alternative_labels: list[str] = []  # quad_alternatives 各組的白話短標籤（例如「另一張紙」「三條邊＋畫面邊」）
+    quad_preselect: Optional[int] = None  # 介面要預先選取的 quad_alternatives 索引（目前的四角就是那一組）；沒有就留空
+    dewarp_needs_review: bool = False  # 攤平的外框建議請使用者確認（外框有推估的邊、紙超出四角、或四角是攤平時自己量的）
+    dewarp_confidence: Optional[float] = None  # 攤平的信心值（0 到 1）；沒有嘗試攤平就留空
+    glare_frac: Optional[float] = None  # 頁面上反光（過曝、看不到內容）的面積比例；沒有量就留空
+    source_size: Optional[tuple[int, int]] = None  # 來源影像（照片套用 EXIF 方向後）的寬、高（像素）；PDF 留空
 
     @property
     def page_height_pt(self) -> float:
