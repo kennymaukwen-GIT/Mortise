@@ -54,7 +54,8 @@
      （少於「字高的平方 × line_min_ink × 字數（最多算 2 個字）」：墨跡量與字高的平方成正比，門檻也跟著走，
      縮小頁面、降低解析度時頁碼這種短行不會被略過；略過的是被圖片蓋住、或與底色太接近的字）、使用者改過文字、字型或字級的段落；
      以及含有「驗證用的電腦沒有字型可以畫出來」的字的行（只限不內嵌字型的格式，例如 SVG、Word、PowerPoint：
-     使用者的電腦有字型就看得到；摘要裡會註明有幾行沒有驗證到）。可編輯 PDF 內嵌字型，畫不出來就是真的缺字，照常判斷。
+     使用者的電腦有字型就看得到；摘要裡會註明有幾行沒有驗證到）；同一個框裡的其他行也不判斷（畫不出來的字換了寬度，
+     整段的換行都會跟著變）。可編輯 PDF 內嵌字型，畫不出來就是真的缺字，照常判斷。
 
 逐行分數（line_score，0 到 1；⑦把它乘上畫面分數成為這一頁的分數，為什麼這樣組合寫在 stages/s7_verify.py 開頭）
   逐行分數 = 1 − 各行嚴重程度的總和 ÷ 判斷的行數 − min(line_problem_cap, line_problem_floor × 內容問題的嚴重程度總和)
@@ -396,6 +397,8 @@ def check_page(working: Image.Image, rendered: Image.Image, el: ElementList, lay
     scale_pt = frame[0] / W  # 1 像素 = 多少 pt
     own = owners(layout)
     changed = _user_changed(layout, page)
+    # 畫不出來的字會用別的寬度（或缺字方塊）排版，同一個框裡其他行的換行也跟著變：整個框都不判斷
+    lacking_boxes = {own[t.id] for t in el.texts if t.id in own and any(ch in unrenderable for ch in t.text)}
     results: list[LineResult] = []
     for line in el.texts:
         x0r, y0r, x1r, y1r = line.quad.bbox
@@ -413,6 +416,9 @@ def check_page(working: Image.Image, rendered: Image.Image, el: ElementList, lay
         lacking = [ch for ch in line.text if ch in unrenderable]
         if lacking:
             res.status, res.skip_reason = "skipped", f"驗證用的電腦沒有字型可以畫出「{lacking[0]}」"
+            continue
+        if own.get(line.id) in lacking_boxes:
+            res.status, res.skip_reason = "skipped", "驗證用的電腦沒有字型可以畫出同一個框裡的字（換行會跟著變）"
             continue
         _match_line(line, res, O, R, W, font_px, p)
     _relocate(results, O, R, p)
@@ -992,7 +998,8 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str, 
     no_font = [r for r in results if r.skip_reason.startswith("驗證用的電腦沒有字型")]
     return PageLines(lines=results, score=score, checked=n, missing=counts["missing"], partial=counts["partial"],
                      overlap=counts["overlap"], offset=counts["offset"], issues=issues, no_font=len(no_font),
-                     no_font_example=no_font[0].skip_reason if no_font else "", rewrapped=counts["rewrapped"],
+                     no_font_example=next((r.skip_reason for r in no_font if "「" in r.skip_reason), no_font[0].skip_reason) if no_font else "",
+                     rewrapped=counts["rewrapped"],
                      misplaced=counts["misplaced"], color=counts["color"], extra=extra_lines, text_layer=has_text)
 
 

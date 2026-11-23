@@ -66,7 +66,6 @@ import math
 import re
 import sys
 import tempfile
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -341,7 +340,9 @@ def _combine(per_format: dict, neutral_page: dict, proxies: list, unverified: di
             parts.append(f"{label} 沒有分數（{unverified.get(fmt, '沒有可用的驗證')}，中性渲染也沒有結果）")
         elif fmt in proxies:
             why = unverified.get(fmt, "這個格式還沒有自己的驗證")
-            parts.append(f"{label} {doc_scores[fmt]:.3f}（代用值：{why}，{label}檔本身沒有驗證；分數來自成品文件的中性渲染）")
+            if "本身沒有" not in why:
+                why += f"，{label}檔本身沒有驗證"
+            parts.append(f"{label} {doc_scores[fmt]:.3f}（代用值：{why}；分數來自成品文件的中性渲染）")
         else:
             parts.append(f"{label} {doc_scores[fmt]:.3f}")
     if not doc_scores:

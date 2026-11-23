@@ -313,7 +313,7 @@ def test_word_file_itself_is_verified(poster, monkeypatch):
     monkeypatch.setattr(libreoffice, "available", lambda: False)
     proxy = s7_verify.run(*args, [_blank(poster, out, OutputFormat.DOCX_FIXED)], poster["cfg"], poster["store"])
     assert not proxy.format_reports and proxy.overall_score > 0.9  # 驗證不了：分數來自成品文件本身
-    assert "代用值" in proxy.notes[0] and "Word" in proxy.notes[0] and "沒有驗證" in proxy.notes[0]
+    assert "代用值" in proxy.notes[0] and "Word 檔本身沒有" in proxy.notes[0] and "中性渲染" in proxy.notes[0]
 
 
 def test_transparent_svg_page_is_flagged(poster):

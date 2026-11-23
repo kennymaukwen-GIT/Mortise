@@ -33,7 +33,6 @@ import io
 import math
 import re
 import statistics
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
