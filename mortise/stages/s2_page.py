@@ -4,7 +4,8 @@
   s2.box        原生 PDF：選頁框（裁切框與媒體框的交集）、套用旋轉
   s2.corners    照片：四邊擬合找頁面四角（找不到就以整張圖為頁面，使用者可以手動拉四角）；截圖與掃描以整張圖為頁面
   s2.rectify    透視攤平，建立頁面座標系（頁寬為 1）
-  s2.enhance    去陰影、白平衡，產生工作影像（只對照片模式、像白紙、又不是平塗數位畫面的頁面做；未增強的影像另存 color_image）
+  s2.enhance    去陰影、白平衡，產生工作影像（只對照片模式、像白紙、又不是平塗數位畫面的頁面做；找不到紙張四邊又光照均勻的照片也不做；
+                未增強的影像另存 color_image）
   s2.size       尺寸判斷：使用者輸入永遠優先，其次檔案內建，都沒有才依長寬比推論候選規格
   s2.working    產生工作影像，計算有效解析度
 """
@@ -24,7 +25,7 @@ from ..tools import pdfium as pdf
 from ..tools.units import to_pt
 
 NAME = "s2"
-VERSION = "3"
+VERSION = "4"
 
 
 def _png(im: Image.Image) -> bytes:
@@ -212,9 +213,14 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
         work = color
         if kind in (InputType.PHOTO, InputType.SCANNED_PDF) and c.get("enhance_photos", True) and _paper_like(image_arr, c):
             digital = _digital_content(image_arr, c)
+            spread = _illumination_spread(image_arr) if kind == InputType.PHOTO and method == "full_image" else None
             if digital is not None:
                 # 照片模式但畫面是平塗的數位內容（例如帶相機資訊的截圖、乾淨的掃描）：沒有光照不均可修，做了只會改掉原本的顏色
                 notes.append(f"頁面是平塗的數位畫面（{digital}），不做去陰影與白平衡，顏色照原圖。")
+            elif spread is not None and spread < float(c.get("enhance_uniform_max", 0.03)):
+                # 判成照片、卻找不到紙張四邊，整頁的光照又幾乎完全均勻（底色亮度的落差不到 3%）：多半不是拍的照片，
+                # 而是底色有細紋理的截圖（例如閱讀軟體的紙紋主題）或乾淨的掃描。沒有陰影可去；白平衡只會把米色、灰色的底改成白色
+                notes.append(f"沒有找到紙張四邊，整頁的光照又很均勻（底色亮度落差 {spread:.1%}），不做去陰影與白平衡，顏色照原圖。")
             else:
                 work = Image.fromarray(np.ascontiguousarray(pg.enhance(image_arr)))
                 notes.append("頁面像一般紙張，已去陰影與白平衡後再辨識；工作影像的顏色因此與原圖不同，未增強的原圖另外保留（color_image）。")
@@ -236,6 +242,21 @@ def _paper_like(arr, c: dict) -> bool:
     share = counts.max() / counts.sum()
     chroma = int(dominant.max() - dominant.min())
     return share >= c.get("paper_min_share", 0.25) and dominant.mean() >= c.get("paper_min_brightness", 150) and chroma <= c.get("paper_max_chroma", 40)
+
+
+def _illumination_spread(arr) -> float:
+    """頁面底色的亮度落差：縮圖上用形態學閉運算把字抹掉、只留底色，再取（第 95 百分位 − 第 5 百分位）÷ 中位數。
+    拍照時光線、暗角一定讓底色有明暗變化（合成的手機照片實測 0.2 以上）；截圖與乾淨的掃描幾乎是 0。"""
+    import cv2
+    import numpy as np
+
+    h, w = arr.shape[:2]
+    small = cv2.resize(np.ascontiguousarray(arr[..., :3]), (256, max(8, round(256 * h / max(w, 1)))), interpolation=cv2.INTER_AREA).astype(np.float32)
+    luma = small @ np.array([0.299, 0.587, 0.114], np.float32)
+    bg = cv2.morphologyEx(luma, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+    bg = cv2.GaussianBlur(bg, (0, 0), 8)
+    p5, p50, p95 = np.percentile(bg, [5, 50, 95])
+    return float((p95 - p5) / max(p50, 1.0))
 
 
 def _digital_content(arr, c: dict) -> Optional[str]:

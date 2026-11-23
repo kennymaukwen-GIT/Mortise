@@ -4,7 +4,7 @@
   整頁相似度（s7_verify.similarity）是把整頁縮到約 480 像素寬、略為模糊後比像素。一頁 A4 上少了十幾行小字，
   或一行標題錯開幾 pt，平均到整頁只差一兩個百分點，分數照樣九十幾分。逐行看，才看得出「內容不見」與「文字錯位」。
 
-做法（只看影像，不讀輸出檔的內部結構，所以任何輸出格式、任何渲染引擎都用同一套，也可以拿去比 7A 的中性渲染）
+做法（影像為主；輸出檔讀得回文字時另外比對文字層。任何輸出格式、任何渲染引擎都用同一套，也可以拿去比 7A 的中性渲染）
   1. 墨跡：原圖（工作影像）與成品的渲染結果各自以「這一行附近最常見的顏色」當底色，和底色差得夠多的像素算墨跡
      （0 到 1 的軟值）。深字淺底、淺字深底、有顏色的字都一樣處理。工作影像先縮放成渲染結果的大小。
   2. 整行找位置：原圖這一行的墨跡當樣板，在渲染結果同一位置附近（水平約一個字高、垂直約四分之三個字高）
@@ -13,37 +13,59 @@
      每一段只在「原位置」與「整行找到的位置」附近的小範圍（約 0.4 個字高）找。這樣抓得到「同一行前半對得上、
      後半錯開」（例如換了字寬不同的字型、中英交界的間距不同），也不會把一段誤認成隔壁的詞。
      一段算找到：相關係數至少 line_ncc_min，而且那裡的墨跡量至少是原圖的 line_mass_min 倍（不是殘影或被蓋住）。
-  4. 一行的結果：
+  4. 一行的影像結果：
        找到的比例：找到的各段的墨跡量 ÷ 全行的墨跡量。
        偏移（pt）：找到的各段當中偏移最大的那一段與原位置的距離。
        疊字：(a) 有些段在找到的位置上，字的中段（去掉上下各兩成）墨跡變成原圖的 line_overlap_mass 倍以上——
-             別的字疊了上來（行距很緊時上下行字母的上下緣碰進來不算，因為只看中段）；這些段佔全行至少 line_crowded_share。
+             別的字疊了上來（行距很緊時上下行字母的上下緣碰進來不算，因為只看中段）；這些段佔全行至少 line_crowded_share，
+             或有一段到 line_overlap_mass_strong 倍（不論佔多少）。一到三個字的短行（頁碼）換了字型中段墨跡就差很多，只認後者。
              (b) 兩行在成品上找到的位置互相重疊，在原圖上卻沒有。
        被畫到別處：原位置找不到的行，在上下各 line_relocate_rows 個字高的範圍裡整行再找一次（要更像：line_relocate_ncc）；
              找到了、而且落點上那一行的中段墨跡真的變多，就記成「被畫到那裡、和那一行疊在一起」。
-             落點的墨跡沒有變多時不採信（多半是把那一行自己的字誤認成它），仍然只算找不到。
-  5. 判斷（每一個都開成一條問題，element_id 指到這一行所屬的文字框或表格；不屬於任何一個時指到包住它的圖片）：
-       找不到（line_missing，error）：找到的比例低於 line_found_min。
+       字的顏色：找到的段裡「確定是字」的像素，原圖與成品各取「字的顏色 − 底色」的中位數，比兩個方向的夾角
+             （反鋸齒與縮放會把細筆畫的顏色往底色拉淡，深淺量不準，但往哪個方向淡是一樣的）；超過 line_color_angle 度算顏色不同。
+  5. 文字層（輸出檔讀得回文字時：可編輯 PDF、SVG、LibreOffice 的渲染、中性渲染）：影像只看墨跡的形狀，長度相近的詞
+     形狀幾乎一樣——換行後別的詞剛好落在原位置，影像會說「找到了」。所以把讀回來的每個字分給它所在的那一行
+     （影像找到這一行的，用找到的位置），看那裡寫的是不是這一行的字：
+       這一行的字有八成以上在那裡：字在原位置；那裡又多出別行的字 → 兩行疊在一起；影像卻對不上 → 字在但畫出來的樣子不對
+         （字級、字型、行距不同），或畫出來看不見（被蓋住、顏色和底色太接近）。
+       只有一部分在那裡、其餘在這一頁的別處 → 換行與原圖不同；在這一頁哪裡都讀不到 → 字不在成品裡。
+       原位置上沒有字、但這一頁別處讀得到 → 字在檔案裡、沒有畫在原位置（若落在別行上，說出疊在哪一行）。
+       讀回來、但不落在任何一行範圍裡的字 → 成品上多出原圖沒有的字（換行後被擠出框外、或多畫了一次），
+         依字的內容對回原本的那一行，紅框畫在那一行所屬的元素上。
+     很短的行（頁碼、一兩個字）只認「讀回來的某一行整行就是它」或「它出現在沒分給任何一行的字裡」，
+     不然「1」幾乎一定出現在別行的「12%」裡。旋轉、直排的行只靠影像判斷。
+     沒有文字層時（例如文字轉成外框的 SVG）改用「墨跡守恆」：同一個元素裡多數行在原位置找不到、但元素範圍內畫出來的墨跡
+     仍有原圖的 line_conserve_min 倍以上，就說「字多半還在，只是位置偏太多、字級不同或疊在一起」，不說「找不到」。
+  6. 判斷（每一個都開成一條問題，element_id 指到這一行所屬的文字框或表格；不屬於任何一個時指到包住它的圖片；
+     同一行同一種問題只開一條）：
+       找不到（line_missing，error）：影像找到的比例低於 line_found_min，文字層也沒有這些字。
+       字在但不在原位置或樣子不對（line_misplaced，error）。
+       換行與原圖不同（line_rewrapped，原位置上這一行的字不到一半時是 error，否則 warning）。
        一部分找不到（line_partial，warning）：找到的比例低於 line_partial_min。
        和別的行疊在一起（line_overlap，error）。
        位置偏移（line_offset，warning）：偏移超過 max(line_offset_tolerance_pt, line_offset_tolerance_ratio × 字高)。
-         渲染結果若是替身引擎自己重新排字的（LibreOffice 代替 PowerPoint、中性渲染代替 Word），它的字距與項目符號後的
+         渲染結果若是替身引擎自己重新排字的（LibreOffice 代替 PowerPoint、Word，中性渲染），它的字距與項目符號後的
          間距本來就和目標軟體不同：水平方向放寬到 line_offset_relayout_ratio 個字高，垂直方向不放寬。
          可編輯 PDF 與 SVG 的每一行位置是寫死在檔案裡的，不放寬。
-  6. 不判斷的行（不計入、不扣分）：不可見的文字（OCR 文字層）、沒有看得見的字、原圖上那一行幾乎沒有墨跡
-     （例如原生 PDF 裡被圖片蓋住的字、與底色太接近的字）、使用者改過文字、字型或字級的段落；
+       字的顏色不同（line_color，warning）。
+       多出原圖沒有的字（line_extra，warning）。
+  7. 不判斷的行（不計入、不扣分）：不可見的文字（OCR 文字層）、沒有看得見的字、原圖上那一行幾乎沒有墨跡
+     （少於「字高的平方 × line_min_ink × 字數（最多算 2 個字）」：墨跡量與字高的平方成正比，門檻也跟著走，
+     縮小頁面、降低解析度時頁碼這種短行不會被略過；略過的是被圖片蓋住、或與底色太接近的字）、使用者改過文字、字型或字級的段落；
      以及含有「驗證用的電腦沒有字型可以畫出來」的字的行（只限不內嵌字型的格式，例如 SVG、Word、PowerPoint：
      使用者的電腦有字型就看得到；摘要裡會註明有幾行沒有驗證到）。可編輯 PDF 內嵌字型，畫不出來就是真的缺字，照常判斷。
 
 逐行分數（line_score，0 到 1；⑦把它乘上畫面分數成為這一頁的分數，為什麼這樣組合寫在 stages/s7_verify.py 開頭）
-  逐行分數 = 1 − 各行嚴重程度的平均 − min(line_problem_cap, line_problem_floor × 內容問題的嚴重程度總和)
-    各行嚴重程度的平均：每一行算一份（沒問題的行是 0）。
-    第二項只算「找不到、一部分找不到、疊在一起」這類內容問題：長文件少一行也必須看得出來，所以每個再多扣 2%，
-    最多多扣 10%（問題很多時第一項已經反映嚴重程度）。位置偏移不多扣。
-  嚴重程度：找不到 1；一部分找不到 = 不見的比例；疊在一起 0.6；
+  逐行分數 = 1 − 各行嚴重程度的總和 ÷ 判斷的行數 − min(line_problem_cap, line_problem_floor × 內容問題的嚴重程度總和)
+    第一項：每一行算一份（沒問題的行是 0）；多出原圖沒有的字也各算一份嚴重程度。
+    第二項只算內容問題（找不到、字不在原位置、換行不同、一部分找不到、疊在一起）：長文件少一行也必須看得出來，
+    所以每個再多扣 2%，最多多扣 10%（問題很多時第一項已經反映嚴重程度）。位置偏移、顏色不同不多扣。
+  嚴重程度：找不到 1；字在但不在原位置或樣子不對 0.6；疊在一起 0.6；換行不同 最多 0.5（原位置上這一行的字越少越重）；
+            一部分找不到 = 不見的比例；字的顏色不同 0.2；多出原圖沒有的一行字 0.2；
             位置偏移 0.15 到 0.35（剛超過容許差是 0.15，再多偏一個字高以上是 0.35），再乘上偏掉的段佔這一行的比例
             （整行都偏了算滿；換了字寬不同的字型、只有後半行漸漸偏掉的，只算偏掉的那部分）。
-  同一行有好幾種問題時取最重的一種。沒有任何可判斷的行時不給分數（None），⑦就只看畫面分數。
+  同一行有好幾種問題時取最重的一種計分（每一種都開問題）。沒有任何可判斷的行時不給分數（None），⑦就只看畫面分數。
 
 設定在 default.toml 的 [verify]（名稱以 line_ 開頭）。
 """
@@ -715,6 +737,13 @@ def _text_layer(results: list[LineResult], glyphs: list[Glyph], frame: tuple[flo
         best[take] = d[take]
         owner[take] = n
     by_line_text = {r.line_id: _norm_text(r.text) for r in results}
+    # 很短的行（頁碼、一兩個字）用「在別處找得到」判斷不可靠（「1」幾乎一定出現在別行的「12%」裡）：
+    # 只認讀回來的某一行整行就是它，或它出現在沒有分給任何一行的字裡
+    read_lines: dict[int, list[int]] = {}
+    for i, g in enumerate(glyphs):
+        read_lines.setdefault(g.line, []).append(i)
+    whole_lines = {_norm_text("".join(gch[i] for i in sorted(idx, key=lambda i: gx[i]))) for idx in read_lines.values()}
+    free_text = [_norm_text("".join(gch[i] for i in sorted(idx, key=lambda i: gx[i]) if owner[i] < 0)) for idx in read_lines.values()]
     for n, r in enumerate(results):
         if r.status == "skipped" or not r.horizontal:
             continue
@@ -728,7 +757,10 @@ def _text_layer(results: list[LineResult], glyphs: list[Glyph], frame: tuple[flo
         r.near_text = near
         r.text_cover = matched / max(len(want), 1)
         r.text_extra = (len(near) - matched) / max(len(want), 1)
-        r.text_elsewhere = _present(want, all_text, shingles)
+        if len(want) <= 6:
+            r.text_elsewhere = want in whole_lines or any(want in t for t in free_text)
+        else:
+            r.text_elsewhere = _present(want, all_text, shingles)
         if r.text_extra >= 0.5:  # 多出來的字是哪一行的
             used = set()
             for b in blocks:
@@ -753,8 +785,19 @@ def _text_layer(results: list[LineResult], glyphs: list[Glyph], frame: tuple[flo
         text = _norm_text("".join(gch[i] for i in sorted(idx, key=lambda i: gx[i])))
         if len(text) < 2:
             continue
-        cx, cy = float(np.mean(gx[idx])), float(np.mean(gy[idx]))
-        eid = _containing_element(page, cx / f + ox, cy / f + oy)
+        # 多出來的字屬於哪個元素：先看它是哪一行的字（換行後被擠出框外的字，紅框要畫在原本的框上），
+        # 對不到任何一行時，才用它落在哪個元素裡
+        eid, best_v = None, 0.0
+        for q in results:
+            want = by_line_text[q.line_id]
+            if not want or q.element_id is None:
+                continue
+            v = sum(b.size for b in difflib.SequenceMatcher(None, text, want, autojunk=False).get_matching_blocks()) / len(text)
+            if v > best_v:
+                eid, best_v = q.element_id, v
+        if best_v < 0.6:
+            cx, cy = float(np.mean(gx[idx])), float(np.mean(gy[idx]))
+            eid = _containing_element(page, cx / f + ox, cy / f + oy)
         extras.append((text, eid))
     return extras
 
@@ -831,6 +874,11 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str, 
     total_sev = 0.0  # 各行嚴重程度的總和
     content_sev = 0.0  # 其中內容問題（找不到、一部分找不到、疊在一起、換行不同、字還在但位置不對）的總和
     found_min, partial_min = p["line_found_min"], p["line_partial_min"]
+    # 文字層：某一行的位置上讀到另一行的字（text_overlap_with）→ 那另一行是被畫到這一行上面
+    landed_on: dict[str, LineResult] = {}
+    for r in checked:
+        if r.text_overlap_with and r.text_overlap_with not in landed_on:
+            landed_on[r.text_overlap_with] = r
     for r in checked:
         r.offset_pt *= scale_pt
         r.dx_pt *= scale_pt
@@ -847,6 +895,8 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str, 
         moved = ""
         if r.moved_to is not None:
             moved = f"，被畫到約 {math.hypot(*r.moved_to) * scale_pt:.0f} pt 外的地方" + (f"，和「{_clip(other.text)}」疊在一起" if other is not None else "")
+        elif r.line_id in landed_on and landed_on[r.line_id] is not r:
+            moved = f"，被畫到「{_clip(landed_on[r.line_id].text)}」那一行的位置、和它疊在一起"
         if cover is not None and cover >= 0.8:
             # 文字層：這一行的字在它的位置上
             if r.text_extra >= 0.5 and text_other is not None:
@@ -901,7 +951,9 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str, 
         if img_ok:
             if other is not None:
                 cands.append((_OVERLAP_SEVERITY, "overlap", Severity.ERROR, "line_overlap", f"{prefix}這一行和「{_clip(other.text)}」疊在一起：{quote}。"))
-            elif r.crowded >= p["line_crowded_share"] or any(c.crowded and c.core_mass >= p["line_overlap_mass_strong"] for c in r.chunks):
+            elif ((r.crowded >= p["line_crowded_share"] and len(_norm_text(r.text)) >= 4)
+                  or any(c.crowded and c.core_mass >= p["line_overlap_mass_strong"] for c in r.chunks)):
+                # 只有一到三個字的行（頁碼之類）：換了字型、字重，中段墨跡就差很多，要到 line_overlap_mass_strong 才算疊字
                 worst_mass = max(c.core_mass for c in r.chunks if c.crowded)
                 cands.append((_OVERLAP_SEVERITY, "overlap", Severity.ERROR, "line_overlap",
                               f"{prefix}這一行上面多畫了原圖沒有的字（有一段字的中段墨跡是原圖的 {worst_mass:.1f} 倍），多半是別的行疊了上來：{quote}。"))
@@ -923,8 +975,12 @@ def _summarize(results: list[LineResult], scale_pt: float, p: dict, where: str, 
         total_sev += worst[0]
         if worst[1] not in ("offset", "color"):
             content_sev += worst[0]
-        for sev, status, level, code, msg in cands:
-            counts[status] += 1
+        seen: set[str] = set()
+        for sev, status, level, code, msg in cands:  # 同一行同一種問題只開一條（先判斷出來的說明較具體）
+            if status in seen:
+                continue
+            seen.add(status)
+            counts[status] += 1  # 行數：同一行有好幾種問題時，每一種各算一行
             issues.append(Issue(severity=level, code=code, element_id=r.element_id, message=msg))
     extra_lines = 0
     for text, eid in extras or []:

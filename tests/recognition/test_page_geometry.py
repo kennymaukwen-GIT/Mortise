@@ -450,3 +450,107 @@ def test_contour_fallback_when_refine_fails():
     assert q.method == "contour" and q.confidence < 0.5
     e = np.linalg.norm(q.corners - corners, axis=1)
     assert e.max() < 6.0 and q.corner_error_px.min() >= 2.0, e
+
+
+# ------------------------------------------------------------------ 照片頁面偵測：直線候選、文字先驗、彎邊、狀態（追加）
+
+
+def test_merge_segments_joins_collinear_pieces():
+    """LSD 線段合併：同一條直線斷成好幾段要合成一條；平行但相距 20 像素的另一條要分開。"""
+    from mortise.recognition.page_geometry import _merge_segments, _p
+
+    segs = np.array(
+        [
+            [100, 200, 300, 204],  # 同一條（斜率 0.02）斷成三段
+            [320, 204.4, 500, 208],
+            [520, 208.4, 700, 212],
+            [100, 230, 700, 242],  # 平行、往下 30 像素
+        ],
+        dtype=np.float64,
+    )
+    N, C, L = _merge_segments(segs, (800, 800), _p({}))
+    assert len(N) == 2
+    # 最長的是平行那條（600 像素）與三段合併（約 560 像素）
+    ys = sorted(float((c - n[0] * 400.0) / n[1]) for n, c in zip(N, C))
+    assert abs(ys[0] - 206.0) < 0.5 and abs(ys[1] - 236.0) < 0.5, ys
+
+
+def test_text_map_finds_text_but_not_wood():
+    """便宜的文字偵測：頁面上的字要找到；木紋背景本身不算字。"""
+    from mortise.recognition.page_geometry import _p, _text_map
+
+    rng = np.random.default_rng(0)
+    wood = background("wood", 900, 640, rng)
+    t = _text_map(wood, _p({}))
+    assert len(t["blobs"]) == 0, len(t["blobs"])
+    page = cv2.resize(page_image("doc_a4", 100), (640, 900), interpolation=cv2.INTER_AREA)
+    t = _text_map(page, _p({}))
+    assert len(t["blobs"]) >= 50 and 4 <= t["h"] <= 20, (len(t["blobs"]), t["h"])
+    # 字都在頁面的印刷範圍內（doc_a4 的字集中在上半頁）
+    assert np.median(t["blobs"][:, 1]) < 450
+
+
+def _curved_paper(sag: float, seed: int = 0):
+    """深色桌面上的白紙：上緣是拋物線（中間往下凹 sag 像素），其餘三邊是直線。回傳（影像、直線弦構成的四角）。"""
+    W, H = 1000, 1200
+    rng = np.random.default_rng(seed)
+    img = np.full((H, W, 3), 60.0, np.float32)
+    x0, x1, y0, y1 = 150.0, 850.0, 200.0, 1050.0
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float64) + 0.5
+    top = y0 + sag * (1.0 - ((xs - 500.0) / 350.0) ** 2)
+    a = np.clip(ys - top + 0.5, 0, 1) * np.clip(y1 - ys + 0.5, 0, 1) * np.clip(xs - x0 + 0.5, 0, 1) * np.clip(x1 - xs + 0.5, 0, 1)
+    img = img * (1 - a[..., None]) + 235.0 * a[..., None]
+    img = cv2.GaussianBlur(img, (0, 0), 1.0) + rng.normal(0, 2.0, img.shape)
+    q = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float64)
+    return np.clip(img, 0, 255).astype(np.float32), q
+
+
+def test_measure_bow_flags_only_the_curved_edge():
+    """彎邊量測：上緣弓高 14 像素要判彎曲、量到 14±4；直的三邊不算彎曲。全直的紙四邊都不算彎曲。"""
+    from mortise.recognition.page_geometry import _measure_bow, _p
+
+    p = _p({})
+    img, q = _curved_paper(14.0)
+    bows = _measure_bow(img, q, p)
+    assert bows[0]["curved"], bows[0]["bow"]
+    assert abs(bows[0]["bow"] - 14.0) < 4.0, bows[0]["bow"]
+    assert not any(b["curved"] for b in bows[1:]), [b["bow"] for b in bows]
+    img, q = _curved_paper(0.0)
+    bows = _measure_bow(img, q, p)
+    assert not any(b["curved"] for b in bows), [b["bow"] for b in bows]
+
+
+def test_status_fields_on_clean_and_curved_photo():
+    """乾淨的平紙：status ok、沒有外框、弓高都是 0。上緣明顯彎曲的紙：status 不是 ok、信心 < 0.6、附外框，誤差至少涵蓋弓高。"""
+    page = page_image("doc_a4")
+    photo, G, corners = make_photo(page, 1200, 1600, "wood", seed=0, f_frac=0.75, rx=20, ry=5, rz=3)
+    photo = degrade(photo, np.random.default_rng(0), blur=0.6, noise=1.0)
+    q = find_page_quad(photo)
+    assert q.status == "ok" and q.confidence > 0.75, (q.status, q.confidence, q.notes)
+    assert q.boundary is None and q.edge_bow_px == [0.0, 0.0, 0.0, 0.0]
+    assert isinstance(q.alternatives, list) and len(q.alternative_scores) == len(q.alternatives)
+    img, chord = _curved_paper(25.0, seed=1)
+    q = find_page_quad(img.astype(np.uint8))
+    assert q.method == "edge_fit" and q.status != "ok", (q.status, q.notes)
+    assert q.confidence < 0.6
+    if q.status == "curved_edge":
+        assert q.boundary is not None and len(q.boundary) >= 16
+        assert q.corner_error_px.max() >= 0.5 * max(q.edge_bow_px)
+
+
+def test_table_frame_inside_page_is_not_the_page():
+    """紙內有一個很強的表格外框、紙與背景對比低：要框紙，不是框表格（以前的候選全是表格框）。"""
+    W, H = 900, 1270
+    page = np.full((H, W, 3), 248, np.uint8)
+    cv2.putText(page, "Module Study Plan", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (30, 30, 30), 2, cv2.LINE_AA)
+    cv2.rectangle(page, (70, 190), (W - 70, H - 190), (20, 20, 20), 3)
+    for y in np.linspace(190, H - 190, 11).astype(int)[1:-1]:
+        cv2.line(page, (70, y), (W - 70, y), (20, 20, 20), 1)
+        cv2.putText(page, "Strategic planning group work", (90, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 1, cv2.LINE_AA)
+    cv2.putText(page, "Module Guide 2026-27", (W // 2 - 140, H - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 1, cv2.LINE_AA)
+    photo, G, corners = make_photo(page, 1200, 1600, "light", seed=4, f_frac=0.7, rx=12, ry=-6, rz=2, fill=0.75)
+    photo = degrade(photo, np.random.default_rng(4), blur=1.0, noise=2.5, light=True, jpeg=85)
+    q = find_page_quad(photo)
+    assert q.method == "edge_fit", q.notes
+    e = np.linalg.norm(q.corners - corners, axis=1)
+    assert e.max() < 2.0, (e, q.notes)

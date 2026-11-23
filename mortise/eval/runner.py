@@ -68,13 +68,13 @@ from ..artifacts.layout import PageLayout
 from ..config import Config
 from ..pipeline import Pipeline
 from . import metrics as M
-from .synth import KINDS, degrade
+from .synth import CURVED_KINDS, KINDS, degrade, degrade_curved, sample_page_map
 
 SAMPLE_EXTS = (".pdf", ".png", ".jpg", ".jpeg")
 UNGROUPED = "（未分組）"
 
 DEFAULT_PARAMS: dict[str, Any] = {
-    "variants": ["screenshot", "scan", "photo"],  # 原生 PDF 自我監督要做的干擾種類
+    "variants": ["screenshot", "scan", "photo"],  # 原生 PDF 自我監督要做的干擾種類；彎曲的紙寫 curved_<種類>（種類見 synth.CURVED_KINDS，例如 curved_curl_top）
     "seed": 0,  # 基礎亂數種子；每個（樣本、頁、干擾）的種子由它與名稱的 CRC32 導出，可重現
     "strength": 1.0,  # 干擾強度倍數（見 synth.degrade）
     "max_pages_per_sample": 5,  # 自我監督每個樣本最多評幾頁
@@ -88,6 +88,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
         "composite", "text_recall", "text_precision", "cer_zh", "cer_en", "page_cer", "position_error_pt", "size_error_pct",
         "font_top1", "font_top3", "color_delta_e", "bold_accuracy", "image_recall", "shape_recall", "paragraph_pair_f1",
         "boxes_per_paragraph", "reading_order", "e2e_score", "e2e_similarity", "e2e_text_match", "e2e_linebreak_match", "rasterized_page",
+        "dewarp_pos_p95_px", "page_coverage", "background_frac", "pdf_text_cer",
     ],
 }
 
@@ -96,6 +97,8 @@ TYPE_LABELS = {
     "synth_screenshot": "合成截圖（影像產線）",
     "synth_scan": "合成掃描（影像產線）",
     "synth_photo": "合成照片（影像產線）",
+    **{f"synth_curved_{k}": f"合成彎曲照片：{v}（影像產線）" for k, v in (("flat", "平的紙"), ("bend", "弓起"), ("curl_top", "上緣捲起"),
+                                                                    ("corner_curl", "捲角"), ("crease", "折痕"), ("curl_crease", "捲起加折痕"))},
     "image_screenshot": "截圖樣本",
     "image_photo": "照片樣本",
     "image_scanned_pdf": "掃描 PDF 樣本",
@@ -165,6 +168,7 @@ class RunArtifacts:
     styled: Optional[StyledDoc]
     report: Optional[FidelityReport]
     seconds: float = 0.0
+    store: Any = None  # 產物倉庫（讀 PageSpec 指向的檔案用，例如攤平對應圖）
 
 
 def run_pipeline(job_dir: Path, source: Path, cfg: Config, outputs: list[str]) -> tuple[Pipeline, RunArtifacts]:
@@ -186,7 +190,12 @@ def load_artifacts(pipe: Pipeline, report: Optional[FidelityReport] = None, seco
     styled = st.load("s5/styled_doc", StyledDoc) if st.has("s5/styled_doc") else None
     if report is None and st.has("s7/fidelity_report"):
         report = st.load("s7/fidelity_report", FidelityReport)
-    return RunArtifacts(doc, specs, els, layout, styled, report, seconds)
+    return RunArtifacts(doc, specs, els, layout, styled, report, seconds, st)
+
+
+def run_store(run: RunArtifacts):
+    """這次流水線的產物倉庫（RunArtifacts 沒有直接帶，從 load_artifacts 時記下的屬性取）。"""
+    return run.store
 
 
 def page_layout(run: RunArtifacts, page_index: int) -> Optional[PageLayout]:
@@ -427,8 +436,60 @@ def evaluate_sample(sample: Sample, out_dir: Path, cfg: Optional[Config] = None,
     return result
 
 
+def _curved_kind(variant: str) -> Optional[str]:
+    k = variant[len("curved_"):] if variant.startswith("curved_") else None
+    return k if k in CURVED_KINDS else None
+
+
+def _working_to_photo(pspec: PageSpec, store) -> Callable[[np.ndarray], np.ndarray]:
+    """影像產線的頁面相對座標 → 照片像素：有攤平對應圖（PageSpec.dewarp_map）就在圖上取樣，否則用 source_to_page 的反矩陣。"""
+    hinv = np.linalg.inv(mat3(pspec.source_to_page))
+    if pspec.dewarp_map is not None:
+        import cv2
+
+        z = np.load(store.blob_path(pspec.dewarp_map))
+        mx, my = z["map_x"].astype(np.float32), z["map_y"].astype(np.float32)
+        ww = float(pspec.working_image_size[0])
+
+        def fn(pts: np.ndarray) -> np.ndarray:
+            q = np.asarray(pts, np.float64) * ww - 0.5
+            xs = q[:, 0].astype(np.float32).reshape(1, -1)
+            ys = q[:, 1].astype(np.float32).reshape(1, -1)
+            x = cv2.remap(mx, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
+            y = cv2.remap(my, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
+            return np.stack([x, y], 1).astype(np.float64)
+        return fn
+
+    def fn_h(pts: np.ndarray) -> np.ndarray:
+        h = np.hstack([np.asarray(pts, np.float64), np.ones((len(pts), 1))]) @ hinv.T
+        return h[:, :2] / h[:, 2:3]
+    return fn_h
+
+
+def _curved_extra_metrics(pspec: PageSpec, store, page_map: np.ndarray, w0: float, h0: float, pred, truth_el, acc: M.Accumulator) -> None:
+    """彎曲照片才有的指標：工作影像每個像素對回原頁面的位置誤差 p95、頁面覆蓋率、背景比例；以原生 PDF 文字層為答案的 CER。"""
+    to_photo = _working_to_photo(pspec, store)
+    ww, wh = pspec.working_image_size
+    step = 4
+    ys, xs = np.mgrid[0:wh:step, 0:ww:step].astype(np.float64) + 0.5
+    ph = to_photo(np.stack([xs.ravel() / ww, ys.ravel() / ww], 1))
+    full_x = np.full((wh, ww), np.nan, np.float32)
+    full_y = np.full((wh, ww), np.nan, np.float32)
+    iy, ix = (ys.ravel() - 0.5).astype(int), (xs.ravel() - 0.5).astype(int)
+    full_x[iy, ix], full_y[iy, ix] = ph[:, 0], ph[:, 1]
+    g = M.dewarp_geometry(full_x, full_y, page_map, (w0, h0), step=step)
+    for k in ("dewarp_pos_p95_px", "page_coverage", "background_frac"):
+        acc.value(k, g.get(k))
+    truth_lines = [{"text": t.text, "bbox": [min(q.x for q in t.quad.points) * w0, min(q.y for q in t.quad.points) * w0,
+                                             max(q.x for q in t.quad.points) * w0, max(q.y for q in t.quad.points) * w0]} for t in truth_el.texts]
+    ocr = [(t.text, (t.quad.center.x * w0, t.quad.center.y * w0)) for t in pred.texts]
+    if truth_lines:
+        acc.value("pdf_text_cer", M.pdf_text_cer(ocr, truth_lines).get("pdf_text_cer"))
+
+
 def _self_supervised(sample: Sample, truth_run: RunArtifacts, variant: str, job_root: Path, out_dir: Path, cfg: Config, p: dict) -> dict[str, Any]:
-    if variant not in KINDS:
+    curved = _curved_kind(variant)
+    if variant not in KINDS and curved is None:
         raise ValueError(f"不認得的干擾種類：{variant}")
     mp = p["metrics"]
     acc = M.Accumulator()
@@ -441,7 +502,13 @@ def _self_supervised(sample: Sample, truth_run: RunArtifacts, variant: str, job_
         main_store = Pipeline(job_root / "main", cfg).store
         image = np.asarray(Image.open(main_store.blob_path(spec.working_image)).convert("RGB"))
         seed = variant_seed(p["seed"], sample.key, i, variant)
-        img, mat, info = degrade(image, variant, seed, p["strength"], p["synth"])
+        page_map = None
+        if curved:
+            img, page_map, info = degrade_curved(image, curved, seed, p["strength"], p["synth"])
+            mat = None
+            info = {k: v for k, v in info.items() if k != "page_outline"}  # 外框折線很長，不寫進報表
+        else:
+            img, mat, info = degrade(image, variant, seed, p["strength"], p["synth"])
         info["page_index"] = i
         src = tmp_dir / f"{Path(sample.key).stem}.p{i + 1:03d}.{variant}.png"
         Image.fromarray(img).save(src, compress_level=1)
@@ -449,11 +516,25 @@ def _self_supervised(sample: Sample, truth_run: RunArtifacts, variant: str, job_
         secs += run.seconds
         pspec, pel = run.specs[0], run.elements[0]
         w0 = float(spec.working_image_size[0])
-        # 預測（干擾影像的頁面相對座標）→ 原頁面相對座標
-        to_pred = mat3(pspec.source_to_page) @ mat @ np.diag([w0, w0, 1.0])
-        h = np.linalg.inv(to_pred)
-        pred = M.transform_elements(pel, h)
+        if curved:
+            # 預測（照片的頁面相對座標）→ 照片像素 → 逐像素真值 → 原頁面像素 → 原頁面相對座標（對不到紙的元素算漏抓）
+            to_photo = _working_to_photo(pspec, run_store(run))
+
+            def to_page(pts: np.ndarray, to_photo=to_photo, page_map=page_map) -> np.ndarray:
+                ph = to_photo(pts)
+                u_, v_, ok = sample_page_map(page_map, ph[:, 0], ph[:, 1])
+                out = np.stack([u_, v_], 1).astype(np.float64) / w0
+                out[~ok] = np.nan
+                return out
+            pred = M.transform_elements_pointwise(pel, to_page)
+        else:
+            # 預測（干擾影像的頁面相對座標）→ 原頁面相對座標
+            to_pred = mat3(pspec.source_to_page) @ mat @ np.diag([w0, w0, 1.0])
+            h = np.linalg.inv(to_pred)
+            pred = M.transform_elements(pel, h)
         M.evaluate_page(pred, truth_run.elements[i], spec.page_width_pt.value, page_layout(run, 0), page_layout(truth_run, i), params=mp, acc=acc)
+        if curved:
+            _curved_extra_metrics(pspec, run_store(run), page_map, w0, float(spec.working_image_size[1]), pred, truth_run.elements[i], acc)
         M.compare_end_to_end(run.report, acc)
         _rasterized(run, acc, mp)
         info["image"] = str(src) if p["save_degraded_images"] else None

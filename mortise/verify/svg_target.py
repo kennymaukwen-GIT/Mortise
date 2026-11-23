@@ -54,6 +54,7 @@ DEFAULTS: dict[str, Any] = {
     "svg_font_dirs": [],  # 渲染用的字型目錄；空的表示用 fontconfig 列出的字型（與輸出時量行寬用的是同一批）
     "svg_emulate_bold": True,  # 伺服器沒有粗體檔時，渲染前補描邊模擬粗體
     "svg_render": True,  # 是否渲染比對（關掉就只做結構檢查與讀回）
+    "svg_transparent_max": 0.005,  # 頁面上透明的像素比例超過此值，就檢查深色背景下的樣子（見 verify 的「頁面底色」）
 }
 _FONT_EXT = (".ttf", ".otf", ".ttc", ".otc")
 _GENERIC_FALLBACK = {
@@ -302,14 +303,50 @@ def render_copy(root, book: FontBook, others: dict[str, bytes], emulate_bold: bo
     return etree.tostring(root, encoding="unicode"), sorted(did)
 
 
-def render(resvg_py, svg_text: str, width_px: int, book: FontBook) -> Image.Image:
-    """用 resvg 把 SVG 畫成影像。固定傳 dpi=96（resvg-py 的預設 0 會讓帶單位的尺寸出錯）、只用清單裡的字型、白底。"""
+def render(resvg_py, svg_text: str, width_px: int, book: FontBook, background: Optional[str] = "#ffffff") -> Image.Image:
+    """用 resvg 把 SVG 畫成影像。固定傳 dpi=96（resvg-py 的預設 0 會讓帶單位的尺寸出錯）、只用清單裡的字型。
+    background 預設白底，回傳 RGB；background=None 時不鋪底色，回傳 RGBA（透明的地方 alpha 為 0），用來檢查頁面是不是不透明。"""
     kw: dict[str, Any] = {}
     for arg, name in (("serif_family", "serif"), ("sans_serif_family", "sans-serif"), ("monospace_family", "monospace")):
         if book.generic.get(name):
             kw[arg] = book.generic[name]
-    png = resvg_py.svg_to_bytes(svg_string=svg_text, width=int(width_px), dpi=96.0, background="#ffffff", skip_system_fonts=True, font_files=book.files, **kw)
-    return Image.open(io.BytesIO(png)).convert("RGB")
+    if background is not None:
+        kw["background"] = background
+    png = resvg_py.svg_to_bytes(svg_string=svg_text, width=int(width_px), dpi=96.0, skip_system_fonts=True, font_files=book.files, **kw)
+    im = Image.open(io.BytesIO(png))
+    return im.convert("RGB") if background is not None else im.convert("RGBA")
+
+
+def transparent_share(rgba: Image.Image) -> float:
+    """頁面上透明（alpha 低於 250）的像素比例。SVG 沒有「紙張」：不畫底色的地方是透明的，
+    在深色模式的看圖軟體或預覽裡會變成黑底、深色的字看不見。"""
+    import numpy as np
+
+    a = np.asarray(rgba.getchannel("A"))
+    return float((a < 250).mean()) if a.size else 0.0
+
+
+def _on(rgba: Image.Image, color: tuple[int, int, int]) -> Image.Image:
+    """把透明的渲染結果鋪在某個底色上（模擬看圖軟體的背景）。"""
+    base = Image.new("RGBA", rgba.size, color + (255,))
+    return Image.alpha_composite(base, rgba).convert("RGB")
+
+
+def _transparent_check(sim: float, clear: float, rgba: Image.Image, working: Image.Image, page, svg_p: dict, issues: list[Issue]) -> float:
+    """頁面底色：整頁 SVG 應該最底層畫一個不透明的頁面底色（svg_page_background = "auto"，exporters/svg.py）。
+    透明的地方在深色模式的看圖軟體或預覽裡會變成黑底、深色的字看不見；驗證時一律鋪白底，看不出這種退步，所以另外檢查。
+      設定是 auto（應該不透明）卻有透明的地方：開 svg_transparent（error），這一頁的相似度取「白底」與「黑底」兩種背景下較差的一個。
+      設定是 none（使用者要透明）：只寫一條說明（info），不扣分。
+    回傳這一頁要用的相似度。"""
+    pct = f"{int(clear * 100)}%" if clear >= 0.01 else f"{clear:.1%}"  # 無條件捨去：幾乎全透明時不寫成 100%
+    if svg_p.get("page_background", "auto") == "none":
+        issues.append(Issue(severity=Severity.INFO, code="svg_transparent", message=f"頁面有 {pct} 是透明的（設定 svg_page_background = \"none\"）：在深色模式的看圖軟體裡會變成黑底。"))
+        return sim
+    dark = similarity(working, content_region(_on(rgba, (0, 0, 0)), page))
+    issues.append(Issue(severity=Severity.ERROR, code="svg_transparent",
+                        message=f"頁面有 {pct} 是透明的，沒有畫出頁面底色：在深色模式的看圖軟體或預覽裡會變成黑底，深色的字看不見"
+                                f"（黑底下與原圖的相似度 {dark:.3f}，白底下 {sim:.3f}；分數取較差的一個）。"))
+    return min(sim, dark)
 
 
 def _renders_pdf(images: list[tuple[Image.Image, float, float]]) -> bytes:
@@ -537,7 +574,7 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
         notes.append("設定關閉了渲染比對（svg_render = false），只做結構檢查與文字讀回。")
     elif resvg_py is None:
         notes.append("resvg-py 無法載入，退回只做結構檢查與文字讀回，沒有相似度。")
-    _, lp = svgx.params_for(cfg)
+    svg_p, lp = svgx.params_for(cfg)
     reports: list[FormatPageReport] = []
     renders: list[tuple[Image.Image, float, float]] = []
     adjustments: set[str] = set()
@@ -565,12 +602,17 @@ def verify(output: OutputFile, specs: list[PageSpec], elements: list[ElementList
             try:
                 text, did = render_copy(root, book, others, bool(p["svg_emulate_bold"]), float(lp.get("faux_bold_stroke_ratio", 0.03)))
                 adjustments.update(did)
-                image = render(resvg_py, text, max(1, round(page.width_pt * verify_dpi(p["render_dpi"], page, spec) / 72.0)), book)
+                # 不鋪底色畫一次：透明的地方在深色模式的看圖軟體裡會變成黑底。比對時鋪白底（一般看圖軟體的樣子）
+                rgba = render(resvg_py, text, max(1, round(page.width_pt * verify_dpi(p["render_dpi"], page, spec) / 72.0)), book, background=None)
+                image = _on(rgba, (255, 255, 255))
+                clear = transparent_share(rgba)
                 renders.append((image, page.width_pt, page.height_pt))
                 if spec is not None:
                     working = Image.open(store.blob_path(spec.working_image))  # 白紙類頁面比去光照後的影像；其他頁面工作影像就是原圖
                     region = content_region(image, page)
                     sim = similarity(working, region)  # 有輸出尺寸時只比原始內容那一塊（留白不算）
+                    if clear > float(p["svg_transparent_max"]):
+                        sim = _transparent_check(sim, clear, rgba, working, page, svg_p, issues)
                     if on_render is not None:
                         on_render(i, region, glyphs=_glyphs(read, book))
                     if sim < p["svg_similarity_pass"]:

@@ -13,7 +13,7 @@
 （verify/lines.py 的 Glyph；讀不到文字層時省略）。⑦用它做「逐行文字對照」（lines.py：③讀到的每一行字在成品上
 找不找得到、有沒有錯位或疊在一起），比對的問題由⑦併進這個格式的 FormatReport，並計入整體分數。
 PowerPoint 的目標驗證（要靠 LibreOffice 當替身引擎）是較早寫的，仍在 stages/s7_verify.py 裡。
-這台機器驗證不了某個格式時（例如 Word 需要 LibreOffice），驗證模組丟出例外（docx_target.Unverified），
+這台機器驗證不了某個格式時（例如 Word 需要 LibreOffice），驗證模組丟出例外（本套件的 Unverified），
 ⑦改用中性渲染的分數當這個格式的代用值，並在報告裡寫明。沒有登記驗證模組的格式（例如 Excel、InDesign）也一樣。
 """
 

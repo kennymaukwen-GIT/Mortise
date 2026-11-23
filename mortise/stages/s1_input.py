@@ -23,7 +23,7 @@ from ..pipeline.store import Store, sha256_bytes
 from ..tools import pdfium as pdf
 
 NAME = "s1"
-VERSION = "2"
+VERSION = "3"
 
 
 class InputError(Exception):
@@ -165,9 +165,17 @@ class ImageFeatures:
           就算雜訊被 JPEG 壓平，完全同色的範圍也只到一個 8×8 區塊為止，不會連成一大片。
     noise：平坦區的雜訊 σ（色階），與②頁面幾何判斷「數位影像」用的是同一個量法（只量影像中央）。
     quad：在縮圖上找到的紙張四邊（method、信心值、佔整張圖的面積比例）；quad_outside_flat 是四邊以外那一圈的大片平塗比例
-          （照片裡四邊以外是桌面之類的真實場景；截圖裡斜放的色塊，四邊以外仍是平塗的畫面）。"""
+          （照片裡四邊以外是桌面之類的真實場景；截圖裡斜放的色塊，四邊以外仍是平塗的畫面）。
+    quad_persp_deg：四邊形兩組對邊的夾角取大的（度）。拍照的透視會讓對邊不平行；截圖裡的色塊、圖片就算旋轉了，對邊仍然平行。
+    quad_outside_flat_mid：同 quad_outside_flat，但只算「不是純黑或純白」的像素。相機把暗處壓成純黑（例如在暗處拍螢幕、投影）
+          或把亮處過曝成純白時，四邊以外也會是一大片完全同色，但那不是數位畫面；這時中間色調的像素幾乎都不平塗。
+          中間色調的像素太少（不到四邊以外的 5%）時是 None。
+    quad_tilt_deg：四邊形的邊離水平或垂直最多偏幾度。截圖裡的色塊、圖片幾乎都和畫面軸對齊（0°）；拍照很難拍得完全正。
+    quad_outside_black：四邊以外純黑像素（三個通道都 ≤ 6）的比例。"""
 
-    def __init__(self, flat: float, flat_big: float, noise: float, quad_method: str, quad_conf: float, quad_area: float, quad_outside_flat: Optional[float]):
+    def __init__(self, flat: float, flat_big: float, noise: float, quad_method: str, quad_conf: float, quad_area: float, quad_outside_flat: Optional[float],
+                 quad_persp_deg: float = 0.0, quad_outside_flat_mid: Optional[float] = None, quad_tilt_deg: float = 0.0,
+                 quad_outside_black: float = 0.0):
         self.flat = flat
         self.flat_big = flat_big
         self.noise = noise
@@ -175,6 +183,10 @@ class ImageFeatures:
         self.quad_conf = quad_conf
         self.quad_area = quad_area
         self.quad_outside_flat = quad_outside_flat
+        self.quad_persp_deg = quad_persp_deg
+        self.quad_outside_flat_mid = quad_outside_flat_mid
+        self.quad_tilt_deg = quad_tilt_deg
+        self.quad_outside_black = quad_outside_black
 
     def summary(self) -> str:
         out = f"平塗像素 {self.flat:.0%}（大片平塗 {self.flat_big:.0%}），雜訊 σ {self.noise:.2f}，紙張四邊 {self.quad_method}（信心值 {self.quad_conf:.2f}）"
@@ -182,6 +194,9 @@ class ImageFeatures:
             out += f"，佔畫面 {self.quad_area:.0%}"
         if self.quad_outside_flat is not None:
             out += f"，四邊以外的大片平塗 {self.quad_outside_flat:.0%}"
+            out += "（不算純黑純白：" + ("幾乎沒有中間色調" if self.quad_outside_flat_mid is None else f"{self.quad_outside_flat_mid:.0%}") + "）"
+        if self.quad_method != "full_image":
+            out += f"，對邊夾角 {self.quad_persp_deg:.1f}°、邊的傾斜 {self.quad_tilt_deg:.1f}°"
         return out
 
 
@@ -216,18 +231,56 @@ def image_features(im: Image.Image, c: dict) -> ImageFeatures:
     s = min(1.0, side / max(H, W))
     small = cv2.resize(arr, (max(8, int(round(W * s))), max(8, int(round(H * s)))), interpolation=cv2.INTER_AREA) if s < 1 else arr
     quad = pg.find_page_quad(small, {"input_type": None})
-    area, outside = 1.0, None
+    area, outside, outside_mid, persp, tilt, black = 1.0, None, None, 0.0, 0.0, 0.0
     if quad.method != "full_image":
         sh, sw = sub.shape[:2]
         k = np.array([sw / small.shape[1], sh / small.shape[0]])
-        poly = np.round(np.asarray(quad.corners, dtype=np.float64) * k).astype(np.int32)
+        corners = np.asarray(quad.corners, dtype=np.float64)
+        poly = np.round(corners * k).astype(np.int32)
         mask = np.zeros((sh, sw), np.uint8)
         cv2.fillPoly(mask, [poly], 1)
         area = float(mask.mean())
         out = mask == 0
         if out.mean() >= 0.03:
             outside = float(big[out].mean())
-    return ImageFeatures(flat, float(big.mean()), noise, quad.method, float(quad.confidence), area, outside)
+            dark = sub.max(axis=2) <= 6
+            clipped = dark | (sub.min(axis=2) >= 249)  # 純黑或純白（相機壓暗、過曝）
+            black = float(dark[out].mean())
+            mid = out & ~clipped
+            if mid.sum() >= 0.05 * out.sum():
+                outside_mid = float(big[mid].mean())
+        persp, tilt = _opposite_sides_angle(corners), _axis_tilt(corners)
+    return ImageFeatures(flat, float(big.mean()), noise, quad.method, float(quad.confidence), area, outside, persp, outside_mid, tilt, black)
+
+
+def _axis_tilt(corners) -> float:
+    """四邊形各邊離水平或垂直最多偏幾度。"""
+    import math
+
+    c = [tuple(map(float, pt)) for pt in corners]
+    worst = 0.0
+    for a, b in zip(c, c[1:] + c[:1]):
+        t = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 90.0
+        worst = max(worst, min(t, 90.0 - t))
+    return worst
+
+
+def _opposite_sides_angle(corners) -> float:
+    """四邊形（左上、右上、右下、左下）兩組對邊的夾角，取大的（度）。對邊平行（長方形、平行四邊形）是 0。"""
+    import math
+
+    c = [tuple(map(float, pt)) for pt in corners]
+
+    def ang(a, b) -> float:
+        return math.atan2(b[1] - a[1], b[0] - a[0])
+
+    def diff(a: float, b: float) -> float:
+        d = abs(a - b) % math.pi
+        return math.degrees(min(d, math.pi - d))
+
+    top, bottom = ang(c[0], c[1]), ang(c[3], c[2])
+    left, right = ang(c[0], c[3]), ang(c[1], c[2])
+    return max(diff(top, bottom), diff(left, right))
 
 
 def classify_image(f: ImageFeatures, camera: bool, c: dict) -> tuple[InputType, float, str]:
@@ -238,6 +291,7 @@ def classify_image(f: ImageFeatures, camera: bool, c: dict) -> tuple[InputType, 
     檔案格式（PNG 或 JPEG）不列入判斷：截圖常被聊天軟體轉成 JPEG。相機資訊只在內容分不出來時當旁證。
     依序：
       1. 有透視變形的紙張四邊 → 照片；除非四邊以外也是大片平塗、四邊形又只佔畫面一部分（截圖裡的色塊或圖片）。
+         但四邊以外的平塗幾乎全是純黑、四邊形又是歪的（在暗處拍螢幕或投影）仍判照片。
       2. 大片平塗比例夠高 → 截圖（相機拍的影像不會有成片完全同色的區域）。
       3. 幾乎沒有雜訊、平塗像素又多 → 截圖（漸層多的畫面）。
       4. 其他 → 照片（整張圖就是頁面，或紙張邊緣沒拍到）。"""
@@ -246,6 +300,15 @@ def classify_image(f: ImageFeatures, camera: bool, c: dict) -> tuple[InputType, 
     digital = f.noise < float(c.get("classify_noise_digital", 0.6))
     if f.quad_method in ("edge_fit", "contour") and f.quad_conf >= float(c.get("classify_quad_min_conf", 0.5)):
         if f.quad_outside_flat is not None and f.quad_outside_flat >= float(c.get("classify_outside_flat", 0.5)) and f.quad_area < float(c.get("classify_quad_max_area", 0.8)):
+            # 四邊以外是一大片完全同色：多半是截圖裡的色塊或圖片。例外是在暗處拍螢幕、投影：相機把螢幕以外壓成純黑，
+            # 也是一大片完全同色，但那不是數位畫面。分得出來的地方是：那片同色幾乎全是純黑、而四邊形不是和畫面軸對齊的長方形
+            # （拍照很難拍得完全正，截圖裡的色塊、圖片則一定對齊）。純白不算這個例外：白底投影片上的圖片很常見。
+            tilted = max(f.quad_tilt_deg, f.quad_persp_deg) > float(c.get("classify_quad_tilt_deg", 0.3))
+            crushed = f.quad_outside_flat_mid is None and f.quad_outside_black >= float(c.get("classify_outside_black", 0.5))
+            if tilted and crushed:
+                conf = 0.85 if camera else 0.75
+                return InputType.PHOTO, conf, (f"找到一個歪斜的四邊形（佔畫面 {f.quad_area:.0%}，邊的傾斜 {max(f.quad_tilt_deg, f.quad_persp_deg):.1f}°），"
+                                               f"四邊以外幾乎全是純黑（{f.quad_outside_black:.0%}）：判為在暗處拍的螢幕或投影，不是截圖")
             return InputType.SCREENSHOT, 0.6, (f"找到一個像紙張的四邊形（佔畫面 {f.quad_area:.0%}），但四邊以外是大片平塗的數位畫面（{f.quad_outside_flat:.0%}），"
                                                "判為截圖裡的色塊或圖片，不是拍到的紙張")
         conf = 0.95 if camera else 0.9
@@ -254,7 +317,7 @@ def classify_image(f: ImageFeatures, camera: bool, c: dict) -> tuple[InputType, 
         conf = 0.9 if f.flat_big >= 2 * flat_big_min else 0.75
         if camera:
             conf = 0.6
-        return InputType.SCREENSHOT, conf, f"有大片完全同色的平塗區域（{f.flat_big:.0%}），判為截圖或軟體匯出的頁面"
+        return InputType.SCREENSHOT, conf, f"有大片完全同色的平塗區域（{f.flat_big:.0%}），判為截圖、軟體匯出的頁面或乾淨的掃描"
     if digital and f.flat >= flat_min:
         return InputType.SCREENSHOT, 0.6 if camera else 0.7, f"平塗像素多（{f.flat:.0%}）、幾乎沒有雜訊（σ {f.noise:.2f}），判為截圖或軟體匯出的頁面"
     if camera:

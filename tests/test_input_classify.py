@@ -114,7 +114,55 @@ def test_screenshot_with_a_big_photo_inside_is_screenshot(tmp_path, store):
     assert ref.input_type.value == InputType.SCREENSHOT
 
 
+def test_tilted_picture_on_white_slide_is_screenshot(tmp_path, store):
+    """白底投影片上斜放一張照片（拍立得風格）：四邊形是歪的，但四邊以外是純白的數位畫面，仍是截圖。
+    （純黑的四周才是「暗處拍螢幕」的例外，見 test_screen_photo_in_the_dark_is_photo。）"""
+    rng = np.random.default_rng(5)
+    canvas = np.full((700, 1000, 3), 255, np.float32)
+    yy, xx = np.mgrid[0:380, 0:520]
+    scene = np.stack([90 + 60 * np.sin(xx / 70.0), 120 + 40 * np.cos(yy / 50.0), 150 + 30 * np.sin((xx + yy) / 90.0)], axis=2)
+    scene = scene + rng.normal(0, 4, scene.shape)
+    canvas = _warp_onto(scene.astype(np.float32), canvas, [[250, 170], [760, 130], [790, 500], [280, 540]])
+    path = tmp_path / "tilted_photo_on_slide.png"
+    Image.fromarray(np.clip(canvas, 0, 255).astype(np.uint8)).save(path)
+    assert run_s1(path, store).pages[0].input_type.value == InputType.SCREENSHOT
+
+
+def _warp_onto(content: np.ndarray, bg: np.ndarray, quad) -> np.ndarray:
+    import cv2
+
+    h, w = content.shape[:2]
+    M = cv2.getPerspectiveTransform(np.float32([[0, 0], [w, 0], [w, h], [0, h]]), np.float32(quad))
+    H, W = bg.shape[:2]
+    warped = cv2.warpPerspective(content, M, (W, H), flags=cv2.INTER_AREA)
+    mask = cv2.warpPerspective(np.ones((h, w), np.float32), M, (W, H), flags=cv2.INTER_LINEAR)[..., None]
+    return bg * (1 - mask) + warped * mask
+
+
 # ---------------------------------------------------------------- ①：照片
+
+
+def test_screen_photo_in_the_dark_is_photo(tmp_path, store):
+    """在暗處拍螢幕：相機把螢幕以外壓成純黑，四邊以外也是一大片完全同色，但那不是數位畫面。
+    以前判成截圖（信心值 0.6），沒有透視攤平、文字行斜 1.8°。現在：四邊形是歪的、四邊以外幾乎全是純黑 → 照片，並攤平。"""
+    import cv2
+
+    rng = np.random.default_rng(11)
+    scr = np.asarray(render("slide_basic", 110.0)).astype(np.float32)
+    h, w = scr.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    moire = 1 + 0.06 * np.sin(2 * np.pi * (xx * 0.13 + yy * 0.021)) * np.sin(2 * np.pi * (yy * 0.11 - xx * 0.017))
+    scr = scr * moire[..., None] * 0.92 + 10
+    ph = _warp_onto(scr, np.zeros((1050, 1400, 3), np.float32), [[175, 147], [1253, 182], [1232, 889], [161, 861]])
+    ph = cv2.GaussianBlur(ph, (0, 0), 1.0)
+    ph = ph + rng.normal(0, 2.5, ph.shape).astype(np.float32) * (ph.mean(axis=2, keepdims=True) > 30)
+    jpg = save_jpeg(Image.fromarray(np.clip(np.round(ph), 0, 255).astype(np.uint8)), tmp_path / "screen_dark.jpg", quality=88)
+    doc = run_s1(jpg, store)
+    ref = doc.pages[0]
+    assert ref.input_type.value == InputType.PHOTO, doc.metadata
+    assert "純黑" in doc.metadata["classify"] and "螢幕" in doc.metadata["classify"]
+    spec = s2_page.run(doc, 0, Config.load(), [], store)
+    assert spec.quad_method != "full_image"  # 找到螢幕的四角並攤平
 
 
 @pytest.mark.parametrize("name,seed,strength", PHOTOS)
@@ -163,6 +211,16 @@ def test_classify_rules():
     assert classify_image(f(0.8, 0.7, 0.0, "edge_fit", 0.95, 0.95, 0.6), False, c)[0] == InputType.PHOTO  # 佔滿畫面：掃到的紙張
     assert classify_image(f(0.0, 0.0, 4.0, "edge_fit", 0.3, 0.5, 0.0), False, c)[0] == InputType.PHOTO  # 四邊信心值低：不算四邊，看雜訊
 
+    def g(tilt, persp, mid, black):
+        return ImageFeatures(0.47, 0.46, 1.2, "edge_fit", 0.95, 0.52, 0.97, quad_persp_deg=persp, quad_outside_flat_mid=mid,
+                             quad_tilt_deg=tilt, quad_outside_black=black)
+
+    # 四邊以外是平塗：純黑、四邊形歪的 → 暗處拍的螢幕（照片）；對齊畫面軸、或平塗的是中間色調、或是純白 → 截圖裡的色塊
+    assert classify_image(g(1.9, 0.6, None, 0.97), False, c)[0] == InputType.PHOTO
+    assert classify_image(g(0.0, 0.0, None, 0.97), False, c)[0] == InputType.SCREENSHOT
+    assert classify_image(g(1.9, 0.6, 0.95, 0.10), False, c)[0] == InputType.SCREENSHOT
+    assert classify_image(g(1.9, 0.6, None, 0.0), False, c)[0] == InputType.SCREENSHOT
+
 
 # ---------------------------------------------------------------- ②：截圖不增強，照片的原圖另外保留
 
@@ -207,3 +265,47 @@ def test_photo_is_rectified_and_enhanced_but_keeps_the_original(photo_jpeg, stor
     assert color.shape == flat.shape and np.array_equal(color, flat)
     assert work.shape == color.shape and np.abs(work.astype(int) - color.astype(int)).mean() > 5  # 工作影像是增強過的
     assert any("color_image" in n for n in spec.notes)
+
+
+def _textured_theme(name: str = "doc_a4") -> np.ndarray:
+    """閱讀軟體的「紙紋」主題截圖：米色底帶細紋理（空間上有相關、不是感光雜訊），沒有相機資訊。"""
+    import cv2
+
+    rng = np.random.default_rng(4)
+    page = np.asarray(render(name, 110.0)).astype(np.float32)
+    tex = cv2.GaussianBlur(rng.normal(0, 6.0, page.shape[:2]).astype(np.float32), (0, 0), 1.2)[..., None]
+    ink = page.mean(axis=2, keepdims=True) / 255.0
+    out = (np.array([246, 240, 226], np.float32) + tex) * ink + np.array([60, 55, 50], np.float32) * (1 - ink)
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def test_textured_theme_screenshot_keeps_its_colors(tmp_path, store):
+    """紙紋主題的截圖沒有大片平塗、有細紋理，①可能判成照片。以前②接著做白平衡，米色底 (246,240,226) 被改成灰白，
+    ⑦又拿增強後的影像比，分數看不出來。現在：照片模式下找不到紙張四邊、整頁光照又均勻時不做去陰影與白平衡。"""
+    arr = _textured_theme()
+    path = tmp_path / "textured_theme.png"
+    Image.fromarray(arr).save(path)
+    cfg = Config.load()
+    doc = run_s1(path, store)
+    ref = doc.pages[0].model_copy(update={"input_type": doc.pages[0].input_type.model_copy(update={"value": InputType.PHOTO})})
+    spec = s2_page.run(doc.model_copy(update={"pages": [ref]}), 0, cfg, [], store)  # 不論①怎麼判，照片模式都不能改顏色
+    assert not spec.enhanced and spec.color_image is None
+    assert any("光照" in n and "均勻" in n for n in spec.notes), spec.notes
+    work = np.asarray(Image.open(store.blob_path(spec.working_image)).convert("RGB"))
+    assert np.array_equal(work, arr)
+
+
+def test_full_frame_photo_with_uneven_light_is_still_enhanced(tmp_path, store):
+    """反例：紙張填滿畫面（找不到四邊）、但光照不均（一邊亮一邊暗、偏黃）的照片，仍然要去陰影與白平衡。"""
+    rng = np.random.default_rng(6)
+    page = np.asarray(render("doc_a4", 110.0)).astype(np.float32)
+    h, w = page.shape[:2]
+    light = np.linspace(1.0, 0.9, w, dtype=np.float32)[None, :, None] * np.ones((h, 1, 1), np.float32)  # 一邊暗一成（還算「白紙」）
+    photo = page * light * np.array([0.98, 0.95, 0.88], np.float32) + rng.normal(0, 3.0, page.shape).astype(np.float32)
+    path = save_jpeg(Image.fromarray(np.clip(np.round(photo), 0, 255).astype(np.uint8)), tmp_path / "fullframe.jpg")
+    doc = run_s1(path, store)
+    ref = doc.pages[0].model_copy(update={"input_type": doc.pages[0].input_type.model_copy(update={"value": InputType.PHOTO})})
+    spec = s2_page.run(doc.model_copy(update={"pages": [ref]}), 0, Config.load(), [], store)
+    assert spec.quad_method == "full_image" and spec.enhanced and spec.color_image is not None
+    assert s2_page._illumination_spread(np.asarray(Image.open(path).convert("RGB"))) > 0.06
+    assert s2_page._illumination_spread(_textured_theme()) < 0.03

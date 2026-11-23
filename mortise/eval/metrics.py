@@ -30,6 +30,14 @@
 - 「英文」錯誤率涵蓋所有非中日韓、非空白的字元（拉丁字母、數字、標點）。
 - 端到端指標的總分沿用⑦的定義：整頁當成一張圖輸出時相似度近乎 1，所以另有「整頁點陣化比例」指標。
 
+攤平（彎曲照片）的指標（dewarp_geometry、pdf_text_cer）：
+8. 位置誤差：輸出每隔 step 像素取一點 → 方法交出的對應圖 → 照片座標 → 合成時的逐像素真值 → 頁面座標；
+   輸出座標對頁面座標做最佳仿射擬合（容許整體縮放、平移、輕微斜切，只量「彎」與「不均勻」），
+   回報殘差的中位數與 p95（頁面像素，150 dpi 時 1 像素約 0.17 mm）。
+   頁面覆蓋率：頁面切成 coverage_cell 像素的格子，有輸出點落進去的格子比例；背景比例：輸出點落在紙外的比例。
+9. 以 PDF 文字層為答案的字元錯誤率：辨識出的每一行，以它的中心（換算到頁面座標）分給包含它的那一行答案；
+   每行答案把分到的辨識結果依 x 排序接起來算編輯距離；沒分到任何答案行的辨識結果整行算插入。
+
 可單獨升級的點：多對一行配對；以字元框（而非行框）計算位置誤差；字型名稱別名表可擴充；
 顏色差可換成 CIEDE2000。
 """
@@ -131,6 +139,12 @@ METRICS: dict[str, MetricInfo] = {
     "e2e_position_error_pt": MetricInfo("輸出位置誤差（⑦）", "pt", False, "端到端", 0.1),
     "rasterized_page": MetricInfo("整頁點陣化比例（文字不可編輯）", "比例", False, "端到端", 0.01),
     "user_rating": MetricInfo("使用者整頁評分（換算成 0 到 1）", "比例", True, "回饋", 0.05),
+    # ---- 攤平（彎曲照片；需要 synth.degrade_curved 的逐像素真值，見 dewarp_geometry）----
+    "dewarp_pos_median_px": MetricInfo("攤平位置誤差中位數（頁面像素，150 dpi）", "px", False, "攤平", 0.5),
+    "dewarp_pos_p95_px": MetricInfo("攤平位置誤差 p95（頁面像素，150 dpi）", "px", False, "攤平", 1.0),
+    "page_coverage": MetricInfo("頁面覆蓋率（頁面有多少落在輸出裡）", "比例", True, "攤平", 0.01),
+    "background_frac": MetricInfo("輸出裡不是這張紙的比例", "比例", False, "攤平", 0.01),
+    "pdf_text_cer": MetricInfo("字元錯誤率（以原生 PDF 文字層為答案）", "比例", False, "文字", 0.01),
 }
 
 
@@ -287,6 +301,51 @@ def transform_elements(el: ElementList, h: np.ndarray) -> ElementList:
         s = local_scale(h, c.x, c.y)
         shapes.append(sh.model_copy(update={"quad": _tq(sh.quad, h), "stroke_width": None if sh.stroke_width is None else sh.stroke_width * s}))
     tables = [t.model_copy(update={"quad": _tq(t.quad, h), "h_lines": [], "v_lines": []}) for t in el.table_regions]
+    return el.model_copy(update={"texts": texts, "images": images, "shapes": shapes, "table_regions": tables})
+
+
+def transform_elements_pointwise(el: ElementList, fn) -> ElementList:
+    """把元素清單用「逐點」的座標轉換搬到另一個座標系（非線性變形用，例如彎曲照片的逐像素真值）。
+    fn((N, 2) 陣列) -> (N, 2) 陣列，對不到的點給 NaN；四角有任一點對不到的元素整個丟掉（算漏抓）。
+    字級、字距、線寬依中心附近的局部縮放倍數（有限差分）調整。"""
+    eps = 1e-3
+
+    def tq(q: Quad):
+        pts = fn(np.array([[pt.x, pt.y] for pt in q.points], dtype=np.float64))
+        if not np.all(np.isfinite(pts)):
+            return None
+        return Quad(tl=Point(x=pts[0, 0], y=pts[0, 1]), tr=Point(x=pts[1, 0], y=pts[1, 1]), br=Point(x=pts[2, 0], y=pts[2, 1]), bl=Point(x=pts[3, 0], y=pts[3, 1]))
+
+    def scale_at(c: Point) -> float:
+        a = fn(np.array([[c.x, c.y], [c.x + eps, c.y], [c.x, c.y + eps]], dtype=np.float64))
+        if not np.all(np.isfinite(a)):
+            return 1.0
+        u, v = (a[1] - a[0]) / eps, (a[2] - a[0]) / eps
+        return math.sqrt(abs(u[0] * v[1] - u[1] * v[0]))
+
+    texts = []
+    for t in el.texts:
+        q = tq(t.quad)
+        if q is None:
+            continue
+        s = scale_at(t.quad.center)
+        runs = []
+        for r in t.runs:
+            rq = tq(r.quad) or q
+            runs.append(r.model_copy(update={"quad": rq, "font_size": _scale_measured(r.font_size, s),
+                                             "char_spacing": None if r.char_spacing is None else r.char_spacing * s, "char_x": [x * s for x in r.char_x]}))
+        bl = fn(np.array([[pt.x, pt.y] for pt in t.baseline], dtype=np.float64))
+        base = (Point(x=bl[0, 0], y=bl[0, 1]), Point(x=bl[1, 0], y=bl[1, 1])) if np.all(np.isfinite(bl)) else (q.bl, q.br)
+        texts.append(t.model_copy(update={"quad": q, "runs": runs, "baseline": base}))
+    images = [i.model_copy(update={"quad": q}) for i in el.images if (q := tq(i.quad)) is not None]
+    shapes = []
+    for sh in el.shapes:
+        q = tq(sh.quad)
+        if q is None:
+            continue
+        s = scale_at(sh.quad.center)
+        shapes.append(sh.model_copy(update={"quad": q, "stroke_width": None if sh.stroke_width is None else sh.stroke_width * s}))
+    tables = [t.model_copy(update={"quad": q, "h_lines": [], "v_lines": []}) for t in el.table_regions if (q := tq(t.quad)) is not None]
     return el.model_copy(update={"texts": texts, "images": images, "shapes": shapes, "table_regions": tables})
 
 
@@ -737,3 +796,84 @@ def distribution(values: Iterable[float], bins: int = 10) -> dict[str, Any]:
     hist, _ = np.histogram(np.clip(v, 0, 1), bins=bins, range=(0.0, 1.0))
     return {"n": int(v.size), "mean": float(v.mean()), "min": float(v.min()), "p10": float(np.percentile(v, 10)),
             "median": float(np.median(v)), "hist": hist.astype(int).tolist()}
+
+
+# ====================================================================== 攤平幾何與 PDF 文字層（彎曲照片）
+
+
+def dewarp_geometry(map_x: np.ndarray, map_y: np.ndarray, page_map: np.ndarray, page_size: tuple[float, float], step: int = 4,
+                    coverage_cell: float = 20.0) -> dict[str, Any]:
+    """攤平結果與逐像素真值比對（見開頭說明第 8 點）。
+
+    map_x、map_y：輸出像素中心 → 照片座標（像素角落約定），即攤平時交出的對應圖；
+    page_map：照片像素中心 → 頁面座標（synth.degrade_curved 交出，紙外為 NaN）；page_size：頁面（寬, 高）像素。
+    回傳 dewarp_pos_median_px、dewarp_pos_p95_px、dewarp_pos_max_px、page_coverage、background_frac、n。"""
+    from .synth import sample_page_map
+
+    oh, ow = map_x.shape
+    ys, xs = np.mgrid[0:oh:step, 0:ow:step]
+    sx = map_x[ys, xs].astype(np.float32)
+    sy = map_y[ys, xs].astype(np.float32)
+    finite = np.isfinite(sx) & np.isfinite(sy)
+    u, v, ok = sample_page_map(page_map, np.where(finite, sx, -1e6), np.where(finite, sy, -1e6))
+    ok &= finite
+    out: dict[str, Any] = {"background_frac": float(1.0 - ok.mean()) if ok.size else 1.0, "n": int(ok.sum())}
+    if ok.sum() < 12:
+        out.update({"page_coverage": 0.0})
+        return out
+    A = np.stack([xs[ok] + 0.5, ys[ok] + 0.5, np.ones(int(ok.sum()))], 1)
+    T = np.stack([u[ok], v[ok]], 1).astype(np.float64)
+    sol, *_ = np.linalg.lstsq(A, T, rcond=None)
+    res = np.linalg.norm(A @ sol - T, axis=1)
+    W, H = page_size
+    nx, ny = int(math.ceil(W / coverage_cell)), int(math.ceil(H / coverage_cell))
+    occ = np.zeros((ny, nx), bool)
+    occ[np.clip((T[:, 1] // coverage_cell).astype(int), 0, ny - 1), np.clip((T[:, 0] // coverage_cell).astype(int), 0, nx - 1)] = True
+    out.update({"dewarp_pos_median_px": float(np.median(res)), "dewarp_pos_p95_px": float(np.percentile(res, 95)),
+                "dewarp_pos_max_px": float(res.max()), "page_coverage": float(occ.mean())})
+    return out
+
+
+def _plain(text: str, p: dict) -> str:
+    s = unicodedata.normalize("NFKC", text) if p["cer_nfkc"] else text
+    return "".join(c for c in s if not (p["cer_ignore_spaces"] and c.isspace()))
+
+
+def _edit_distance(a: str, b: str) -> int:
+    return sum(1 for i, j in align(a, b) if i is None or j is None or a[i] != b[j])
+
+
+def pdf_text_cer(ocr_lines: list[tuple[str, Optional[tuple[float, float]]]], truth_lines: list[dict[str, Any]], params: dict | None = None) -> dict[str, Any]:
+    """以 PDF 文字層為答案的字元錯誤率（見開頭說明第 9 點）。
+
+    ocr_lines：[(辨識文字, 行中心的頁面座標 (x, y) 或 None)]；truth_lines：synth.render_pdf_page 交出的 [{"text", "bbox"}]（頁面像素）。
+    回傳 pdf_text_cer、errors、chars、unassigned（沒分到答案行的辨識行數）。"""
+    p = _p(params)
+    groups: list[list[tuple[float, str]]] = [[] for _ in truth_lines]
+    extra = 0
+    unassigned = 0
+    for text, c in ocr_lines:
+        t = _plain(text, p)
+        if not t:
+            continue
+        best, best_d = None, float("inf")
+        if c is not None and np.all(np.isfinite(c)):
+            for k, tl in enumerate(truth_lines):
+                x0, y0, x1, y1 = tl["bbox"]
+                hgt = max(1.0, y1 - y0)
+                if x0 - 0.5 * hgt <= c[0] <= x1 + 0.5 * hgt and y0 - 0.35 * hgt <= c[1] <= y1 + 0.35 * hgt:
+                    d = abs(c[1] - 0.5 * (y0 + y1)) + 0.01 * abs(c[0] - 0.5 * (x0 + x1))
+                    if d < best_d:
+                        best, best_d = k, d
+        if best is None:
+            extra += len(t)
+            unassigned += 1
+        else:
+            groups[best].append((float(c[0]), t))
+    errors, chars = extra, 0
+    for tl, g in zip(truth_lines, groups):
+        truth = _plain(tl["text"], p)
+        pred = "".join(t for _, t in sorted(g, key=lambda z: z[0]))
+        chars += len(truth)
+        errors += _edit_distance(truth, pred)
+    return {"pdf_text_cer": (errors / chars) if chars else None, "errors": int(errors), "chars": int(chars), "unassigned": int(unassigned)}

@@ -18,6 +18,8 @@ classify_flat_photo = 0.3            # 3×3 平塗像素低於這個比例，判
 classify_quad_min_conf = 0.5         # 縮圖上找到的紙張四邊信心值至少這麼多，才算「有透視變形的紙張」
 classify_outside_flat = 0.5          # 四邊以外的大片平塗比例達到這個、四邊形又不到 classify_quad_max_area，視為截圖裡的色塊或圖片（初始值）
 classify_quad_max_area = 0.8         # 見上；佔畫面這麼大的四邊形一律當成拍到或掃到的紙張
+classify_quad_tilt_deg = 0.3         # 四邊形的邊離水平或垂直超過這麼多度（或對邊不平行），才算「歪的」（截圖裡的色塊一定對齊；初始值）
+classify_outside_black = 0.5         # 四邊以外有這個比例以上是純黑、又沒有中間色調的平塗：歪的四邊形判為暗處拍的螢幕或投影（照片；初始值）
 classify_max_side = 1200             # 找紙張四邊時縮圖的長邊（像素）
 classify_max_megapixels = 16         # 算平塗比例時，影像超過這麼多百萬像素就隔點取樣
 
@@ -29,6 +31,14 @@ size_auto_accept = 0.6               # 尺寸候選的信心值超過此值就�
 enhance_photos = true                # 照片與掃描檔先去陰影、白平衡再辨識
 enhance_max_flat = 0.25              # 照片模式下，攤平後的頁面若有這個比例以上的成片完全同色像素（平塗的數位畫面），就不做去陰影與白平衡（初始值）
 enhance_flat_window = 9              # 「成片完全同色」的鄰域邊長（像素），要大於 JPEG 的 8×8 區塊
+enhance_uniform_max = 0.03           # 照片模式、找不到紙張四邊時，底色亮度落差（p95−p5）÷ 中位數低於此值就不做去陰影與白平衡（紙紋主題的截圖 0.004、合成手機照片 0.2 以上；初始值）
+# ---- 彎曲的紙攤平（recognition/dewarp.py；由 page_geometry.rectify 的 params["dewarp"] 開啟，s2 下一輪接進流程）----
+dewarp_photos = true                 # 照片判定紙是彎的（弓起、捲起、折痕）才攤平；平的紙只做透視攤平
+dewarp_uvdoc = "auto"                # 學習式外框候選 UVDoc（MIT）："auto" 第一次使用時下載到使用者快取並驗證 SHA-256、"cache_only" 不下載、"off" 不用
+dewarp_flat_sag_median_pct = 0.1     # 判定平的紙：頁內格線與文字行離直線的最大距離（佔頁寬 %）中位數低於此值……（合成資料初定，要用真實照片校正）
+dewarp_flat_sag_max_pct = 0.3        # ……而且第二大的線也低於此值
+dewarp_bow_px = 2.0                  # 判定紙邊彎曲：弓高超過 max(此值, 0.2% 邊長)（原照片像素）
+enhance_fine_side = 1600             # 去陰影時估照度圖的縮圖長邊（像素）：越大陰影的硬邊越準，越慢
 
 [recognize]                          # ③ 辨識
 line_gap_factor = 1.5                # 同一基線上兩字間距超過「字級 × 此值」就拆成兩行
@@ -134,6 +144,7 @@ region_overlay_noise_ratio_textured = 0.08  # 照片找不到本身平坦的地�
 region_overlay_translucent_ratio = 0.05  # 頁面底色完全乾淨時，色塊內部的顆粒比超過此值就當成半透明，不拆（初始值）
 region_overlay_full_bleed = true     # 滿版照片（沒有頁面底色）也找疊在上面的平塗圖形；找不到就照原本的讀法
 region_overlay_fill_quality_warn = 0.5  # 補出來的地方的中尺度紋理不到周圍的此比例時，在 notes 提醒移動圖形會看得出是補的
+region_overlay_collinear_px = 3.5    # 疊在照片上的多邊形：頂點離前後兩頂點連線不到這麼多像素就併掉（JPEG 的振鈴把直邊壓出 1.5–3 px 的凹凸；初始值）
 
 [structure]                          # ④ 結構
 paragraph_gap_factor = 1.45          # 行距超過「一般行距 × 此值」就分段（初始值）
@@ -248,6 +259,7 @@ svg_similarity_pass = 0.95           # SVG 渲染後與工作影像的相似度�
 svg_position_tolerance_pt = 0.1      # 讀回來的文字行位置與成品文件排版的容許差（pt）
 svg_emulate_bold = true              # 伺服器上的字型沒有粗體檔時，渲染前補同色描邊模擬粗體（不改輸出檔）
 svg_font_dirs = []                   # 渲染用的字型目錄；空的表示用 fontconfig 列出的字型（與輸出時量行寬用的是同一批）
+svg_transparent_max = 0.005          # 頁面上透明的像素比例超過此值：另外在黑底上比一次（深色模式的看圖軟體）；svg_page_background = "auto" 時記成錯誤並取較差的相似度（初始值）
 # ---- 逐行文字對照（verify/lines.py）：③讀到的每一行字在成品的渲染結果上找不找得到、有沒有錯位或疊在一起；名稱以 line_ 開頭 ----
 line_check = true                    # 是否做逐行文字對照（關掉時整體分數只看畫面相似度，與以前相同）
 line_found_min = 0.5                 # 一行在原位置附近找到的比例低於此值：這一行在成品裡找不到（初始值）

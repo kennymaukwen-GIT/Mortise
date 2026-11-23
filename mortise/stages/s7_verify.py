@@ -16,37 +16,47 @@
   - 「成品文件對輸出檔」的比對（讀回的文字與成品文件排版的位置）不受影響：兩邊都是輸出頁面的座標。
   - 「輸出檔對來源」的比對（與③來源文字行的位置差）先用 placement 把來源座標換到輸出頁面（source_frame）。
 
-整體分數（overall_score）是各頁分數的平均。每一頁的分數 = 畫面分數 × 逐行分數。
+整體分數（overall_score）
+  每個輸出格式各算一個分數（各頁的平均），整體分數 = 最差的格式 ＋ format_mean_weight（0.1）×（各格式的平均 − 最差）。
+  報告 notes 的第一行列出各格式的分數；用代用值的格式會寫明原因。
 
-  畫面分數：依下面的順序取第一個算得出來的。
-    1. 有 PowerPoint 的目標驗證：0.5 × 目標渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、位置在容許差內」的比例。
-    2. 沒有 PowerPoint 的目標驗證、但有其他格式的回讀驗證（例如可編輯 PDF、SVG）：
-       每個格式 0.5 × 回讀渲染的相似度 ＋ 0.5 × 文字一致率（兩者缺一個就只用另一個）。
-    3. 都沒有：7A 中性渲染的相似度。
-  逐行分數（mortise/verify/lines.py）：拿上面同一份渲染結果（PowerPoint 是 LibreOffice 的渲染，其他格式是各自的回讀渲染，
-    都沒有時是 7A 的中性渲染），逐行檢查③讀到的每一行字在成品上找不找得到、有沒有錯位、有沒有和別的行疊在一起。
-    有第 2 種回讀驗證時，每個格式各自相乘（畫面分數 × 自己的逐行分數），這一頁的分數是各格式的平均。
-    沒有任何可判斷的行（例如整頁都是圖）時，逐行分數不算，只看畫面分數。
+  各格式每一頁的分數 = 畫面分數 × 逐行分數。
+    PowerPoint（LibreOffice 當替身引擎渲染）：畫面分數 = 0.5 × 渲染的相似度 ＋ 0.5 × 文字框與表格中「文字一致、斷行一致、
+      位置在容許差內」的比例。渲染結果少了這一頁是 0。
+    有自己驗證模組的格式（mortise/verify/：可編輯 PDF、SVG、Word（LibreOffice 轉成 PDF）、給 Illustrator 的 PDF）：
+      畫面分數 = 0.5 × 回讀渲染的相似度 ＋ 0.5 × 文字一致率（缺一個就只用另一個）。輸出檔裡沒有這一頁是 0。
+    沒有驗證模組、或這台機器驗證不了的格式（Excel、InDesign 等；沒有 LibreOffice 時的 Word 與 PowerPoint）：
+      用 7A 中性渲染的分數（相似度 × 中性渲染的逐行分數）當「代用值」，報告寫明「這個格式的檔案本身沒有驗證」。
+    沒有任何輸出格式：中性渲染的分數。
+  逐行分數（mortise/verify/lines.py）：拿同一份渲染結果，逐行檢查③讀到的每一行字在成品上找不找得到、有沒有錯位、
+    有沒有和別的行疊在一起、換行是否相同、字的顏色是否相同、有沒有多出原圖沒有的字。輸出檔讀得回文字時（PDF、SVG、
+    LibreOffice 的渲染、中性渲染）也比對「原位置上寫的是什麼字」。沒有任何可判斷的行（例如整頁都是圖）時，逐行分數不算，只看畫面分數。
 
   為什麼這樣組合
     - 畫面相似度是把整頁縮到約 480 像素寬再比，看得出整頁的樣子（底色、圖片、大區塊的位置），卻幾乎看不出少了幾行小字、
       或一行字錯開幾 pt：A4 履歷左欄十幾行字不見、右欄幾行疊在一起，相似度仍有 0.95。逐行分數補的就是這一塊。
     - 兩者相乘而不是相加：任何一邊有問題都要把分數往下拉，不能被另一邊的高分抵銷；兩邊都完美時（例如原生 PDF
       輸出成可編輯 PDF）仍是 1.0 附近。
+    - 多個格式取最差、而不是平均：使用者拿到的每一個檔案都要能用。以前 PowerPoint 的分數會蓋掉其他格式（可編輯 PDF 換成
+      空白檔，整體分數照樣不變），沒有 PowerPoint 時又取平均（兩個格式一個壞掉，分數還有一半）。平均只佔一成，
+      讓「其他格式都好」仍略有反映，但一個格式壞掉一定看得出來。
+    - Word 檔一定要實際渲染（LibreOffice 轉成 PDF）：以前 Word 的分數全來自中性渲染，Word 輸出器自己的錯誤（文字框放錯、
+      字型被換掉、整份檔案是空的）完全看不到。LibreOffice 不是 Word，報告會寫明。
     - 逐行分數 = 1 − 各行嚴重程度的平均 − min(10%, 2% × 內容問題的嚴重程度總和)。
         每一行算一份：5 行的投影片少一行扣 20%，80 行的 A4 少一行扣 1.25%。
         但長文件少一行也必須看得出來，所以「找不到、疊在一起」這類內容問題每個再多扣 2%（最多多扣 10%：
         問題很多時第一項已經反映嚴重程度，不必再加重）。
-        嚴重程度：找不到 1（內容不見了，最嚴重）；疊在一起 0.6（字還在，但讀不清楚）；一部分找不到 = 不見的比例；
-        位置偏移 0.15 到 0.35 × 偏掉的部分佔這一行的比例（字在、讀得懂，只是位置不對；偏得越多、偏掉的部分越多越重）。
+        嚴重程度：找不到 1（內容不見了，最嚴重）；疊在一起、字在檔案裡卻沒有畫在原位置 0.6（字還在，但讀不清楚或找不到）；
+        換行與原圖不同 最多 0.5；一部分找不到 = 不見的比例；位置偏移 0.15 到 0.35 × 偏掉的部分佔這一行的比例
+        （字在、讀得懂，只是位置不對）；字的顏色不同 0.2；成品上多出原圖沒有的一行字 0.2。
       例：80 行的履歷有 20 行找不到、3 行疊在一起 → 逐行分數約 1 − (20 + 1.8) ÷ 80 − 10% ≈ 0.63，
           畫面相似度 0.95 的整體分數就是 0.60，而不是 0.95。
-    - LibreOffice（代替 PowerPoint）與中性渲染（代替 Word 等）是自己重新排字的替身引擎，字距本來就和目標軟體不同，
+    - LibreOffice（代替 PowerPoint、Word）與中性渲染是自己重新排字的替身引擎，字距本來就和目標軟體不同，
       水平偏移放寬到 0.35 個字高才算；可編輯 PDF 與 SVG 的每一行位置寫死在檔案裡，不放寬。驗證用的這台電腦沒有字型
       畫得出來的字，在不內嵌字型的格式裡不判斷（摘要會註明有幾行沒有驗證到），可編輯 PDF 照常判斷。
-    - 每一行找不到、疊在一起、錯位，都開成一條問題（代碼 line_missing、line_partial、line_overlap、line_offset），
-      element_id 指到那一行所屬的文字框或表格，網頁的 Overlay 依它畫紅框。PowerPoint 與中性渲染的問題放在各頁的 issues；
-      其他格式的放在該格式的 format_reports。
+    - 每一行的問題都開成一條問題（代碼見 verify/lines.py 的 CODES），element_id 指到那一行所屬的文字框或表格，
+      網頁的 Overlay 依它畫紅框。PowerPoint 與（當代用值的）中性渲染的問題放在各頁的 issues；其他格式的放在該格式的 format_reports。
+    - 照片、掃描這類影像輸入：多數文字行一致偏斜（原圖歪了、沒有被轉正）時，在頁面的 issues 寫一條 page_skewed 提醒。
 """
 
 from __future__ import annotations
@@ -57,6 +67,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -73,7 +84,7 @@ from ..verify import lines as line_check
 from . import s2_page, s3_recognize
 
 NAME = "s7"
-VERSION = "5"
+VERSION = "6"
 
 # 逐行文字對照的問題說明前面加的渲染來源
 _WHERE = {OutputFormat.PDF: "可編輯 PDF", OutputFormat.SVG: "SVG", OutputFormat.PPTX: "PowerPoint 經 LibreOffice 渲染",
@@ -313,16 +324,8 @@ def _readback_page_score(fr, page_index: int, found, fallback: Optional[float]) 
     return fallback
 
 
-def _readback_score(format_reports, page_index: int, format_lines=None):
-    """（舊介面，保留給測試與外部工具）各格式回讀驗證這一頁的分數的平均；沒有任何格式驗到這一頁就回傳 None。"""
-    per_format = [s for fr in format_reports
-                  if (s := _readback_page_score(fr, page_index, (format_lines or {}).get((fr.format, page_index)), None)) is not None
-                  and any(fp.page_index == page_index for fp in fr.pages)]
-    return (sum(per_format) / len(per_format)) if per_format else None
-
-
 def _combine(per_format: dict, neutral_page: dict, proxies: list, unverified: dict, mean_weight: float) -> tuple[Optional[float], str]:
-    """各格式的分數（各頁平均）→ 整體分數與一句說明。見模組開頭「多個輸出格式」。"""
+    """各格式的分數（各頁平均）→ 整體分數與一句說明。見模組開頭「整體分數」。"""
     doc_scores: dict = {}
     for fmt, by_page in per_format.items():
         vals = [v for v in by_page.values() if v is not None]
@@ -473,9 +476,38 @@ def _field_report(spec: PageSpec, el: ElementList, layout: Layout, styled: Style
             issues.append(Issue(severity=Severity.INFO, code="vector_traced", element_id=v.id, message=f"這個向量圖是由像素描圖重建的（{len(v.paths)} 條路徑{detail}），不是原檔裡的向量資料。"))
     if el.background.generated_regions:
         issues.append(Issue(severity=Severity.WARNING, code="background_generated", message=f"底圖有 {len(el.background.generated_regions)} 個區域是生成（修補）出來的。"))
+    skew = page_skew(el)
+    if skew is not None:
+        issues.append(Issue(severity=Severity.WARNING, code="page_skewed", message=(
+            f"原圖的文字行一致歪了約 {abs(skew):.1f}°（{'順' if skew > 0 else '逆'}時針），頁面沒有被轉正：成品的文字行是水平的，"
+            "與原圖比對時每行兩端會有偏移。如果原圖是掃描或照片，可以在修正畫面手動拉出頁面四角，讓系統轉正後重新辨識。")))
     for n in el.notes + spec.notes:
         issues.append(Issue(severity=Severity.INFO, code="note", message=n))
     return PageReport(page_index=page, elements=reports, issues=issues)
+
+
+PAGE_SKEW_MIN_DEG = 0.3  # 多數文字行一致偏斜超過這麼多度，才提醒頁面沒有被轉正
+PAGE_SKEW_AGREE = 0.6  # 至少這個比例的行偏斜角度相同（±0.25°）：避免把斜放的標題、圖片裡的字當成整頁歪了
+
+
+def page_skew(el: ElementList) -> Optional[float]:
+    """影像輸入的頁面歪了幾度（③量到的文字行基線，中位數；y 向下，正值是順時針）。不是影像輸入、可判斷的行太少、
+    或各行角度不一致時回傳 None。只看橫排、至少 8 個字的行。"""
+    if el.production_line.value == "extract":
+        return None
+    angles = []
+    for t in el.texts:
+        if t.hidden or t.direction.value != "horizontal" or len(t.text.strip()) < 8:
+            continue
+        (a, b) = t.baseline
+        if math.hypot(b.x - a.x, b.y - a.y) <= 1e-6:
+            continue
+        angles.append(math.degrees(math.atan2(b.y - a.y, b.x - a.x)))
+    if len(angles) < 3:
+        return None
+    m = float(np.median(angles))
+    agree = sum(1 for v in angles if abs(v - m) <= 0.25) / len(angles)
+    return m if abs(m) >= PAGE_SKEW_MIN_DEG and agree >= PAGE_SKEW_AGREE else None
 
 
 # ---------- s7.neutral（7A）----------
@@ -601,7 +633,12 @@ def _target_verify(rendered_pdf: bytes, specs, elements, layout, styled, pages, 
                     elif not text_ok:
                         issues.append(Issue(severity=Severity.ERROR, code="text_mismatch", element_id=e.element_id, message="輸出檔渲染出來的文字與原圖不一致。"))
                     elif not breaks_ok:
-                        issues.append(Issue(severity=Severity.WARNING, code="linebreak_mismatch", element_id=e.element_id, message=f"斷行不一致：原圖 {len(expect)} 行，輸出檔渲染為 {len(got)} 行。"))
+                        if len(expect) != len(got):
+                            why = f"原圖 {len(expect)} 行，輸出檔渲染為 {len(got)} 行"
+                        else:
+                            k_bad = next((n for n, (a, b) in enumerate(zip(expect, got)) if _norm(a.text) != _norm(b.text)), 0)
+                            why = f"行數相同（{len(got)} 行），但從第 {k_bad + 1} 行起每行的字不同（在不同的地方換行）"
+                        issues.append(Issue(severity=Severity.WARNING, code="linebreak_mismatch", element_id=e.element_id, message=f"斷行不一致：{why}。"))
                         if round_no < c["max_rounds"]:
                             size = max((r.size_pt.value for p in next(t for t in sp.text_boxes if t.id == e.element_id).paragraphs for r in p.runs), default=12.0)
                             delta = (0.35 if len(got) > len(expect) else -0.35) * size * (round_no + 1)
