@@ -39,6 +39,10 @@ dewarp_flat_sag_median_pct = 0.1     # 判定平的紙：頁內格線與文字�
 dewarp_flat_sag_max_pct = 0.3        # ……而且第二大的線也低於此值
 dewarp_bow_px = 2.0                  # 判定紙邊彎曲：弓高超過 max(此值, 0.2% 邊長)（原照片像素）
 enhance_fine_side = 1600             # 去陰影時估照度圖的縮圖長邊（像素）：越大陰影的硬邊越準，越慢
+# ---- 照片裡找紙張邊界（recognition/page_geometry.find_page_quad；s2 下一輪接進流程）----
+quad_review_confidence = 0.6         # 頁面四角的信心值低於此值、或 status 不是 ok，就請使用者拖曳四角確認（與 page_geometry 的 review_conf 相同；
+                                     # 合成照片 193 張校準：信心 ≥ 0.6 的 88 張中 1 張四角誤差超過對角線 1%）
+quad_max_corner_err_frac = 0.01      # 任一角的估計誤差超過影像對角線的此比例，也請使用者確認（與 page_geometry 的 max_corner_err_frac 相同）
 
 [recognize]                          # ③ 辨識
 line_gap_factor = 1.5                # 同一基線上兩字間距超過「字級 × 此值」就拆成兩行

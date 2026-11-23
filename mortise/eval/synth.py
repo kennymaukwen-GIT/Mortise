@@ -575,6 +575,8 @@ def degrade_curved(image: np.ndarray, kind: str, seed: int, strength: float = 1.
     page_map：H×W×2 float32，照片每個像素中心 → 頁面影像座標（像素角落約定）；不是這張紙的像素為 NaN。
     info["page_corners"]：頁面四角投影到照片的位置（左上、右上、右下、左下；捲起時可能被遮住）；
     info["page_outline"]：頁面四條邊投影到照片的折線（上、右、下、左，各 65 點）。
+    info["flat_corners"]：「展平後」的四角：沒有折、捲的那片紙（平面）延伸到頁面四角的投影；捲角、捲邊時四角偵測應對照這組
+    （實體的角翹起來了）。整張弓起（bend）時只供參考。
     """
     if kind not in CURVED_KINDS:
         raise ValueError(f"不認得的彎曲種類：{kind}（可用：{', '.join(CURVED_KINDS)}）")
@@ -712,7 +714,6 @@ def degrade_curved(image: np.ndarray, kind: str, seed: int, strength: float = 1.
         return np.stack([np.interp(t, np.linspace(0, 1, len(a)), a), np.interp(t, np.linspace(0, 1, len(b)), b)], -1).tolist()
 
     outline = [edge(px[0, :], py[0, :]), edge(px[:, -1], py[:, -1]), edge(px[-1, ::-1], py[-1, ::-1]), edge(px[::-1, 0], py[::-1, 0])]
-    cpx, cpy = page_map.shape[1] // 2, page_map.shape[0] // 2
     info: dict[str, Any] = {
         "kind": kind, "seed": int(seed), "strength": strength, "source_size": [int(W), int(H)], "output_size": [int(ow), int(oh)],
         "ops": [{k: (list(v) if isinstance(v, tuple) else v) for k, v in op.items()} for op in ops], "camera": cam, "margin": margin,
@@ -722,6 +723,11 @@ def degrade_curved(image: np.ndarray, kind: str, seed: int, strength: float = 1.
         "page_corners": corners.tolist(), "page_outline": outline,
         "page_fraction": float(np.mean(~np.isnan(page_map[..., 0]))),
     }
+    # 「展平後」的四角：紙沒有折、捲的那一大片（z = 0 的平面）延伸到頁面四角的投影位置，也就是平的那幾段紙邊直線的交點。
+    # 捲角、捲邊時，四角偵測與透視攤平要找的是這組（實體的角翹起來了，投影位置不是攤平要的角）；整張弓起（bend）時沒有平的部分，只供參考
+    Pf = np.array([[0.0, 0.0, 0.0], [W, 0.0, 0.0], [W, H, 0.0], [0.0, H, 0.0]])
+    fx, fy, _ = _project(Pf, float(W), float(H), cam)
+    info["flat_corners"] = np.stack([fx * sc + ox, fy * sc + oy], 1).tolist()
     # 頁面在照片中的等效解析度（中央附近的局部縮放）
     pc0 = np.array([W / 2.0, H / 2.0])
     jj = np.argmin(np.abs(us - pc0[0]))
@@ -730,7 +736,6 @@ def degrade_curved(image: np.ndarray, kind: str, seed: int, strength: float = 1.
         du = np.hypot(px[ii, jj + 1] - px[ii, jj - 1], py[ii, jj + 1] - py[ii, jj - 1]) / (us[jj + 1] - us[jj - 1])
         dv = np.hypot(px[ii + 1, jj] - px[ii - 1, jj], py[ii + 1, jj] - py[ii - 1, jj]) / (vs[ii + 1] - vs[ii - 1])
         info["effective_dpi"] = float(150.0 * math.sqrt(du * dv))
-    del cpx, cpy
     return out, page_map, info
 
 

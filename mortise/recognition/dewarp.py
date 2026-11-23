@@ -34,9 +34,17 @@
        每條以三次曲線平滑後，量它與直線擬合的差：橫線給垂直位移、直線給水平位移；以粗控制格點的雙線性曲面
        加二階差分平滑懲罰、Tukey 重加權的最小平方擬合成位移場（外框已量過的那兩邊固定為 0），與對應圖合成。
        殘差（各條線平滑後離直線的距離，第 95 百分位）沒有變小就不採用。
-    6. 驗證後才採用：攤平後的直線度要比透視攤平明顯好（少 max(0.04% 頁寬, 30%)；文字行有字形雜訊，
-       修正場會「修掉雜訊」，所以要求相對進步），紙被四角裁掉或根本沒有四角時例外；否則退回透視並寫明原因。
-       信心值 = 外框支持率 × 殘差項。
+    6. 驗證後才採用（每條路徑都驗證，包括紙被四角裁掉、沒有四角）：
+       a. 前後比的要是同一組線：攤平後量到的線至少要有攤平前的 70%（線被扭壞就量不到，殘差會假性變小），否則不採用；
+       b. 攤平後的殘差比透視攤平大（超過量測雜訊 15% + 0.03 像素）就不採用；
+       c. 紙沒有被四角裁掉、頁內有 3 條以上的線時，還要明顯變好（少 max(0.06% 頁寬, 30%)；文字行有字形雜訊，
+          修正場會「修掉雜訊」，所以要求相對進步）；紙被裁掉時放寬成「不變差」（攤平多救回一塊紙）；
+       d. 頁內完全量不到線時，要有量到的彎曲紙邊（或紙超出四角）才採用。
+       不採用就退回透視並寫明原因。量線前，深色底的頁面（字是亮的）先反轉，否則字與字之間的深色底會被當成線。
+       沒有四角時，學習式模型的外框精修後至少要有三條邊是量到的「紙與背景交界」（有內外色差），才當四角用
+       （pseudo_quad；rectify 會採用，上層應請使用者確認）；否則外框只放在 candidate_outline 當候選，維持整張圖。
+       信心值 = 外框支持率 × 頁內殘差項（有修正時用交叉驗證殘差：線分兩組，一組擬合位移場、量另一組的預測誤差）
+       × 來源（外框有推估的邊 × 0.5、紙超出四角 × 0.6、四角是自己量的 × 0.8）× 直線度進步幅度。
 
     輸出尺寸：與 rectify 相同，「最長的那一組對邊」1:1 取樣（量的是外框曲線的弧長）；長寬比優先用 find_page_quad
     由透視反推的值，沒有四角或紙被裁掉時以外框四角用 Zhang–He 方法估。對原照片只做一次 remap（避免兩次內插變模糊）。
@@ -46,6 +54,8 @@ UVDoc 權重
     不需要 torch：以白名單的 unpickler 讀出權重、把 BatchNorm 摺進卷積、用本檔的最小 protobuf 編碼器組成 ONNX，
     存到 mortise.tools.fontfind.cache_dir()/models/uvdoc/（旁邊附 MIT 授權全文），之後直接載入。
     scripts/export_uvdoc_onnx.py 用 torch 官方匯出做交叉比對（網格差異 < 1e-6，torch 不是產品相依）。
+    攤平時快取裡沒有模型，就在背景執行緒下載（這張照片先只用量測式，不讓使用者的請求等下載）；部署時可先執行
+    python -m mortise.recognition.dewarp --download。下載有總時限，失敗後一小時內不再重試，.part 一律清掉。
     環境變數 MORTISE_OFFLINE=1 或 params["uvdoc"]="cache_only" 時不下載；下載或載入失敗就退回純量測式並寫進 notes。
 
 已知限制
@@ -86,12 +96,13 @@ from .types import PageQuad
 
 DEFAULT_PARAMS: dict[str, Any] = {
     "dewarp_mode": "auto",  # "auto"：判定彎曲才攤平；"force"：一律攤平（評測用）；"off"：只做透視
-    "uvdoc": "auto",  # 學習式初值："auto"（快取沒有就下載）、"cache_only"（只用快取，不下載）、"off"（不用）
+    "uvdoc": "auto",  # 學習式初值："auto"（快取沒有就在背景下載，這次先不用）、"sync"（在這次請求裡下載，腳本用）、"cache_only"（只用快取）、"off"（不用）
+    "uvdoc_retry_s": 3600.0,  # 下載失敗後這麼多秒內不再重試
     "uvdoc_threads": 2,  # UVDoc 推論的執行緒數
     "uvdoc_crop_margin": 0.05,  # 有四角時，裁到四角外接框外擴這個比例再給 UVDoc（研究實測比全圖準）
     "uvdoc_interp": "cubic",  # UVDoc 網格放大成對應圖的內插："cubic" 或 "linear"
     "interior_prior": "perspective",  # 頁內初值："perspective"（四角透視＋外框 Coons 修正；合成評測較準）或 "uvdoc"（UVDoc 網格）
-    "download_timeout_s": 60.0,  # 下載權重的逾時（秒）
+    "download_timeout_s": 120.0,  # 下載權重的總時限（秒；整個下載，不是每次讀取）
     # ---- 平的紙判定
     "bow_px": 2.0,  # 邊的弓高超過 max(bow_px, bow_frac × 邊長) 視為彎曲（原圖像素）
     "bow_frac": 0.002,
@@ -117,6 +128,7 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "min_edge_support": 0.35,  # 每條邊至少要有這個比例有邊緣支持，精修結果才採用
     # ---- 頁內量測與修正（縮圖上）
     "measure_side": 1200,  # 量直線度的縮圖長邊（像素）
+    "dark_page_luma": 110.0,  # 頁面灰階中位數低於這個視為深色底（字是亮的），量線前先反轉
     "sauvola_window_frac": 0.025,  # Sauvola 視窗（佔縮圖長邊）
     "sauvola_k": 0.2,
     "rule_min_len_frac": 0.2,  # 格線至少佔頁寬（或頁高）的比例
@@ -127,8 +139,15 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "correct_smooth": 2.0,  # 位移場二階差分平滑懲罰
     "correct_pin": 5.0,  # 外框已量過的邊固定為 0 的權重
     "correct_min_gain": 0.05,  # 殘差至少要下降這個比例才採用這一輪修正
-    "accept_margin_frac": 0.0004,  # 攤平後的殘差要比透視攤平少 max(這個 × 頁寬, accept_rel × 透視殘差)（輸出像素）才算更好
+    "accept_margin_frac": 0.0006,  # 攤平後的殘差要比透視攤平少 max(這個 × 頁寬, accept_rel × 透視殘差)（輸出像素）才算更好
     "accept_rel": 0.3,  # 文字行的直線度有字形雜訊，修正場會「修掉雜訊」；要求相對進步，避免平的紙被誤攤
+    "keep_lines_frac": 0.7,  # 攤平後量到的線至少要有攤平前的這個比例（線被攤壞就量不到，殘差會假性變小），否則不採用
+    "worse_tol_rel": 0.15,  # 攤平後的殘差比透視攤平大超過「這個比例 + worse_tol_px」就不採用（任何情況都檢查，含紙超出四角）；
+    "worse_tol_px": 0.03,  # 這是量測雜訊（字形、取樣）的容許量（輸出像素）
+    # ---- 信心值（攤平後）：外框支持率 × 頁內殘差（有修正時用交叉驗證殘差）× 來源 × 直線度進步
+    "conf_uvdoc_prior": 0.5,  # 外框有一邊是學習式模型推估的（量不到紙邊）
+    "conf_truncated": 0.6,  # 紙超出四角（捲起處的位置與壓縮量量不到）
+    "conf_pseudo": 0.8,  # 沒有現成的四角，四角是攤平時自己量的
     "quad_doubt_area": 0.75,  # 四角框住的面積不到量到的外框面積的這個比例（框到紙上的一塊、或把紙切掉一大半）時改用量到的外框
     "quad_doubt_support": 0.7,  # ……而且外框至少三邊量到、平均支持率至少這麼高
     "crop_touch_frac": 0.015,  # UVDoc 的外框貼到裁切邊（這個比例內，且裁切邊不是畫面邊）：四角可能框小了，改用全圖重推
@@ -138,10 +157,26 @@ DEFAULT_PARAMS: dict[str, Any] = {
 }
 
 
+# 設定檔 [page] 裡帶 dewarp_ 前綴、但不是本模組參數的鍵（由 s2 讀，不是給本模組的），不發警告
+_EXTERNAL_KEYS = {"dewarp_photos"}
+
+
 def _p(params: dict | None) -> dict:
+    """參數：本模組的鍵直接採用；設定檔的 dewarp_xxx（例如 dewarp_bow_px）去掉前綴對應到 xxx（同時給了不帶前綴的鍵時，以不帶前綴的為準）；
+    dewarp_ 開頭卻對不上任何參數的鍵發出警告（拼錯的設定不再被悄悄忽略）。"""
     p = dict(DEFAULT_PARAMS)
     if params:
-        p.update({k: v for k, v in params.items() if k in DEFAULT_PARAMS or k.startswith("dewarp_") or k.startswith("uvdoc")})
+        for k, v in params.items():
+            if k.startswith("dewarp_") and k not in DEFAULT_PARAMS:
+                base = k[len("dewarp_"):]
+                if base in DEFAULT_PARAMS:
+                    if base not in params:
+                        p[base] = v
+                elif k not in _EXTERNAL_KEYS:
+                    import warnings
+
+                    warnings.warn(f"攤平參數 {k} 對不上任何已知參數，已忽略", stacklevel=3)
+        p.update({k: v for k, v in params.items() if k in DEFAULT_PARAMS})
     return p
 
 
@@ -166,6 +201,12 @@ class DewarpResult:
     homography: Optional[np.ndarray] = None  # 3×3：原照片 → 輸出影像的單應矩陣（由四角求；攤平時只是近似）
     notes: list[str] = field(default_factory=list)
     timings: dict = field(default_factory=dict)  # 各步驟耗時（秒）
+    # 沒有給四角（或 find_page_quad 給整張圖）時：由紙邊量出的四角（學習式模型的外框只當候選，精修後至少三邊有量測支持才給）。
+    # image 就是用這組四角做的透視攤平（或攤平）結果；rectify 會採用它，上層應把它當成「需要使用者確認」的四角。
+    pseudo_quad: Optional[np.ndarray] = None
+    measured_sides: int = 0  # 外框有幾條邊是在原照片上量到的（紙與背景的交界，有足夠支持率）
+    candidate_outline: list[np.ndarray] = field(default_factory=list)  # 沒有採用、只當候選的外框（學習式模型推估，量測支持不足）；給介面讓使用者確認
+    needs_review: bool = False  # 建議請使用者確認外框（信心值低、外框有推估的邊、紙超出四角、或四角是自己量的）
 
     def maps_npz(self) -> bytes:
         """對應圖存成 npz（map_x、map_y，float32），給 PageSpec.dewarp_map 用。"""
@@ -422,6 +463,9 @@ def find_lines(rgb: np.ndarray, p: dict) -> dict:
     回傳 {"h": [(x, y), ...], "v": [(x, y), ...]}（直線的 x、y 對調存：沿 y 取樣，值是 x），以及 text_height。"""
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if rgb.ndim == 3 else rgb
     Hs, Ws = gray.shape
+    if float(np.median(gray)) < p.get("dark_page_luma", 110.0):
+        # 深色底（深色投影片）：字是亮的。不反過來的話，字與字之間的深色底會被當成墨跡、量出假的「線」
+        gray = (255 - gray).astype(gray.dtype)
     ink = _ink_mask(gray, p).astype(np.uint8)
     weight = np.clip(255.0 - gray.astype(np.float32), 0, None)
     bin_px = int(p["line_bin_px"])
@@ -823,44 +867,83 @@ def _sha256_file(path: Path) -> str:
 
 
 def _download(url: str, dest: Path, sha256: str, size: int, timeout: float) -> None:
+    """下載到 dest（先寫 .part，驗證 SHA-256 與大小後才改名）。timeout 是整個下載的時限（秒），不是每個 socket 操作的；
+    任何失敗（逾時、太大、SHA 不符、連線中斷）都會刪掉 .part。"""
     tmp = dest.with_name(dest.name + ".part")
     h = hashlib.sha256()
     n = 0
+    deadline = time.monotonic() + timeout
     req = urllib.request.Request(url, headers={"User-Agent": "mortise-dewarp"})
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(tmp, "wb") as f:
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            n += len(chunk)
-            if n > size + (1 << 20):
-                raise ValueError("下載的檔案比預期大")
-            f.write(chunk)
-            h.update(chunk)
-    if h.hexdigest() != sha256 or n != size:
-        tmp.unlink(missing_ok=True)
-        raise ValueError(f"下載的權重 SHA-256 不符（{h.hexdigest()[:12]}…，預期 {sha256[:12]}…）")
-    tmp.replace(dest)
+    ok = False
+    try:
+        with urllib.request.urlopen(req, timeout=min(timeout, 30.0)) as r, open(tmp, "wb") as f:
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"下載超過 {timeout:.0f} 秒")
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                n += len(chunk)
+                if n > size + (1 << 20):
+                    raise ValueError("下載的檔案比預期大")
+                f.write(chunk)
+                h.update(chunk)
+        if h.hexdigest() != sha256 or n != size:
+            raise ValueError(f"下載的權重 SHA-256 不符（{h.hexdigest()[:12]}…，預期 {sha256[:12]}…）")
+        tmp.replace(dest)
+        ok = True
+    finally:
+        if not ok:
+            tmp.unlink(missing_ok=True)
 
 
-def ensure_uvdoc_model(params: dict | None = None) -> tuple[Optional[Path], list[str]]:
-    """確保快取裡有 UVDoc 的 ONNX（沒有就下載權重、驗證 SHA-256、在本機組成 ONNX）。回傳（路徑或 None、notes）。"""
-    p = _p(params)
-    mode = p["uvdoc"]
-    if mode == "off":
-        return None, ["學習式初值（UVDoc）已關閉，只用量測式攤平。"]
-    d = uvdoc_model_dir()
+_FAIL_FILE = "download_failed.json"
+
+
+def _cached_uvdoc(d: Path) -> Optional[Path]:
+    """快取裡已有、而且驗證過的 ONNX 路徑；沒有就 None。"""
     onnx = d / f"uvdoc2d-{UVDOC_SHA256[:12]}.onnx"
     meta = d / "uvdoc2d.json"
     if onnx.exists() and meta.exists():
         try:
             m = json.loads(meta.read_text(encoding="utf-8"))
             if m.get("source_sha256") == UVDOC_SHA256 and m.get("onnx_sha256") == _sha256_file(onnx):
-                return onnx, []
+                return onnx
         except (OSError, ValueError):
             pass
+    return None
+
+
+def _recent_failure(d: Path, retry_s: float) -> Optional[str]:
+    """retry_s 秒內下載失敗過：回傳當時的錯誤（不再重試，免得每張照片都卡在下載）。"""
+    try:
+        m = json.loads((d / _FAIL_FILE).read_text(encoding="utf-8"))
+        if time.time() - float(m.get("time", 0)) < retry_s:
+            return str(m.get("error", ""))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def ensure_uvdoc_model(params: dict | None = None) -> tuple[Optional[Path], list[str]]:
+    """確保快取裡有 UVDoc 的 ONNX（沒有就下載權重、驗證 SHA-256、在本機組成 ONNX）。回傳（路徑或 None、notes）。
+    這個函式會在呼叫的執行緒裡下載（安裝、部署時預先下載用：python -m mortise.recognition.dewarp --download）；
+    攤平時預設改在背景下載（見 _uvdoc_session），不讓使用者的請求等下載。下載失敗後 uvdoc_retry_s 秒內不再重試。"""
+    p = _p(params)
+    mode = p["uvdoc"]
+    if mode == "off":
+        return None, ["學習式初值（UVDoc）已關閉，只用量測式攤平。"]
+    d = uvdoc_model_dir()
+    onnx = _cached_uvdoc(d)
+    if onnx is not None:
+        return onnx, []
+    onnx = d / f"uvdoc2d-{UVDOC_SHA256[:12]}.onnx"
+    meta = d / "uvdoc2d.json"
     if mode == "cache_only" or os.environ.get("MORTISE_OFFLINE") == "1":
         return None, ["快取裡沒有學習式初值模型（UVDoc），而且設定為不下載：只用量測式攤平。"]
+    err = _recent_failure(d, float(p["uvdoc_retry_s"]))
+    if err is not None and not (params or {}).get("_force_retry"):
+        return None, [f"學習式初值（UVDoc）無法取得（{err}；{p['uvdoc_retry_s'] / 60:.0f} 分鐘內不再重試），只用量測式攤平。"]
     try:
         d.mkdir(parents=True, exist_ok=True)
         pkl = d / "best_model.pkl"
@@ -875,16 +958,52 @@ def ensure_uvdoc_model(params: dict | None = None) -> tuple[Optional[Path], list
                                     "license": "MIT（見 LICENSE-UVDoc.txt）", "built_by": "mortise.recognition.dewarp.build_uvdoc_onnx"},
                                    ensure_ascii=False, indent=1), encoding="utf-8")
         pkl.unlink(missing_ok=True)
+        (d / _FAIL_FILE).unlink(missing_ok=True)
         return onnx, ["第一次使用：已下載 UVDoc 權重（MIT 授權）並在本機轉成 ONNX。"]
     except Exception as e:  # noqa: BLE001 —— 離線、被擋、檔案壞掉：退回量測式
-        return None, [f"學習式初值（UVDoc）無法取得（{type(e).__name__}: {e}），只用量測式攤平。"]
+        msg = f"{type(e).__name__}: {e}"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / _FAIL_FILE).write_text(json.dumps({"time": time.time(), "error": msg}, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+        return None, [f"學習式初值（UVDoc）無法取得（{msg}），只用量測式攤平。"]
+
+
+_UV_BG: dict[str, threading.Thread] = {}
+
+
+def _start_background_download(p: dict) -> list[str]:
+    """在背景執行緒下載並組裝模型（每個快取目錄只啟動一次）；這次的請求不等它。"""
+    d = uvdoc_model_dir()
+    key = str(d)
+    with _UV_LOCK:
+        th = _UV_BG.get(key)
+        if th is not None and th.is_alive():
+            return ["學習式外框模型（UVDoc）正在背景下載，這張照片先只用量測式攤平。"]
+        err = _recent_failure(d, float(p["uvdoc_retry_s"]))
+        if err is not None:
+            return [f"學習式初值（UVDoc）無法取得（{err}；{p['uvdoc_retry_s'] / 60:.0f} 分鐘內不再重試），只用量測式攤平。"]
+        th = threading.Thread(target=ensure_uvdoc_model, args=(dict(p, uvdoc="sync"),), name="mortise-uvdoc-download", daemon=True)
+        _UV_BG[key] = th
+        th.start()
+    return ["第一次使用：學習式外框模型（UVDoc，MIT 授權，約 32 MB）開始在背景下載，這張照片先只用量測式攤平；"
+            "部署時可先執行 python -m mortise.recognition.dewarp --download。"]
 
 
 def _uvdoc_session(p: dict):
-    with _UV_LOCK:
-        path, notes = ensure_uvdoc_model(p)
+    mode = p["uvdoc"]
+    if mode == "off":
+        return None, ["學習式初值（UVDoc）已關閉，只用量測式攤平。"]
+    path = _cached_uvdoc(uvdoc_model_dir())
+    notes: list[str] = []
+    if path is None:
+        if mode == "auto" and os.environ.get("MORTISE_OFFLINE") != "1":
+            return None, _start_background_download(p)
+        path, notes = ensure_uvdoc_model(p)  # "sync"：在這次請求裡下載（腳本、評測用）；"cache_only"／離線：不下載
         if path is None:
             return None, notes
+    with _UV_LOCK:
         key = f"{path}|{int(p['uvdoc_threads'])}"
         if key not in _UV_SESSIONS:
             try:
@@ -1076,6 +1195,77 @@ def _centers(n: int) -> np.ndarray:
     return (np.arange(n, dtype=np.float64) + 0.5) / n
 
 
+_ROW_BLOCK = 256  # 大圖逐列區塊算對應圖、取樣（12 MP 的照片整張一次算，float64 的網格就要好幾百 MB）
+
+
+def _render_rows(img: Optional[np.ndarray], fn: Callable, Wo: int, Ho: int, interp: int = cv2.INTER_LINEAR):
+    """逐列區塊算對應圖並取樣：fn(S, T, r0, r1) -> (X, Y)，S、T 是第 r0 到 r1 列像素中心的參數座標。
+    回傳（float32 的 map_x、map_y，以及取樣後的影像；img 為 None 時影像也是 None）。"""
+    X = np.empty((Ho, Wo), np.float32)
+    Y = np.empty((Ho, Wo), np.float32)
+    out = None if img is None else np.empty((Ho, Wo) + img.shape[2:], img.dtype)
+    s = _centers(Wo)
+    for r0 in range(0, Ho, _ROW_BLOCK):
+        r1 = min(Ho, r0 + _ROW_BLOCK)
+        S, T = np.meshgrid(s, (np.arange(r0, r1, dtype=np.float64) + 0.5) / Ho)
+        x, y = fn(S, T, r0, r1)
+        X[r0:r1] = x
+        Y[r0:r1] = y
+        if out is not None:
+            out[r0:r1] = _remap(img, X[r0:r1], Y[r0:r1], interp)
+    return X, Y, out
+
+
+def _lines_kept(n_before: int, n_after: int, p: dict) -> bool:
+    """攤平後量到的線夠不夠多，前後的殘差才能比（同一組線）：至少 max(min(前, flat_min_lines), keep_lines_frac × 前) 條。"""
+    if n_before <= 0:
+        return True
+    need = max(min(n_before, int(p["flat_min_lines"])), int(math.ceil(p["keep_lines_frac"] * n_before)))
+    return n_after >= need
+
+
+def _cv_residual(st: dict, Wm: int, Hm_: int, p: dict, pin_rows: float, pin_cols: float) -> Optional[float]:
+    """修正場的交叉驗證殘差（縮圖像素，第 95 百分位）：線依位置分兩組，用一組擬合位移場、量另一組的預測誤差。
+    修正場是拿頁內的線擬合的，擬合後那些線一定變直；沒參與擬合的線才看得出位移場本身準不準。"""
+    gy, gx = p["correct_grid"]
+    errs = []
+    for axis, pin in (("h", (pin_rows, 0.0)), ("v", (0.0, pin_cols))):
+        per = st.get("per", {}).get(axis, [])
+        if len(per) < 4:
+            continue
+        rows = []
+        for d in per:
+            ok = d["w"] > 0
+            if axis == "h":
+                rows.append(np.stack([d["x"][ok], d["lin"][ok], d["dev"][ok]], 1))
+            else:
+                rows.append(np.stack([d["lin"][ok], d["x"][ok], d["dev"][ok]], 1))
+        key = [float(np.median(r[:, 1] if axis == "h" else r[:, 0])) for r in rows]
+        order = np.argsort(key)
+        for fold in (0, 1):
+            tr = [rows[i] for j, i in enumerate(order) if j % 2 != fold]
+            te = [rows[i] for j, i in enumerate(order) if j % 2 == fold]
+            a = np.concatenate(tr)
+            if len(a) < 12:
+                continue
+            F = _fit_field(a[:, 0], a[:, 1], a[:, 2], np.ones(len(a)), Wm, Hm_, (gy, gx), p["correct_smooth"], pin[0], pin[1])
+            for b in te:
+                if len(b) < 5:
+                    continue
+                fx = np.clip(b[:, 0] / Wm * (gx - 1), 0, gx - 1 - 1e-9)
+                fy = np.clip(b[:, 1] / Hm_ * (gy - 1), 0, gy - 1 - 1e-9)
+                ix, iy = np.floor(fx).astype(int), np.floor(fy).astype(int)
+                ax, ay = fx - ix, fy - iy
+                pred = (F[iy, ix] * (1 - ax) * (1 - ay) + F[iy, ix + 1] * ax * (1 - ay) + F[iy + 1, ix] * (1 - ax) * ay + F[iy + 1, ix + 1] * ax * ay)
+                u = b[:, 0] if axis == "h" else b[:, 1]  # 沿線的座標：線本身的偏差已去掉直線部分，預測也要去掉
+                r = b[:, 2] - pred
+                r = r - np.polyval(np.polyfit(u, r, 1), u)
+                errs.append(np.abs(r))
+    if not errs:
+        return None
+    return float(np.percentile(np.concatenate(errs), 95))
+
+
 def _field_samples(st: dict) -> tuple[list, list]:
     """直線度量測 → 位移樣本：橫線給（位置 x、y_直線、垂直位移），直線給（位置 x_直線、y、水平位移）。"""
     hs, vs = [], []
@@ -1197,8 +1387,6 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
             r["fn"] = fn
             q_sides.append(r)
             bows[k] = r["bow"] if r["support"] >= p["min_edge_support"] else 0.0
-        if bow_hint:  # find_page_quad 量到的弓高（它的搜尋範圍比較大）
-            bows = [max(b_, float(v or 0.0)) for b_, v in zip(bows, bow_hint)]
         f = min(1.0, p["measure_side"] / max(Wo, Ho))
         small_src = _Small(img, f)
         Wm, Hm_ = max(8, int(round(Wo * f))), max(8, int(round(Ho * f)))
@@ -1207,18 +1395,22 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
         st_before = straightness(find_lines(small_src.render(X, Y), p), Wm, Hm_)
         if st_before.get("n_lines"):
             st_before["p95_out_px"] = st_before["p95_px"] / f
+        if bow_hint and st_before.get("n_lines", 0) < p["flat_min_lines"]:
+            # 頁內沒有線可量時才參考 find_page_quad 量到的弓高（它的搜尋範圍比較大；有線時以直線度為準，免得平的紙被誤攤）
+            bows = [max(b_, float(v or 0.0)) for b_, v in zip(bows, bow_hint)]
 
     if have_quad:
         setup_persp(quad.corners, quad.aspect_ratio, getattr(quad, "edge_bow_px", None))
     tm["flat_check"] = time.time() - t0
+
+    pseudo_info: dict = {}  # 沒有四角時由紙邊量出的四角（交給 rectify 與上層確認）
 
     def perspective_result(extra: list[str], curved: bool, conf: Optional[float] = None, support=None) -> DewarpResult:
         Wo, Ho, Hm = persp["Wo"], persp["Ho"], persp["H"]
         t_in = np.array([[1, 0, 0.5], [0, 1, 0.5], [0, 0, 1]], dtype=np.float64)  # 連續座標 → OpenCV 像素中心（與 rectify 相同）
         t_out = np.array([[1, 0, -0.5], [0, 1, -0.5], [0, 0, 1]], dtype=np.float64)
         out = cv2.warpPerspective(img, t_out @ Hm @ t_in, (Wo, Ho), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        S0, T0 = np.meshgrid(_centers(Wo), _centers(Ho))
-        X, Y = _apply_h(persp["hu"], S0, T0)
+        X, Y, _ = _render_rows(None, lambda S, T, r0, r1: _apply_h(persp["hu"], S, T), Wo, Ho)
         res = st_before.get("p95_out_px")
         c = persp["corners"]
         if conf is None:
@@ -1226,10 +1418,14 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
         if support is None:
             support = list(getattr(quad, "edge_support", None) or [float(sd["support"]) for sd in q_sides])
         tm["total"] = time.time() - t_all
-        return DewarpResult(image=out, map_x=X.astype(np.float32), map_y=Y.astype(np.float32), applied=False, source="", curved=curved,
+        review = bool(pseudo_info) or conf < 0.6 or curved
+        return DewarpResult(image=out, map_x=X, map_y=Y, applied=False, source="", curved=curved,
                             corners=c, boundary=[c[[0, 1]], c[[1, 2]], c[[3, 2]], c[[0, 3]]], support=[float(v) for v in support],
                             bow_px=[float(b_) for b_ in bows], residual_px=res, residual_before_px=res, straightness=_st_summary(st_before, None),
-                            confidence=float(conf), homography=Hm, notes=notes + extra, timings=tm)
+                            confidence=float(conf), homography=Hm, notes=notes + extra, timings=tm,
+                            pseudo_quad=pseudo_info.get("corners"),
+                            measured_sides=int(pseudo_info.get("measured", sum(1 for sd in q_sides if sd["support"] >= p["min_edge_support"]))),
+                            needs_review=review)
 
     if have_quad and mode == "off":
         return perspective_result(["攤平已關閉，只做透視攤平。"], False)
@@ -1295,7 +1491,8 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
                 x, y = prior_uv(*_side_st(k, np.asarray(t, np.float64)))
                 return np.stack([x, y], 1)
             uv_sides.append(refine_side(img_f, fn, inner_uv, R, p))
-        uv_use = [sd["support"] >= p["min_edge_support"] for sd in uv_sides]
+        # 紙邊是「紙 → 背景」的階梯：只有梯度、內外沒有色差的（背景紋理、表格框線）不算量到
+        uv_use = [sd["support"] >= p["min_edge_support"] and sd["contrast"] >= p["edge_min_contrast"] for sd in uv_sides]
     q_use = [bool(q_sides) and q_sides[k]["support"] >= p["min_edge_support"] for k in range(4)]
     tm["boundary"] = time.time() - t0
 
@@ -1310,6 +1507,7 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
 
     # 沒有四角（find_page_quad 失敗）：以精修後的外框四角當「四角」，同樣先檢查是不是平的紙
     pseudo = False
+    n_meas = int(sum(uv_use))
     if not have_quad and grid is not None and sum(uv_use) >= 3:
         cv_ = _side_curves(prior_uv, uv_sides, uv_use, K, inner_uv)
         c4 = _corners_from_curves(cv_)
@@ -1324,6 +1522,25 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
             setup_persp(c5, float(est.value))
         tm["flat_check"] += time.time() - t1
         pseudo = True
+        # 在原照片上量到的邊：直邊精修有支持、而且是紙與背景的交界（有內外色差；表格框線兩側同色，不算）
+        meas = [k for k in range(4) if any(sd["support"] >= p["min_edge_support"] and sd["contrast"] >= p["edge_min_contrast"]
+                                           for sd in (q_sides[k], uv_sides[k]))]
+        pseudo_info.update({"corners": np.asarray(persp["corners"], np.float64).copy(), "measured": len(meas)})
+        n_meas = len(meas)
+        if len(meas) < 3:
+            pseudo = False
+            pseudo_info.clear()
+
+    if not have_quad and not pseudo:
+        # 沒有四角、量得到的紙邊又不到三條：學習式模型的外框只當候選（鐵律：學習式模型不決定最後的位置），維持整張圖
+        cand = _side_curves(prior_uv, uv_sides, uv_use, K, inner_uv) if grid is not None else []
+        sup = [float(sd["support"]) for sd in uv_sides]
+        tm["total"] = time.time() - t_all
+        c4 = _corners_from_curves(cand) if cand else None
+        return DewarpResult(image=None, map_x=None, map_y=None, applied=False, source="", curved=False, confidence=0.0, timings=tm,
+                            corners=c4, support=sup, candidate_outline=cand, measured_sides=int(n_meas), needs_review=True,
+                            notes=notes + [f"沒有頁面四角，紙與背景的交界只量到 {n_meas} 條（學習式模型外框的四邊支持率 {', '.join(f'{v:.2f}' for v in sup)}）："
+                                           "學習式模型找的外框只當候選（請使用者確認），維持整張圖。"])
 
     # 紙有沒有被四角裁掉（捲起的上緣常被丟掉）：UVDoc 外框有邊緣支持的部分明顯在四邊形外
     truncated = []
@@ -1472,44 +1689,70 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
         eT2 = dT + cv2.remap(eT.astype(np.float32), qx, qy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         sm2 = render(eS2, eT2)
         st2 = straightness(find_lines(sm2, p), Wm, Hm_)
-        if st2.get("n_lines") and st2["p95_px"] <= st["p95_px"] * (1 - p["correct_min_gain"]):
+        # 同一組線才比：修正後線少了一大截（被扭壞而量不到），殘差變小也不算數
+        if st2.get("n_lines") and _lines_kept(st["n_lines"], st2["n_lines"], p) and st2["p95_px"] <= st["p95_px"] * (1 - p["correct_min_gain"]):
             eS, eT, st, sm = eS2, eT2, st2, sm2
             n_iter += 1
         else:
             break
     tm["interior"] = time.time() - t0
 
-    # ---- 6. 驗證後才採用
+    # ---- 6. 驗證後才採用（每條路徑都驗證，含紙超出四角）
     res_after = st["p95_px"] / f if st.get("n_lines") else None
     res_before = st_before.get("p95_out_px")
+    n_b, n_a = int(st_before.get("n_lines", 0) or 0), int(st.get("n_lines", 0) or 0)
     accept, reason = True, ""
-    if (have_quad or pseudo) and not truncated:
-        if res_after is not None and res_before is not None and st_before.get("n_lines", 0) >= p["flat_min_lines"]:
-            if res_before - res_after < max(p["accept_margin_frac"] * Wo, p["accept_rel"] * res_before):
-                accept, reason = False, f"攤平後的直線度（殘差 {res_after:.1f} 像素）沒有比透視攤平（{res_before:.1f} 像素）好"
-        elif not bow_bad:
+    if have_quad or pseudo:
+        if n_b and not _lines_kept(n_b, n_a, p):
+            accept, reason = False, f"攤平後只量到 {n_a} 條格線／文字行（透視攤平時 {n_b} 條；線被扭壞就量不到，殘差不能拿來比）"
+        elif res_after is not None and res_before is not None:
+            if res_after > res_before * (1.0 + p["worse_tol_rel"]) + p["worse_tol_px"]:
+                accept, reason = False, f"攤平後的直線度（殘差 {res_after:.2f} 像素）比透視攤平（{res_before:.2f} 像素）差"
+            elif n_b >= p["flat_min_lines"] and not truncated and res_before - res_after < max(p["accept_margin_frac"] * Wo, p["accept_rel"] * res_before):
+                # 紙超出四角時（捲起的部分被四角切掉）放寬：攤平多救回一塊紙，只要直線度沒有變差就採用
+                accept, reason = False, f"攤平後的直線度（殘差 {res_after:.1f} 像素）沒有比透視攤平（{res_before:.1f} 像素）明顯好"
+        elif not bow_bad and not truncated:
             accept, reason = False, "頁內量不到格線或文字行，紙邊也沒有量到彎曲"
     if (have_quad or pseudo) and not accept and mode != "force":
+        if pseudo:
+            sup_ = [float(sd["support"]) for sd in q_sides]
+            conf_ = 0.05 + 0.6 * float(np.clip((sorted(sup_)[1] - 0.3) / 0.5, 0.0, 1.0))
+            return perspective_result([f"沒有現成的四角：以學習式模型找的外框為候選、由紙邊量出四角（{pseudo_info['measured']} 條邊有量測支持）；"
+                                       f"看起來是彎的紙（{'；'.join(why) or '—'}），但{reason}：只做透視攤平，四角請使用者確認。"], curved, conf_, sup_)
         return perspective_result(why and [f"看起來是彎的紙（{'；'.join(why)}），但{reason}：退回透視攤平。"] or [f"{reason}：退回透視攤平。"], curved)
 
     t0 = time.time()
-    SF, TF = np.meshgrid(_centers(Wo), _centers(Ho))
-    if n_iter:
-        qx = (SF * Wm - 0.5).astype(np.float32)
-        qy = (TF * Hm_ - 0.5).astype(np.float32)
-        SF = SF + cv2.remap(eS.astype(np.float32), qx, qy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        TF = TF + cv2.remap(eT.astype(np.float32), qx, qy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    X, Y = M1(SF, TF)
-    del SF, TF
+    eS32, eT32 = eS.astype(np.float32), eT.astype(np.float32)
+
+    def final_map(S, T, r0, r1):
+        if n_iter:
+            qx = (S * Wm - 0.5).astype(np.float32)
+            qy = (T * Hm_ - 0.5).astype(np.float32)
+            S = S + cv2.remap(eS32, qx, qy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            T = T + cv2.remap(eT32, qx, qy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return M1(S, T)
+
     interp = cv2.INTER_CUBIC if p["output_interp"] == "cubic" else cv2.INTER_LINEAR
-    out = _remap(img, X.astype(np.float32), Y.astype(np.float32), interp)
+    X, Y, out = _render_rows(img, final_map, Wo, Ho, interp)
     tm["render"] = time.time() - t0
 
     # ---- 信心值與說明
+    # 頁內殘差：修正場是拿這些線擬合的，擬合後的殘差一定小；有修正時改用交叉驗證殘差（沒參與擬合的線的預測誤差）
+    res_cv = None
+    if n_iter:
+        cvr = _cv_residual(st_first, Wm, Hm_, p, pin_rows, pin_cols)
+        res_cv = cvr / f if cvr is not None else None
+    res_conf = max(v for v in (res_after, res_cv) if v is not None) if (res_after is not None or res_cv is not None) else None
     srt = sorted(support)
     f_sup = float(np.clip((srt[1] - 0.3) / 0.5, 0.0, 1.0))
-    f_res = 1.0 / (1.0 + (res_after / (0.003 * Wo)) ** 2) if res_after is not None else 0.6
-    conf = 0.05 + 0.9 * f_sup * f_res * (1.0 if source == "measured" or n_iter or st.get("n_lines", 0) >= 3 else 0.85)
+    f_res = 1.0 / (1.0 + (res_conf / (0.003 * Wo)) ** 2) if res_conf is not None else 0.6
+    # 外框有學習式模型推估的邊、紙超出四角（捲起處的位置量不到）、四角是自己量的：位置誤差量不到，信心值壓低
+    f_src = (p["conf_uvdoc_prior"] if source == "uvdoc_prior" else 1.0) * (p["conf_truncated"] if truncated else 1.0) * (p["conf_pseudo"] if pseudo else 1.0)
+    # 直線度幾乎沒有進步：攤平的好處只來自外框，頁內量不到有沒有攤對
+    f_gain = 1.0
+    if res_before is not None and res_after is not None and res_before > 0:
+        f_gain = float(np.clip(0.6 + 0.4 * (res_before - res_after) / (0.5 * res_before), 0.6, 1.0))
+    conf = 0.05 + 0.9 * f_sup * f_res * f_src * f_gain * (1.0 if st.get("n_lines", 0) >= 3 else 0.85)
     msg = "已攤平彎曲的紙" + (f"（{'；'.join(why)}）" if why else "")
     msg += f"：外框由紙邊量出（四邊支持率 {', '.join(f'{v:.2f}' for v in support)}）"
     if p["interior_prior"] == "uvdoc" and grid is not None:
@@ -1525,17 +1768,23 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
             msg += f"，透視攤平時為 {res_before:.1f} 像素"
         if n_iter:
             msg += f"，依這些線修正位移場 {n_iter} 輪"
+            if res_cv is not None:
+                msg += f"（沒參與擬合的線量得 {res_cv:.1f} 像素）"
     else:
         msg += "，頁內沒有可量的長線，頁內只靠外框內插" + ("與學習式初值（推估，非量測）" if source == "uvdoc_prior" else "")
+    if pseudo:
+        msg += f"；沒有現成的四角，四角由紙邊量出（{pseudo_info.get('measured', 0)} 條邊有量測支持）"
     notes.append(msg + "。")
-    if conf < 0.6:
-        notes.append("攤平的信心值不高，建議請使用者確認紙的外框。")
+    review = conf < 0.6 or source == "uvdoc_prior" or bool(truncated) or pseudo
+    if review:
+        notes.append("攤平的信心值不高（或外框有推估的部分、紙超出四角、四角是自己量的），建議請使用者確認紙的外框。")
     Hc = _homography(corners, np.array([[0, 0], [Wo, 0], [Wo, Ho], [0, Ho]], np.float64))
     tm["total"] = time.time() - t_all
-    return DewarpResult(image=out, map_x=X.astype(np.float32), map_y=Y.astype(np.float32), applied=True, source=source, curved=curved,
+    return DewarpResult(image=out, map_x=X, map_y=Y, applied=True, source=source, curved=curved,
                         corners=corners, boundary=boundary, support=support, bow_px=[float(b) for b in bows], residual_px=res_after,
                         residual_before_px=res_before, straightness=_st_summary(st_before, st), confidence=float(conf), homography=Hc,
-                        notes=notes, timings=tm)
+                        notes=notes, timings=tm, pseudo_quad=corners.copy() if pseudo else None,
+                        measured_sides=int(pseudo_info.get("measured", sum(1 for u in use if u))), needs_review=review)
 
 
 def _st_summary(before: dict, after: Optional[dict]) -> dict:
@@ -1544,3 +1793,14 @@ def _st_summary(before: dict, after: Optional[dict]) -> dict:
     if after is not None:
         out["after"] = {k: after.get(k) for k in keys if k in after}
     return out
+
+
+if __name__ == "__main__":  # 部署時預先下載模型：python -m mortise.recognition.dewarp --download
+    import sys
+
+    if "--download" in sys.argv:
+        path, msgs = ensure_uvdoc_model({"uvdoc": "sync", "_force_retry": True})
+        print("\n".join(msgs) or "快取裡已有模型。")
+        print(path if path is not None else "下載失敗")
+        sys.exit(0 if path is not None else 1)
+    print("用法：python -m mortise.recognition.dewarp --download")

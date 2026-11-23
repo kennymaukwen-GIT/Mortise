@@ -183,6 +183,9 @@ class PageQuad:
     # corner_error_px 的含意：四個角各自的位置誤差，取「直線擬合誤差（含模糊）」「相鄰紙邊的弓高（彎曲時直線模型本身的誤差）」
     # 「同一張紙其他框法的四角差異（候選間的分歧）」三者的最大值；不是只有擬合雜訊。
     status: str = "ok"  # ok、low_contrast（邊界不清楚或信心不足）、curved_edge（紙邊彎曲）、multiple_pages（有好幾張紙）、cut_off（紙被畫面切掉）、not_found（找不到，用整張圖）；不是 ok 時介面應請使用者拖曳四角確認
+    # cut_off 的兩種情形：method="edge_fit" 時四角本身就是答案（有角落在畫面外，由邊線延長相交）；
+    # method="full_image" 時只在「恰好一條邊貼著畫面邊、另外三條邊都量到」才標，這時 alternatives[0] 是「三條邊＋畫面邊」的框，可以預選。
+    # 紙完整在畫面內卻找不到、或量到的邊不夠時標 not_found（alternatives 只供參考，不要預選）。
     alternatives: list[np.ndarray] = field(default_factory=list)  # 其他候選的四角（每組 (4, 2)，依分數由高到低）：例如照片裡的第二張紙、或被畫面切掉的紙「三條邊＋畫面邊」的框
     alternative_scores: list[float] = field(default_factory=list)  # 上一項各候選的分數 ÷ 最佳候選的分數
     boundary: Optional[np.ndarray] = None  # 紙邊彎曲時的外框（(N, 2)，左上 → 右上 → 右下 → 左下依序）；平的紙留空
