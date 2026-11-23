@@ -368,8 +368,10 @@ def _glyphs(read: dict[tuple, list[svgx.ReadLine]], book: FontBook) -> list[line
     讀回的 x 是行的起點（輸出器一律從行首寫起）；每個字的位置是逐字前進寬度（用渲染時會用到的字型量）加上字距、詞距。
     文字轉外框、旋轉的行、量不出字寬的行不列（那幾行只靠影像判斷）。"""
     out: list[line_check.Glyph] = []
+    n = -1
     for rls in read.values():
         for rl in rls:
+            n += 1
             if rl.outlined or abs(rl.rotation) > 0.5 or not rl.spans:
                 continue
             chars: list[tuple[str, float, float]] = []  # （字、前進寬度 pt、字級 pt）
@@ -389,7 +391,7 @@ def _glyphs(read: dict[tuple, list[svgx.ReadLine]], book: FontBook) -> list[line
             x = rl.x
             for ch, adv, size in chars:
                 if ch.strip():
-                    out.append(line_check.Glyph(ch=ch, x=x, y=rl.y, size=size))
+                    out.append(line_check.Glyph(ch=ch, x=x, y=rl.y, size=size, line=n))
                 x += adv
     return out
 

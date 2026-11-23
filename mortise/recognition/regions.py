@@ -28,7 +28,12 @@
      平坦比（梯度低於門檻的比例）、高頻比（區內拉普拉斯雜訊 ÷ 頁面雜訊）。高分為照片，低分為插畫。
    - 被照片包圍的平坦區塊：先判斷是不是「後來疊上去的平塗形狀」（_OverlayContext：面積、內部顆粒 ÷ 照片最平坦處的顆粒、
      內部顆粒與頁面底色比、顏色均勻、邊緣銳利而且連續），是的話照常擬合、圖層在照片之上；擬合不成基本幾何就試描圖，
-     過關才拆成插畫；其餘併回照片（照片內容）。照片的外形另做擬合。
+     過關才拆成插畫；其餘併回照片（照片內容），沒拆的原因在照片 notes 合併成一句。照片的外形另做擬合。
+     顆粒下限只取照片裡「本身平坦」的格子（低頻起伏不大）；整張都是紋理時改用更嚴的比值（壓縮把均勻處的顆粒壓得比紋理少）。
+     細長的形狀改用較小的高通再量；純黑、純白（截平）的色塊不拆；頁面底色乾淨而形狀內部透出一點顆粒的，當成半透明不拆。
+     疊上去的多邊形若被 JPEG 沿 8×8 區塊削掉尖角，擬合時把短邊當成削掉的尖角補回（尖角裡大多是形狀的顏色才補）。
+   - 滿版照片（選出來的底色沒碰到影像外框、只佔一小部分，外框又大多是紋理）：整張當成前景、整張當成照片候選，
+     疊加判斷照常進行；沒有找到疊上去的圖形就照原本的讀法重來（結果與沒有這個功能時相同）。
    - 照片紋理與形狀顏色相近時，平滑區會穿過形狀邊界連成一片（整片就不平坦）：用「顆粒幾乎為零」把乾淨的大塊挖出來，
      只收被前景整個圍住的（_clean_parts）。
    - 平坦區塊做幾何擬合；擬合不好的（不是簡單幾何）與插畫型紋理就近合併成插畫。
@@ -49,7 +54,9 @@
 表格內的小塊記在表格 notes（可能是漏抓的文字）。
 除錯／調參：params["_debug"] 若給一個 list，會附上背景模型、門檻與每個候選的角色與特徵。
 14. crop_region：裁切成 RGBA；有外形擬合者以 4× 超取樣畫出反鋸齒的透明度，否則以遮罩羽化。
-15. fill_covered：照片被上層元素蓋住的地方補回來（背景補全＋薄膜內插＋複製照片自己的顆粒），回傳生成遮罩。
+15. fill_covered：照片被上層元素蓋住的地方補回來（背景補全＋薄膜內插＋複製照片自己的顆粒），回傳生成遮罩；
+    只把要補的範圍外擴一圈交給背景補全。fill_quality：補出來的地方與周圍的中尺度紋理比（多尺度紋理的照片補得出平滑的一團，
+    數值低，影像產線會在 notes 提醒）。
 多邊形：Douglas–Peucker 的頂點被接受後再精修（每邊直線擬合取交點，去掉共線頂點與太短的邊；反鋸齒削鈍的尖角因此還原）。
 
 座標：工作影像像素，原點左上、y 向下；像素 i 佔 [i, i+1)，中心在 i+0.5。
@@ -58,14 +65,18 @@ quad 一律為「左上、右上、右下、左下」（以形狀自身方向為
 
 已知限制
 --------
-- 半透明色塊壓在照片上：一律當照片內容，不拆出來。照片上的不透明平塗形狀會拆（見第 9 步），但照片本身很乾淨
-  （顆粒 < overlay_min_texture）時比不出來，就留在照片裡；照片裡過曝或欠曝成純白、純黑的大塊，若邊緣銳利、形狀規則，可能被誤拆。
+- 半透明色塊壓在照片上：頁面底色乾淨（數位畫面）時，透明度到約 0.95 都認得出是半透明而不拆；更接近不透明（約 0.97 以上）、
+  或頁面本身有雜訊（掃描、翻拍）時量不出來，會被當成不透明的形狀拆出來（照片底下補掉的那一點透光內容就沒了）。
+  照片上的不透明平塗形狀會拆（見第 9 步），但照片本身很乾淨（顆粒 < overlay_min_texture）時比不出來，就留在照片裡。
+- 純黑、純白（三個色版都截平）的色塊一律不拆：分不出是照片欠曝、過曝截平的地方，還是後來疊上去的黑、白色塊（後者因此會留在照片裡）。
+- JPEG 壓得很重（品質 70 以下）時，形狀的邊緣被振鈴弄得不夠銳利，常常整塊留在照片裡；三角形的尖角被削掉太多時補不回來。
 - 與背景同色、疊在其他色塊上的形狀（藍卡片上的白框）看起來是洞，不會成為區域。
 - 純色加簡單幾何組成的「圖片」會被讀成形狀（例如 slide_basic 的藍底黃橢圓）；類型歧義交⑤。
 - 由基本幾何拼成的插畫會被拆成多個形狀；只有擬合失敗的色塊才合併成插畫。
 - 漸層填色只回報中位色與「有漸層」的註記，還沒有擬合漸層參數。
 - 有外框線的橢圓，線寬約低估 0.5 px；模糊下外框線色會被稀釋（照實回報，不校正）。
-- 完全被照片包住、但沒通過疊加判斷的平坦色塊會併回照片（沒拆的原因記在照片 notes）。碰到照片外緣的形狀不走這個判斷。
+- 完全被照片包住、但沒通過疊加判斷的平坦色塊會併回照片（沒拆的原因記在照片 notes）。碰到照片外緣的形狀不走這個判斷
+  （照片邊上的磚、天空會成為一般的形狀，與沒有這個功能時相同）；滿版照片裡碰到影像外框的平坦處當成照片內容。
 - 照片與背景同色的邊界（白底商品圖放白底上）找不準；外形擬合不好時退回原始遮罩。
 - 同色相接的兩個形狀會連成一塊，擬合失敗後成為插畫（尚未做凹角切分）。
 - 虛線、箭頭端點、雙線格線、漸層以外的特效（光澤、紋理填色）未特別處理。
@@ -558,14 +569,25 @@ def fill_covered(image: np.ndarray, region: Region, cover: np.ndarray, params: d
         return img, gen  # 幾乎整張都被蓋住：沒有依據可補，照原樣
     crop = img[y0:y1, x0:x1]
     bgmod.register_inpainter("membrane", _membrane_inpaint)  # 背景補全的替換點；重複註冊只是覆蓋同一個名稱
-    # 只把「要補的範圍外擴一圈」交給背景補全：大張照片整張交進去，光是量雜訊就要好幾秒（4000×3000 實測 6.9 秒）
-    fb = _bbox_of(fill)
-    pad = max(int(P["overlay_fill_pad_px"]), int(math.ceil(float(P["overlay_fill_pad_rel"]) * max(fb[2] - fb[0], fb[3] - fb[1]))))
-    wx0, wy0, wx1, wy1 = _expand_box(fb, pad, y1 - y0, x1 - x0)
-    res = bgmod.reconstruct_background(crop[wy0:wy1, wx0:wx1], ~known[wy0:wy1, wx0:wx1], {"noise_match": False, "inpaint_method": "membrane"})
+    # 只把「要補的範圍外擴一圈」交給背景補全：大張照片整張交進去，光是量雜訊就要好幾秒（4000×3000 實測 6.9 秒）。
+    # 幾個分開的圖形各補各的（各自的範圍外擴一圈），除非它們的範圍合起來比一個大範圍還大。
+    hh, ww = y1 - y0, x1 - x0
+
+    def _window(box):
+        pad = max(int(P["overlay_fill_pad_px"]), int(math.ceil(float(P["overlay_fill_pad_rel"]) * max(box[2] - box[0], box[3] - box[1]))))
+        return _expand_box(box, pad, hh, ww)
+
+    whole = _window(_bbox_of(fill))
+    n_cc, cc_lab, cc_st, _ = cv2.connectedComponentsWithStats(fill.astype(np.uint8), connectivity=8)
+    parts = [(k, _window((int(cc_st[k, 0]), int(cc_st[k, 1]), int(cc_st[k, 0] + cc_st[k, 2]), int(cc_st[k, 1] + cc_st[k, 3])))) for k in range(1, n_cc)]
+    area = lambda b: (b[2] - b[0]) * (b[3] - b[1])  # noqa: E731
+    if len(parts) <= 1 or sum(area(b) for _, b in parts) >= 0.8 * area(whole):
+        parts = [(-1, whole)]
     out = crop.astype(np.float32)
-    fw = fill[wy0:wy1, wx0:wx1]
-    out[wy0:wy1, wx0:wx1][fw] = res.image[fw].astype(np.float32)
+    for k, (wx0, wy0, wx1, wy1) in parts:
+        res = bgmod.reconstruct_background(crop[wy0:wy1, wx0:wx1], ~known[wy0:wy1, wx0:wx1], {"noise_match": False, "inpaint_method": "membrane"})
+        fw = fill[wy0:wy1, wx0:wx1] if k < 0 else (cc_lab[wy0:wy1, wx0:wx1] == k)
+        out[wy0:wy1, wx0:wx1][fw] = res.image[fw].astype(np.float32)
     grain = _grain_fill(crop.astype(np.float32), known, fill, P)
     if grain is not None:
         out[fill] += grain[fill]
