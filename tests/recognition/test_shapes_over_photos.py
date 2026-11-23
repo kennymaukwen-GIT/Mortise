@@ -504,12 +504,14 @@ def test_thin_bar_over_photo_is_split():
     assert _shape_error("rect", cv.truth[0][1], over[0]) < 2.0 and over[0].features["overlay_hp_sigma"] == 1.0
 
 
-@pytest.mark.parametrize("kind,q", [("grain", 90), ("texture", 90), ("grain", 75), ("texture", 75)])
-def test_jpeg_shapes_over_photo(kind, q):
+@pytest.mark.parametrize("kind,q,seed,strict", [("grain", 90, 7, True), ("texture", 90, 7, True), ("grain", 75, 7, True), ("texture", 75, 7, False),
+                                              ("grain", 60, 7, True), ("texture", 75, 11, True), ("texture", 60, 11, True)])
+def test_jpeg_shapes_over_photo(kind, q, seed, strict):
     """JPEG 壓縮過的照片加形狀：橢圓、矩形、圓角矩形要拆對；三角形的尖角會被壓縮沿 8×8 區塊削掉，要補回來。
-    q90 三角形一定要拆成三個頂點、誤差 2 px 內；q75 只有部分情況補得回來（已知限制），這裡只檢查拆出來時不能錯，
-    而且拆出來的三角形要把真的三角形整個蓋住（不然照片裡會留下殘角）。"""
-    cv = _overlay_scene(kind)
+    strict 的組合三角形一定要拆成三個頂點、誤差 2 px 內。texture 種子 7 的左上尖角旁邊，照片的顏色接近三角形，
+    壓縮後尖角被吃掉十幾個像素，q85 以下補不回來（已知限制），這裡只檢查拆出來時不能錯。
+    拆出來的三角形要把真的三角形整個蓋住（不然照片裡會留下殘角）。"""
+    cv = _overlay_scene(kind, seed=seed)
     img = _jpeg(cv.render(), q)
     regs = find_regions(img, np.zeros(img.shape[:2], bool))
     photo = next(r for r in regs if r.kind == "photo")
@@ -519,7 +521,7 @@ def test_jpeg_shapes_over_photo(kind, q):
         r = over.get(geom)
         if geom == "polygon":
             tri = [r for r in regs if r.features.get("overlay") == 1.0 and r.bbox[0] > 480 and r.bbox[1] > 300]
-            if q >= 90:
+            if strict:
                 assert r is not None and len(r.shape.polygon) == 3
             if tri and r is not None and len(r.shape.polygon) == 3:
                 errs[geom] = round(_shape_error(geom, prm, r), 2)
@@ -537,7 +539,7 @@ def test_jpeg_shapes_over_photo(kind, q):
         assert r is not None and r.z > photo.z and _de(r.shape.fill, col) < 3.0
         errs[geom] = round(_shape_error(geom, prm, r), 2)
         assert errs[geom] < 2.0
-    print(f"\n{kind} JPEG{q}：{errs}")
+    print(f"\n{kind}（種子 {seed}）JPEG{q}：{errs}")
 
 
 def _wall(h: int, w: int, rng, base) -> np.ndarray:

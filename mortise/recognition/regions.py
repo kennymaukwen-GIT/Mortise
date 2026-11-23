@@ -248,6 +248,7 @@ DEFAULT_PARAMS: dict = {
     "overlay_tip_chamfer": 0.2,  # 疊在照片上的多邊形：比相鄰長邊短到此比例以下的邊，當成被 JPEG 削掉的尖角試著補回（倍）
     "overlay_tip_max_px": 24.0,  # 上一項的短邊最長幾個像素（JPEG 削掉的尖角大約一到三個 8×8 區塊；32 會補出離譜的頂點）
     "overlay_tip_color_frac": 0.6,  # 補回的尖角裡，顏色比較接近形狀（而不是周圍照片）的像素至少要這個比例
+    "overlay_collinear_px": 3.5,  # 疊在照片上的多邊形：頂點離前後兩頂點連線不到這麼多像素就併掉（JPEG 的振鈴把直邊壓出 1.5–3 px 的凹凸）
     "overlay_fill_block_px": 24,  # 補照片時複製顆粒的方塊邊長（像素）
     "overlay_fill_pad_px": 64,  # 補照片時，要補的範圍外擴這麼多像素（另與下一項取大者）當成依據，不必整張照片交給背景補全
     "overlay_fill_pad_rel": 0.25,  # 外擴的比例（佔要補範圍的長邊）
@@ -1062,7 +1063,8 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
             a2 = cv2.approxPolyDP(cnt, base_eps * k_eps, True)[:, 0, :].astype(np.float64) + 0.5
             if not 3 <= len(a2) <= 2 * int(P["max_polygon_vertices"]):
                 continue
-            r = _refine_polygon(pts_all, ok, a2, tol, chamfer=float(P["overlay_tip_chamfer"]), chamfer_max_px=float(P["overlay_tip_max_px"]), grid=origin)
+            r = _refine_polygon(pts_all, ok, a2, tol, chamfer=float(P["overlay_tip_chamfer"]), chamfer_max_px=float(P["overlay_tip_max_px"]), grid=origin,
+                                collinear_px=float(P["overlay_collinear_px"]))
             if r is None:
                 continue
             verts, tip_list = r
@@ -1076,7 +1078,9 @@ def _fit_mask(mask: np.ndarray, bad: np.ndarray, P: dict, tol: float, allow_line
             d = _seg_dist(pts[keep], verts)
             f = _Fit("polygon", poly=verts, err_mean=float(d.mean()), err_p95=float(np.percentile(d, 95)))
             f.iou = _iou(_offset_poly(verts, 0.5))
-            if not _ok(f) or tips(verts) < float(P["overlay_tip_color_frac"]):
+            # 補回尖角時才看顏色：沒有補尖角（只併掉幾乎共線的頂點）時，多出來的只是沿邊的一兩個像素（振鈴區，顏色本來就兩邊各半），
+            # 由擬合誤差把關就夠
+            if not _ok(f) or (tip_list and tips(verts) < float(P["overlay_tip_color_frac"])):
                 continue
             f.std = {"tips_recovered": float(len(tip_list))} if tip_list else {}
             if best_f is None or (len(verts), f.err_mean) < (len(best_f.poly), best_f.err_mean):
@@ -1165,7 +1169,7 @@ def _tip_color_check(I: np.ndarray, mask: np.ndarray, bad: np.ndarray, F: np.nda
 
 
 def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float, chamfer: float = 0.0, chamfer_max_px: float = 24.0,
-                    grid: Optional[tuple[float, float]] = None):
+                    grid: Optional[tuple[float, float]] = None, collinear_px: float = 0.0):
     """Douglas–Peucker 的頂點只落在輪廓點上：反鋸齒會把銳角削鈍，在尖端留下兩三個靠得很近的頂點。
     這裡每條邊各自以直線擬合（去掉靠近兩端的點，只用沒被遮住的點），頂點改取相鄰兩條直線的交點；
     太短的邊（小於 max(4, 3 × 容許偏差)）拿掉，讓兩旁的邊直接相交。交點離原頂點太遠（幾乎平行）就保留原頂點。
@@ -1174,6 +1178,8 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
     最多 3 × chamfer_max_px）。grid（局部座標到整張影像的位移）：沿著 8×8 區塊邊界的水平或垂直短邊是 JPEG 削掉尖角的
     典型痕跡，這種邊容許到 2 × chamfer_max_px。這時回傳（頂點、補回的尖角 [(頂點, 削掉的長度)]），
     尖角是否真的屬於形狀由呼叫端看顏色決定。
+    collinear_px：幾乎共線的頂點（離前後兩頂點連線的距離）在 max(容許偏差, 此值) 以內就併掉；壓縮過的照片上，
+    直邊會被振鈴壓出幾個像素的凹凸，多出幾乎共線的頂點（呼叫端之後仍會檢查擬合誤差）。
     回傳精修後的頂點（與輪廓同一個座標框架）；做不到時回傳 None。"""
     n0 = len(V)
     N = len(P_all)
@@ -1185,6 +1191,7 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
     edges = [(idx[i], idx[(i + 1) % len(idx)]) for i in range(len(idx))]  # 每條邊在輪廓上的範圍（含兩端）
     min_len = max(4.0, 3.0 * tol)
     far = max(6.0, 4.0 * tol)
+    coll = max(tol, float(collinear_px))
 
     def _line(a: int, b: int):
         ii = np.arange(a, b + 1) if b > a else np.r_[np.arange(a, N), np.arange(0, b + 1)]
@@ -1229,7 +1236,7 @@ def _refine_polygon(P_all: np.ndarray, ok: np.ndarray, V: np.ndarray, tol: float
         d = nxt - prev
         dev = np.abs(d[:, 0] * (verts[:, 1] - prev[:, 1]) - d[:, 1] * (verts[:, 0] - prev[:, 0])) / np.maximum(np.hypot(d[:, 0], d[:, 1]), _EPS)
         k = int(np.argmin(dev))
-        if dev[k] < tol:
+        if dev[k] < coll:
             edges[k - 1] = (edges[k - 1][0], edges[k][1])
             del edges[k]
             continue
@@ -1495,6 +1502,7 @@ def _classify_texture(I: np.ndarray, m: np.ndarray, grad: np.ndarray, lap: np.nd
 # =====================================================================================
 
 _GRAIN_K = 1.25  # 高通殘差絕對值的中位數換成「約等於雜訊標準差」的倍數（常態分布的平均絕對值約 0.8σ）
+_LUMA = (0.299, 0.587, 0.114)  # 亮度的權重（與 JPEG 相同的 BT.601）
 
 
 class _OverlayContext:
@@ -1507,7 +1515,8 @@ class _OverlayContext:
          比的是「照片最平坦處」而不是「緊鄰的周圍」：周圍若是樹葉、建築，紋理本身就大，拿來比會把天空誤判成乾淨。
       3. 顏色均勻：內部跨區的顏色變化（線性擬合的幅度）要小；天空、牆面常有明暗。
       4. 邊緣：沒被文字或其他物件遮住的邊界上，兩側色差夠大、而且銳利（邊緣上的最大梯度 ÷ 兩側色差），
-         這樣的點要佔大多數（連續）。模糊的色塊、柔邊的光斑過不了。
+         這樣的點要佔大多數（連續）。模糊的色塊、柔邊的光斑過不了。顏色或亮度其中一個銳利就算（JPEG 把顏色降成
+         一半解析度，顏色的邊緣會被抹寬，亮度不會）。
     外形（基本幾何的擬合誤差）在之後的擬合步驟判斷；擬合不成時改試描圖（_overlay_trace），都不成就留在照片裡。
     判斷結果與量到的數值寫進候選的 feats（overlay_*），通過的另在 notes 用白話說明依據。
     """
@@ -1635,11 +1644,22 @@ class _OverlayContext:
         if n_u == 0:
             return 0.0, 0.0
         O = num[use] / den[use][:, None]
-        step = np.linalg.norm(O - np.asarray(c.color, np.float32)[None, :], axis=1)
+        col = np.asarray(c.color, np.float32)
+        step = np.linalg.norm(O - col[None, :], axis=1)
         G = cv2.dilate(self._gradient(bx), np.ones((5, 5), np.uint8))
         sharp = G[use] / np.maximum(step, _EPS)
         cmin = max(float(P["overlay_edge_contrast"]), 4.0 * floor)
-        good = (step >= cmin) & (sharp >= float(P["overlay_edge_sharpness"]))
+        need = float(P["overlay_edge_sharpness"])
+        good = (step >= cmin) & (sharp >= need)
+        # 亮度上再看一次：JPEG 把顏色（色度）降成一半解析度，顏色的邊緣被抹寬到三、四個像素，亮度則保持全解析度。
+        # 亮度上兩側夠不同、而且銳利，也算清楚的邊緣（模糊的照片內容在亮度上一樣模糊，不會因此過關）。
+        wY = np.asarray(_LUMA, np.float32)
+        IY = (I * wY).sum(axis=2)
+        gx = cv2.Sobel(IY, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+        gy = cv2.Sobel(IY, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        GY = cv2.dilate(np.sqrt(gx * gx + gy * gy), np.ones((5, 5), np.uint8))
+        stepY = np.abs(O @ wY - float(col @ wY))
+        good |= (stepY >= cmin) & (GY[use] / np.maximum(stepY, _EPS) >= need)
         return float(good.mean()), n_u / max(n_b, 1)
 
     def reject(self, host: _Cand, labels: list[str], detail: str) -> None:
