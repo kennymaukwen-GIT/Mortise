@@ -1,5 +1,5 @@
 // The big black frame: drop a file in, page through it, watch the conversion, compare and correct the result.
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch } from "react";
 import * as api from "../api/client";
 import { ApiError } from "../api/client";
 import type { CorrectionIn, PageElements, PageGeometry, PageInfo } from "../api/types";
@@ -11,7 +11,7 @@ import { loadServerImage, renderKind } from "../lib/serverImages";
 import { fmtMm, widthBucket } from "../lib/units";
 import { detectedSizeMm, pageGeometry } from "../state/derive";
 import { cornersCorrection } from "../lib/quad";
-import { PAGE_TAGS } from "../state/feedback";
+import { confirmedElements, PAGE_TAGS } from "../state/feedback";
 import type { FeedbackState } from "../state/useFeedback";
 import { pageCount, type Action, type FrameMessage, type State, type View } from "../state/store";
 import { EditDialog, EditLayer } from "./EditLayer";
@@ -282,6 +282,10 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   const [pageReport, setPageReport] = useState<number | null>(null);
   const pageMenuBtn = useRef<HTMLButtonElement>(null);
   const pageMenuPanel = useRef<HTMLDivElement>(null);
+  const reviewBarBtn = useRef<HTMLButtonElement>(null);
+  // What opened "adjust the page" (the yellow bar or the page menu), to give the focus back when it closes.
+  const adjustOpener = useRef<"bar" | "menu" | null>(null);
+  const [geoTry, setGeoTry] = useState(0);
   const adjustRef = useRef(adjust);
   adjustRef.current = adjust;
 
@@ -317,25 +321,56 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   const reviewPages = useMemo(() => pagesToReview(isDone ? state.pages : null), [isDone, state.pages]);
   const wantGeo = isDone && !state.progress.background && !!page && (!!page.needs_review || adjusting);
   const geoKey = `${state.jobId}:${index + 1}:${state.resultVersion}`;
+  const geoKeyRef = useRef(geoKey);
+  geoKeyRef.current = geoKey;
   useEffect(() => {
     if (!wantGeo || !state.jobId) return;
-    if (geo?.key === geoKey && geo.status !== "error") return;
-    let alive = true;
-    setGeo({ key: geoKey, data: null, status: "loading" });
+    // Fetched already, or on its way. "Not ready yet" (409) and errors are asked again: when the editor is opened
+    // again, and every few seconds while it waits (below).
+    if (geo?.key === geoKey && (geo.status === "ready" || geo.status === "loading")) return;
+    const key = geoKey;
+    setGeo({ key, data: null, status: "loading" });
+    // An answer for another page or version is dropped (the key no longer matches).
     api
       .getGeometry(state.jobId, index + 1)
-      .then((data) => alive && setGeo({ key: geoKey, data, status: "ready" }))
+      .then((data) => setGeo((cur) => (cur?.key === key ? { key, data, status: "ready" } : cur)))
       .catch((e) => {
-        if (!alive) return;
-        if (e instanceof ApiError && e.status === 404) onJobMissing();
+        if (e instanceof ApiError && e.status === 404 && geoKeyRef.current === key) onJobMissing();
         // 409: page step ② is still running (for example after new corners were sent).
-        setGeo({ key: geoKey, data: null, status: e instanceof ApiError && e.status === 409 ? "pending" : "error" });
+        const status = e instanceof ApiError && e.status === 409 ? "pending" : "error";
+        setGeo((cur) => (cur?.key === key ? { key, data: null, status } : cur));
       });
-    return () => {
-      alive = false;
-    };
-  }, [wantGeo, geoKey, adjust]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [wantGeo, geoKey, adjust, geoTry]); // eslint-disable-line react-hooks/exhaustive-deps
   const pageGeo = geo?.key === geoKey ? geo : null;
+  // While the editor waits for step ② to finish, ask again every few seconds.
+  const waitingGeo = adjusting && pageGeo?.status === "pending";
+  useEffect(() => {
+    if (!waitingGeo) return;
+    const id = window.setTimeout(() => setGeoTry((n) => n + 1), 3000);
+    return () => window.clearTimeout(id);
+  }, [waitingGeo, geoTry]);
+
+  // Give the focus back to what opened the editor when it closes (Cancel, Escape, Apply). The yellow bar is gone
+  // once the corners are confirmed: then the page menu button takes it.
+  const wasAdjusting = useRef(false);
+  useEffect(() => {
+    if (adjusting) {
+      wasAdjusting.current = true;
+      return;
+    }
+    if (!wasAdjusting.current) return;
+    wasAdjusting.current = false;
+    const opener = adjustOpener.current;
+    adjustOpener.current = null;
+    const id = requestAnimationFrame(() => {
+      const now = document.activeElement;
+      if (now && now !== document.body && now.isConnected) return; // the focus already went somewhere on purpose
+      const usable = (el: HTMLButtonElement | null) => (el && el.isConnected && !el.disabled ? el : null);
+      const target = (opener === "bar" ? usable(reviewBarBtn.current) : null) ?? usable(pageMenuBtn.current) ?? usable(reviewBarBtn.current);
+      target?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [adjusting]);
 
   usePopoverDismiss(
     pageMenu,
@@ -348,8 +383,21 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
   useEffect(() => {
     if (pageMenu) pageMenuPanel.current?.querySelector<HTMLElement>('[role="menuitem"]:not([aria-disabled="true"])')?.focus();
   }, [pageMenu]);
+  // The page menu opens above the "⋯" button; on a narrow screen it is moved sideways to stay on the screen.
+  useLayoutEffect(() => {
+    const el = pageMenuPanel.current;
+    if (!pageMenu || !el) return;
+    el.style.transform = "";
+    const r = el.getBoundingClientRect();
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    let dx = 0;
+    if (r.right > vw - 12) dx = vw - 12 - r.right;
+    if (r.left + dx < 12) dx = 12 - r.left;
+    if (dx) el.style.transform = `translateX(${Math.round(dx)}px)`;
+  }, [pageMenu]);
 
-  const startAdjust = (n: number) => {
+  const startAdjust = (n: number, from: "bar" | "menu") => {
+    adjustOpener.current = from;
     setPageMenu(false);
     dispatch({ type: "SET_EDIT", on: false });
     if (n !== index + 1) dispatch({ type: "SET_PAGE", index: n - 1 });
@@ -680,7 +728,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
       {isDone && !adjusting && (review || renderNote || scoreNone || view === "overlay" || (state.editMode && view === "result")) && (
         <div className="stage-notes">
           {review && (
-            <button type="button" className="review-bar" data-testid="review-bar" onClick={() => startAdjust(review!.page)}>
+            <button type="button" className="review-bar" data-testid="review-bar" onClick={() => startAdjust(review!.page, "bar")} ref={reviewBarBtn}>
               <Corners size={18} className="review-bar__icon" />
               <span className="review-bar__text">{review.text}</span>
               <span className="review-bar__action">{review.page === index + 1 ? t("review.action") : t("review.go", { n: review.page })}</span>
@@ -781,7 +829,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
                       className="menu-item"
                       aria-disabled={!canAdjust || undefined}
                       title={!canAdjust ? t("page.adjustNotPhoto") : undefined}
-                      onClick={() => canAdjust && startAdjust(index + 1)}
+                      onClick={() => canAdjust && startAdjust(index + 1, "menu")}
                     >
                       {t("page.adjust")}
                     </button>
@@ -911,7 +959,7 @@ export function Stage({ state, dispatch, maxMb, serverHasLibreOffice, onPickFile
             requestAnimationFrame(() => back?.isConnected && back.focus());
           }}
           onApply={onCorrect}
-          report={feedback ? { onSend: feedback.send, count: feedback.items.length, consented: feedback.consented, reported: feedback.reported } : undefined}
+          report={feedback ? { onSend: feedback.send, count: feedback.items.length, consented: feedback.consented, reported: feedback.reported, confirmed: confirmedElements(feedback.items) } : undefined}
         />
       )}
 

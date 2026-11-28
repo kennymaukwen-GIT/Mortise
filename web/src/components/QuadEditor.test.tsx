@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { PageGeometry, Quad } from "../api/types";
 import { I18nProvider } from "../i18n/I18n";
@@ -82,13 +82,26 @@ function setup(g = geometry(), lang: "en" | "zh-Hant" = "en") {
   return { ...utils, onApply, onCancel };
 }
 
-/** The frame shown is the photo plus corners outside it, with a 5% margin (see frameFor). */
-function frame(g = geometry()) {
-  const m = 0.05 * Math.max(W, H);
-  const ys = [0, H, ...g.corners.map((p) => p[1]), ...g.alternatives.flatMap((a) => a.corners.map((p) => p[1])), ...(g.outline ?? []).map((p) => p[1])];
-  const y0 = Math.min(...ys) - m;
-  const y1 = Math.max(...ys) + m;
-  return { x: -m, y: y0, w: W + 2 * m, h: y1 - y0 };
+/**
+ * The frame shown (see frameFor and marginsFor): the photo with 5% of its longer side around it, except a side that a
+ * candidate touches or crosses (the paper is cut off there), which gets 30% of the photo's size across it; corners
+ * further out get 5% around them.
+ */
+function frame(g = geometry(), extra: [number, number][] = []) {
+  const n = 0.05 * Math.max(W, H);
+  const pts = [...g.corners, ...g.alternatives.flatMap((a) => a.corners), ...(g.outline ?? [])];
+  const m = {
+    left: pts.some((p) => p[0] <= 0.015 * W) ? 0.3 * W : n,
+    right: pts.some((p) => p[0] >= W - 0.015 * W) ? 0.3 * W : n,
+    top: pts.some((p) => p[1] <= 0.015 * H) ? 0.3 * H : n,
+    bottom: pts.some((p) => p[1] >= H - 0.015 * H) ? 0.3 * H : n,
+  };
+  const all = [...pts, ...extra];
+  const x0 = Math.min(-m.left, ...all.map((p) => p[0] - n));
+  const y0 = Math.min(-m.top, ...all.map((p) => p[1] - n));
+  const x1 = Math.max(W + m.right, ...all.map((p) => p[0] + n));
+  const y1 = Math.max(H + m.bottom, ...all.map((p) => p[1] + n));
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 describe("QuadEditor", () => {
@@ -135,6 +148,54 @@ describe("QuadEditor", () => {
     expect(sent[0]).toEqual([180, 160]);
     expect(sent[2][0]).toBeCloseTo(840 + 40 / k, 6);
     expect(sent[2][1]).toBeCloseTo(1100 - 20 / k, 6);
+  });
+
+  it("the paper cut off at the bottom: the frame leaves room below the photo, and a corner dragged out there is sent as it is", async () => {
+    const g = geometry();
+    const f = frame(g);
+    // The bottom side is cut off (a candidate's corners sit on it): 30% of the photo's height below it.
+    expect(f.y + f.h).toBeCloseTo(H + 0.3 * H, 6);
+    expect(f.x).toBeCloseTo(-55, 6);
+    BOX.width = 550;
+    BOX.height = (550 * f.h) / f.w;
+    const k = BOX.width / f.w;
+    const { onApply } = setup(g);
+    const at = (p: [number, number]) => ({ clientX: BOX.left + (p[0] - f.x) * k, clientY: BOX.top + (p[1] - f.y) * k });
+    // The suggested candidate puts the bottom-left corner on the photo's edge (165, 1100); the paper really ends
+    // 15% further down (y = 1265) — and then a little more, past the frame drawn on screen (y = 1480).
+    const handle = screen.getByRole("button", { name: /Bottom-left corner/ });
+    const from = at([165, 1100]);
+    const to = at([150, 1265]);
+    fireEvent.pointerDown(handle, { pointerId: 3, button: 0, pointerType: "touch", ...from });
+    fireEvent.pointerMove(handle, { pointerId: 3, ...to });
+    expect(handle).toHaveAccessibleName(/x 150, y 1265/);
+    const past = at([150, 1480]);
+    fireEvent.pointerMove(handle, { pointerId: 3, ...past });
+    expect(handle).toHaveAccessibleName(/x 150, y 1480/); // not stopped at the frame's edge (1430)
+    fireEvent.pointerUp(handle, { pointerId: 3 });
+    // When the drag ends, the frame grows to show the corner with room around it.
+    const photo = await screen.findByAltText("The photo as it was uploaded");
+    const grown = frame(g, [[150, 1480]]);
+    expect(grown.y + grown.h).toBeCloseTo(1480 + 55, 6);
+    expect(parseFloat(photo.style.height)).toBeCloseTo((H / grown.h) * 100, 3); // the style keeps 4 decimals
+    expect(parseFloat(handle.style.top)).toBeCloseTo(((1480 - grown.y) / grown.h) * 100, 3);
+    await userEvent.click(screen.getByTestId("adjust-apply"));
+    expect(onApply.mock.calls[0][0][3]).toEqual([150, 1480]);
+  });
+
+  it("a corner can go as far out as the server accepts, no further", () => {
+    const g = geometry({ preselect: null });
+    const f = frame(g);
+    BOX.width = f.w;
+    BOX.height = f.h; // 1 screen px = 1 source px
+    setup(g);
+    const handle = screen.getByRole("button", { name: /Top-right corner/ });
+    const p = { clientX: BOX.left + (820 - f.x), clientY: BOX.top + (140 - f.y) };
+    fireEvent.pointerDown(handle, { pointerId: 4, button: 0, pointerType: "mouse", ...p });
+    fireEvent.pointerMove(handle, { pointerId: 4, clientX: p.clientX + 1e6, clientY: p.clientY });
+    fireEvent.pointerUp(handle, { pointerId: 4 });
+    const limit = 0.99 * 4 * Math.hypot(W, H);
+    expect(handle).toHaveAccessibleName(new RegExp(`x ${Math.round(limit)}, y 140`));
   });
 
   it("moves a corner with the arrow keys (one screen pixel, ten with Shift)", async () => {
@@ -193,11 +254,55 @@ describe("QuadEditor", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("The corners could not be sent: HTTP 500");
   });
 
+  it("Tab goes through the choices, then the four corners in order, then Cancel and Apply", async () => {
+    setup(geometry({ preselect: null }));
+    // The editor starts on the chosen outline.
+    expect(screen.getByRole("radio", { name: "Found by Mortise" })).toHaveFocus();
+    const order: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      await userEvent.tab();
+      const el = document.activeElement as HTMLElement;
+      order.push(el.dataset.corner ?? el.getAttribute("aria-label") ?? el.textContent ?? "");
+    }
+    const corners = order.filter((x) => ["tl", "tr", "br", "bl"].includes(x));
+    expect(corners).toEqual(["tl", "tr", "br", "bl"]);
+    expect(order.indexOf("tl")).toBeLessThan(order.indexOf("Cancel"));
+    expect(order.indexOf("Cancel")).toBeLessThan(order.indexOf("Corners are right"));
+  });
+
+  it("numbers candidates that share a label; the English reason ends with a full stop before the hint", () => {
+    const alt = (label: string) => ({ corners: ALT, score: 0.5, label });
+    setup(geometry({ alternatives: [alt("另一種框法"), alt("另一種框法"), alt("三條邊＋畫面邊")], preselect: null }), "zh-Hant");
+    const names = within(screen.getByRole("radiogroup")).getAllByRole("radio").map((r) => r.textContent);
+    expect(names).toEqual(["Mortise 找到的", "另一種框法 1", "另一種框法 2", "三條邊＋畫面邊", "整張圖當頁面"]);
+  });
+
+  it("the English reason and the hint are separate sentences", () => {
+    setup(geometry({ status: "curved_edge", review_reason: "紙邊是彎的。" }));
+    const hint = screen.getByText(/Drag the four round handles/).closest("p")!;
+    expect(hint.textContent).toMatch(/so its corners are uncertain\. Drag the four round handles/);
+  });
+
   it("Cancel and Escape leave without sending", async () => {
     const { onApply, onCancel } = setup();
     await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onCancel).toHaveBeenCalledTimes(2);
     expect(onApply).not.toHaveBeenCalled();
+  });
+});
+
+describe("the suggested choice is the corners found", () => {
+  it("shows one chip, not two that frame the same corners", () => {
+    setup(geometry({ corners: ALT, alternatives: [{ corners: ALT, score: 0.8, label: "三條邊＋畫面邊" }], preselect: 0 }));
+    expect(screen.queryByTestId("choice-current")).not.toBeInTheDocument();
+    expect(screen.getByTestId("choice-alt-0")).toBeInTheDocument();
+  });
+  it("keeps 'found by Mortise' when the suggestion differs, or after the user set the corners", () => {
+    setup(geometry());
+    expect(screen.getByTestId("choice-current")).toBeInTheDocument();
+    cleanup();
+    setup(geometry({ corners: ALT, alternatives: [{ corners: ALT, score: 0.8, label: "Mortise 原本找到的" }], preselect: null, user_set: true, status: "user" }));
+    expect(screen.getByTestId("choice-current")).toBeInTheDocument();
   });
 });

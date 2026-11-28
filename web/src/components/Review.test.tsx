@@ -173,6 +173,86 @@ describe("yellow review bar and the corner editor", () => {
     expect(dispatch).toHaveBeenCalledWith({ type: "SET_PAGE", index: 1 });
   });
 
+  it("gives the focus back to what opened the editor (the yellow bar, or the page menu button)", async () => {
+    renderStage(doneState([page()]));
+    const bar = await screen.findByTestId("review-bar");
+    await userEvent.click(bar);
+    await screen.findByTestId("quad-editor");
+    fireEvent.keyDown(window, { key: "Escape" });
+    await vi.waitFor(() => expect(screen.getByTestId("review-bar")).toHaveFocus());
+
+    await userEvent.click(screen.getByRole("button", { name: "Page menu" }));
+    await userEvent.click(screen.getByRole("menuitem", { name: /Adjust the paper's corners/ }));
+    await screen.findByTestId("quad-editor");
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Page menu" })).toHaveFocus());
+  });
+
+  it("asks for the corners again after 'not ready yet' (409): when the editor is opened again, and while it waits", async () => {
+    let ready = false;
+    let calls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/geometry")) {
+          calls++;
+          return ready
+            ? new Response(JSON.stringify(GEO), { status: 200, headers: { "Content-Type": "application/json" } })
+            : new Response(JSON.stringify({ detail: "not yet" }), { status: 409, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response(new Uint8Array([137, 80, 78, 71]), { status: 200, headers: { "Content-Type": "image/png" } });
+      }),
+    );
+    renderStage(doneState([page()]));
+    const bar = await screen.findByTestId("review-bar");
+    await vi.waitFor(() => expect(calls).toBe(1));
+    await userEvent.click(bar);
+    expect(await screen.findByText(/still being processed with your corners/)).toBeInTheDocument();
+    const before = calls;
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    ready = true;
+    await userEvent.click(await screen.findByTestId("review-bar"));
+    expect(await screen.findByTestId("quad-editor")).toBeInTheDocument();
+    expect(calls).toBeGreaterThan(before);
+
+    // Waiting in the editor: asked again by itself every few seconds.
+    ready = false;
+    calls = 0;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { unmount } = renderStage(doneState([page()], { jobId: "j2" }));
+      await act(async () => undefined);
+      fireEvent.click(screen.getAllByTestId("review-bar").at(-1)!);
+      await act(async () => undefined);
+      const waited = calls;
+      ready = true;
+      await act(async () => vi.advanceTimersByTime(3100));
+      await act(async () => undefined);
+      expect(calls).toBeGreaterThan(waited);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the page menu is moved sideways to stay on a narrow screen", async () => {
+    renderStage(doneState([page({ needs_review: false, quad_status: "ok" })]));
+    const spy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      // The menu would reach x = 423 on a 390 px wide screen.
+      if (this.id === "page-menu") return { left: 187, right: 423, width: 236, top: 600, bottom: 700, height: 100, x: 187, y: 600, toJSON: () => ({}) } as DOMRect;
+      return { left: 0, top: 0, width: 390, height: 800, right: 390, bottom: 800, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+    });
+    const cw = vi.spyOn(document.documentElement, "clientWidth", "get").mockReturnValue(390);
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "Page menu" }));
+      expect(screen.getByRole("menu", { name: "Page menu" }).style.transform).toBe("translateX(-45px)"); // 390 − 12 − 423
+    } finally {
+      spy.mockRestore();
+      cw.mockRestore();
+    }
+  });
+
   it("PDF pages cannot be adjusted", async () => {
     renderStage(doneState([page({ input_type: "vector_pdf", needs_review: false, quad_status: null })], { jobFilename: "deck.pdf" }));
     await userEvent.click(screen.getByRole("button", { name: "Page menu" }));
@@ -219,6 +299,18 @@ describe("something is wrong here", () => {
     expect(fb.sent).toEqual([{ page: 1, element_id: "p1-t-1", correct: false, tags: ["font_wrong"] }]);
   });
 
+  it("'This is right' sends {page, element_id, correct: true} once and says it was noted", async () => {
+    const fb = fakeFeedback();
+    renderStage(doneState([page({ needs_review: false })], { editMode: true }), { feedback: fb });
+    await userEvent.click(await screen.findByRole("button", { name: /^Text box: Hello/ }));
+    const right = screen.getByTestId("report-right");
+    expect(right).toHaveTextContent("This is right");
+    await userEvent.click(right);
+    expect(fb.sent).toEqual([{ page: 1, element_id: "p1-t-1", correct: true }]);
+    expect(screen.getByTestId("report-right")).toHaveTextContent("Noted: this is right");
+    expect(screen.getByTestId("report-right")).toBeDisabled();
+  });
+
   it("a problem with the whole page comes from the page menu", async () => {
     const fb = fakeFeedback();
     renderStage(doneState([page({ needs_review: false })]), { feedback: fb });
@@ -260,12 +352,63 @@ describe("page rating in the result card", () => {
     expect(screen.getByTestId("fb-note")).toHaveTextContent("are used to improve recognition");
   });
 
-  it("arrow keys change the rating", async () => {
-    const fb = fakeFeedback({ ratings: { 1: 3 } });
+  it("arrow keys only move the stars; one rating is sent after a pause, not one per key", async () => {
+    vi.useFakeTimers();
+    try {
+      const fb = fakeFeedback({ ratings: { 1: 3 } });
+      renderCard(doneState([page()]), fb);
+      const group = screen.getByRole("radiogroup", { name: "Rate page 1, 1 to 5 stars" });
+      const three = within(group).getByRole("radio", { name: /^3 \/ 5/ });
+      act(() => three.focus());
+      // → → ← ←  : 4, 5, 4, 3 shown in turn; nothing is sent while the keys are pressed.
+      fireEvent.keyDown(three, { key: "ArrowRight" });
+      expect(within(group).getByRole("radio", { name: /^4 \/ 5/ })).toHaveAttribute("aria-checked", "true");
+      fireEvent.keyDown(group, { key: "ArrowRight" });
+      fireEvent.keyDown(group, { key: "ArrowLeft" });
+      expect(within(group).getByRole("radio", { name: /^4 \/ 5/ })).toHaveAttribute("aria-checked", "true");
+      await act(async () => vi.advanceTimersByTime(1000));
+      expect(fb.sent).toEqual([]);
+      fireEvent.keyDown(group, { key: "ArrowRight" });
+      await act(async () => vi.advanceTimersByTime(1600));
+      expect(fb.sent).toEqual([{ page: 1, rating: 5 }]);
+      // Back to the rating the page has (3 here: this stand-in does not update): nothing new is sent.
+      fireEvent.keyDown(group, { key: "ArrowLeft" });
+      fireEvent.keyDown(group, { key: "ArrowRight" });
+      await act(async () => vi.advanceTimersByTime(1600));
+      expect(fb.send).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Enter sends the rating chosen with the keys at once; leaving the stars sends it too", async () => {
+    const fb = fakeFeedback({ ratings: { 1: 2 } });
     renderCard(doneState([page()]), fb);
-    const three = screen.getByRole("radio", { name: /^3 \/ 5/ });
-    act(() => three.focus());
-    fireEvent.keyDown(three, { key: "ArrowRight" });
-    await vi.waitFor(() => expect(fb.sent).toEqual([{ page: 1, rating: 4 }]));
+    const group = screen.getByRole("radiogroup", { name: "Rate page 1, 1 to 5 stars" });
+    const two = within(group).getByRole("radio", { name: /^2 \/ 5/ });
+    act(() => two.focus());
+    fireEvent.keyDown(two, { key: "ArrowRight" });
+    expect(fb.sent).toEqual([]);
+    // Enter on a star is a click on it (a button).
+    fireEvent.click(within(group).getByRole("radio", { name: /^3 \/ 5/ }));
+    await vi.waitFor(() => expect(fb.sent).toEqual([{ page: 1, rating: 3 }]));
+
+    const fb2 = fakeFeedback({ ratings: { 1: 2 } });
+    renderCard(doneState([page()]), fb2);
+    const groups = screen.getAllByRole("radiogroup", { name: "Rate page 1, 1 to 5 stars" });
+    const g2 = groups[groups.length - 1];
+    const star = within(g2).getByRole("radio", { name: /^2 \/ 5/ });
+    act(() => star.focus());
+    fireEvent.keyDown(star, { key: "ArrowLeft" });
+    fireEvent.blur(star, { relatedTarget: document.body });
+    await vi.waitFor(() => expect(fb2.sent).toEqual([{ page: 1, rating: 1 }]));
+    expect(fb2.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("clicking the star already given sends nothing", async () => {
+    const fb = fakeFeedback({ ratings: { 1: 4 } });
+    renderCard(doneState([page()]), fb);
+    await userEvent.click(screen.getByRole("radio", { name: /^4 \/ 5/ }));
+    expect(fb.send).not.toHaveBeenCalled();
   });
 });

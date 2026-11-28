@@ -8,24 +8,64 @@ import { Check, Close, Flag, Star } from "./Icons";
 
 /* ------------------------------------------------------------------ stars */
 
+/** How long the stars wait after the last arrow key before the rating is sent (one rating, not one per key). */
+export const RATE_SETTLE_MS = 1500;
+
 export function RatingStars({ page, value, onRate, disabled }: { page: number; value: number | null; onRate: (n: number) => Promise<void>; disabled?: boolean }) {
   const { t } = useI18n();
   const [hover, setHover] = useState<number | null>(null);
   const [sending, setSending] = useState<number | null>(null);
+  // Chosen with the arrow keys but not sent yet: sent after a short pause, on Enter or Space, or when the focus leaves.
+  const [pending, setPending] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const shown = hover ?? sending ?? value ?? 0;
+  const timer = useRef<number | null>(null);
+  // The key-chosen rating waiting to be sent, with the page and sender it was chosen for.
+  const queued = useRef<{ n: number; was: number | null; send: (n: number) => Promise<void> } | null>(null);
+  const latest = useRef({ value, onRate });
+  latest.current = { value, onRate };
+  const chosen = pending ?? value;
+  const shown = hover ?? sending ?? chosen ?? 0;
+
+  const stopTimer = () => {
+    if (timer.current != null) window.clearTimeout(timer.current);
+    timer.current = null;
+  };
   const rate = async (n: number) => {
-    if (sending != null || disabled) return;
+    stopTimer();
+    queued.current = null;
+    setPending(null);
+    // The same rating again is not a new opinion: nothing is sent.
+    if (sending != null || disabled || n === latest.current.value) return;
     setSending(n);
     setError(null);
     try {
-      await onRate(n);
+      await latest.current.onRate(n);
     } catch (e) {
       setError(t("fb.failed", { msg: e instanceof Error ? e.message : String(e) }));
     } finally {
       setSending(null);
     }
   };
+  const rateRef = useRef(rate);
+  rateRef.current = rate;
+  const flush = () => {
+    const q = queued.current;
+    if (q) void rateRef.current(q.n);
+  };
+
+  // A rating chosen with the keys is still sent (for its own page) when the page changes or the stars go away.
+  useEffect(
+    () => () => {
+      const q = queued.current;
+      queued.current = null;
+      if (timer.current != null) window.clearTimeout(timer.current);
+      timer.current = null;
+      if (q && q.n !== q.was) void q.send(q.n).catch(() => undefined);
+    },
+    [page],
+  );
+  useEffect(() => setPending(null), [page]);
+
   return (
     <div className="rating">
       <div
@@ -33,14 +73,22 @@ export function RatingStars({ page, value, onRate, disabled }: { page: number; v
         role="radiogroup"
         aria-label={t("fb.rateLabel", { n: page })}
         onMouseLeave={() => setHover(null)}
+        onBlur={(e) => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) flush();
+        }}
         onKeyDown={(e) => {
           const step = e.key === "ArrowRight" || e.key === "ArrowUp" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowDown" ? -1 : 0;
-          if (!step) return;
+          if (!step || disabled || sending != null) return;
           e.preventDefault();
           e.stopPropagation();
           const group = e.currentTarget;
-          const next = Math.max(1, Math.min(5, (value ?? 0) + step));
-          void rate(next);
+          const next = Math.max(1, Math.min(5, (chosen ?? 0) + step));
+          // Only shown for now; a quick run of key presses becomes one rating.
+          setPending(next);
+          queued.current = { n: next, was: value, send: onRate };
+          setHover(null);
+          stopTimer();
+          timer.current = window.setTimeout(flush, RATE_SETTLE_MS);
           requestAnimationFrame(() => group.querySelector<HTMLElement>(`[data-star="${next}"]`)?.focus());
         }}
       >
@@ -49,8 +97,8 @@ export function RatingStars({ page, value, onRate, disabled }: { page: number; v
             key={n}
             type="button"
             role="radio"
-            aria-checked={value === n}
-            tabIndex={(value ?? 1) === n ? 0 : -1}
+            aria-checked={chosen === n}
+            tabIndex={(chosen ?? 1) === n ? 0 : -1}
             className={"rating__star" + (n <= shown ? " is-on" : "")}
             data-star={n}
             title={t(`fb.star.${n}` as "fb.star.1")}

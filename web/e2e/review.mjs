@@ -32,12 +32,14 @@ const test = (name, fn) => tests.push({ name, fn });
 
 // Synthetic phone photo (a fictional fixture page), cut off at the bottom so step ② asks for the corners.
 const PHOTO = resolve(WORK, "poster-photo.jpg");
-execFileSync("python3", [resolve(here, "make_photo.py"), PHOTO, "cut", "7"], { cwd: repo, stdio: "inherit" });
+// The generator prints the photo's size and the paper's true corners (source pixels; the cut-off ones lie below the photo).
+const TRUTH = JSON.parse(execFileSync("python3", [resolve(here, "make_photo.py"), PHOTO, "cut", "7"], { cwd: repo }).toString().trim().split("\n").pop());
+console.log(`photo ${TRUTH.size.join("×")} px, true corners ${JSON.stringify(TRUTH.corners)}`);
 
 let browser;
 
-async function newPage(viewport, lang = "zh-Hant") {
-  const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, acceptDownloads: true, locale: lang === "en" ? "en-US" : "zh-TW" });
+async function newPage(viewport, lang = "zh-Hant", extra = {}) {
+  const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, acceptDownloads: true, locale: lang === "en" ? "en-US" : "zh-TW", ...extra });
   await ctx.addInitScript((l) => {
     if (!localStorage.getItem("mortise.lang")) localStorage.setItem("mortise.lang", l);
   }, lang);
@@ -78,6 +80,49 @@ async function convertPhoto(page) {
 
 async function waitStill(page) {
   await page.waitForFunction(() => !document.querySelector(".viewer .spinner"), null, { timeout: 30000 });
+}
+
+/** Where a source pixel is on the screen in the corner editor (the photo box carries its frame). */
+async function sourceToScreen(page, p) {
+  return page.evaluate(([x, y]) => {
+    const box = document.querySelector(".quad-box");
+    const [fx, fy, fw, fh] = box.dataset.frame.split(" ").map(Number);
+    const r = box.getBoundingClientRect();
+    return [r.left + ((x - fx) / fw) * r.width, r.top + ((y - fy) / fh) * r.height];
+  }, p);
+}
+
+/**
+ * Drag a corner handle to a source point, the way a person would: grab it, move there, let go. When the point is
+ * further out than the editor shows, the person drags to the edge, lets go (the editor makes room) and goes on.
+ * `input` is "mouse" or "touch" (real touch events through the browser's DevTools protocol).
+ */
+async function dragCornerTo(page, corner, target, input = "mouse") {
+  const handle = page.locator(`.quad-handle[data-corner="${corner}"]`);
+  const stage = await page.locator(".quad-editor .viewer__stage").boundingBox();
+  const cdp = input === "touch" ? await page.context().newCDPSession(page) : null;
+  let tries = 0;
+  for (; tries < 5; tries++) {
+    const bb = await handle.boundingBox();
+    const from = [bb.x + bb.width / 2, bb.y + bb.height / 2];
+    const want = await sourceToScreen(page, target);
+    const to = [Math.min(stage.x + stage.width - 3, Math.max(stage.x + 3, want[0])), Math.min(stage.y + stage.height - 3, Math.max(stage.y + 3, want[1]))];
+    const steps = 10;
+    if (cdp) {
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: from[0], y: from[1] }] });
+      for (let i = 1; i <= steps; i++) await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: from[0] + ((to[0] - from[0]) * i) / steps, y: from[1] + ((to[1] - from[1]) * i) / steps }] });
+      await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+    } else {
+      await page.mouse.move(from[0], from[1]);
+      await page.mouse.down();
+      for (let i = 1; i <= steps; i++) await page.mouse.move(from[0] + ((to[0] - from[0]) * i) / steps, from[1] + ((to[1] - from[1]) * i) / steps);
+      await page.mouse.up();
+    }
+    await page.waitForTimeout(150);
+    if (Math.abs(to[0] - want[0]) < 0.5 && Math.abs(to[1] - want[1]) < 0.5) break; // reached in one go
+  }
+  if (cdp) await cdp.detach();
+  return { at: cornerFromLabel(await handle.getAttribute("aria-label")), drags: tries + 1 };
 }
 
 function cornerFromLabel(label) {
@@ -126,29 +171,47 @@ test("desktop: yellow bar → drag a corner → apply → re-run → bar gone; r
   });
   console.log("    handles:", geomCheck.map((h) => h.label).join(" | "));
 
-  // 3. Drag the bottom-right corner with the mouse; the magnifier shows while dragging.
+  // 3. The paper goes on below the photo: drag the two bottom corners out to where it really ends.
+  //    The editor leaves room below a photo that cuts the paper off; nothing holds a corner inside the photo.
+  const [W0, H0] = TRUTH.size;
+  const frame0 = (await page.locator(".quad-box").getAttribute("data-frame")).split(" ").map(Number);
+  console.log(`    frame on screen (source px): x ${frame0[0].toFixed(0)}…${(frame0[0] + frame0[2]).toFixed(0)}, y ${frame0[1].toFixed(0)}…${(frame0[1] + frame0[3]).toFixed(0)} (photo ${W0}×${H0})`);
   const br = page.locator('.quad-handle[data-corner="br"]');
-  const startLabel = await br.getAttribute("aria-label");
-  const bb = await br.boundingBox();
-  const cx = bb.x + bb.width / 2;
-  const cy = bb.y + bb.height / 2;
-  await page.mouse.move(cx, cy);
-  await page.mouse.down();
-  for (let i = 1; i <= 8; i++) await page.mouse.move(cx - 3 * i, cy - 2 * i);
-  await page.getByTestId("magnifier").waitFor();
-  await shot(page, "03-desktop-drag-magnifier");
-  await page.mouse.up();
-  const endLabel = await br.getAttribute("aria-label");
-  const p0 = cornerFromLabel(startLabel);
-  const p1 = cornerFromLabel(endLabel);
-  assert(p1[0] < p0[0] && p1[1] < p0[1], `corner moved up-left: ${p0} → ${p1}`);
+  // The magnifier shows while dragging.
+  {
+    const bb = await br.boundingBox();
+    const cx = bb.x + bb.width / 2;
+    const cy = bb.y + bb.height / 2;
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    for (let i = 1; i <= 8; i++) await page.mouse.move(cx - 3 * i, cy + 2 * i);
+    await page.getByTestId("magnifier").waitFor();
+    await shot(page, "03-desktop-drag-magnifier");
+    await page.mouse.up();
+  }
+  const truthBR = TRUTH.corners[2];
+  const truthBL = TRUTH.corners[3];
+  const dBR = await dragCornerTo(page, "br", truthBR);
+  const dBL = await dragCornerTo(page, "bl", truthBL);
+  console.log(`    bottom-right → ${dBR.at} (true ${truthBR}, ${dBR.drags} drag), bottom-left → ${dBL.at} (true ${truthBL}, ${dBL.drags} drag)`);
+  for (const [d, t] of [
+    [dBR, truthBR],
+    [dBL, truthBL],
+  ])
+    assert(Math.hypot(d.at[0] - t[0], d.at[1] - t[1]) <= 2.5, `corner reaches the true corner outside the photo: ${d.at} vs ${t}`);
+  assert(dBR.at[1] > H0 && dBL.at[1] > H0, "both bottom corners are below the photo");
   assert((await page.locator('.quad-choices [aria-checked="true"]').textContent()).includes("你調整的"), "the choice becomes 'yours'");
-  // Keyboard: one step left with the arrow key.
+  await shot(page, "03b-desktop-dragged-outside");
+  // Keyboard: one step left with the arrow key, and back.
   await br.focus();
+  const p1 = cornerFromLabel(await br.getAttribute("aria-label"));
   await page.keyboard.press("ArrowLeft");
   const p2 = cornerFromLabel(await br.getAttribute("aria-label"));
   assert(p2[0] < p1[0] && p2[1] === p1[1], `arrow key moves left: ${p1} → ${p2}`);
+  await page.keyboard.press("ArrowRight");
   const sentQuad = await Promise.all(["tl", "tr", "br", "bl"].map(async (c) => cornerFromLabel(await page.locator(`.quad-handle[data-corner="${c}"]`).getAttribute("aria-label"))));
+  const pagesBefore = await api(`/api/jobs/${jobId}/pages`);
+  const ratioBefore = pagesBefore[0].height_pt / pagesBefore[0].width_pt;
 
   // 4. Apply → the job re-runs from step ② → back to the view, the bar is gone.
   const t0 = Date.now();
@@ -165,7 +228,29 @@ test("desktop: yellow bar → drag a corner → apply → re-run → bar gone; r
   const err = Math.max(...after.corners.map((p, i) => Math.hypot(p[0] - sentQuad[i][0], p[1] - sentQuad[i][1])));
   console.log(`    corners on the server vs the handles: max ${err.toFixed(2)} px (handles show whole pixels)`);
   assert(err <= 1.0, "server corners = the dragged corners (±1 px)");
+  const errTrue = Math.max(...after.corners.map((p, i) => Math.hypot(p[0] - TRUTH.corners[i][0], p[1] - TRUTH.corners[i][1])));
+  const pagesAfter = await api(`/api/jobs/${jobId}/pages`);
+  const ratioAfter = pagesAfter[0].height_pt / pagesAfter[0].width_pt;
+  console.log(`    server corners vs the paper's true corners: max ${errTrue.toFixed(1)} px; page height/width ${ratioBefore.toFixed(3)} → ${ratioAfter.toFixed(3)} (A4 is 1.414)`);
   await shot(page, "04-desktop-after-apply");
+
+  // Leaving the editor with Escape gives the focus back to the page menu button (the yellow bar is gone now).
+  await page.getByTestId("page-menu-button").click();
+  await page.getByRole("menuitem", { name: /調整紙張範圍/ }).click();
+  await page.waitForSelector(".quad-photo", { timeout: 30000 });
+  // Tab goes through the choice, the four corners in order, then Cancel and Apply.
+  const tabOrder = [];
+  for (let i = 0; i < 14; i++) {
+    await page.keyboard.press("Tab");
+    tabOrder.push(await page.evaluate(() => document.activeElement?.dataset.corner ?? document.activeElement?.textContent?.trim() ?? ""));
+  }
+  const cornersInTab = tabOrder.filter((x) => ["tl", "tr", "br", "bl"].includes(x));
+  assert(JSON.stringify(cornersInTab) === JSON.stringify(["tl", "tr", "br", "bl"]), "Tab reaches the four corners in order: " + tabOrder.join(" → "));
+  assert(tabOrder.indexOf("bl") < tabOrder.indexOf("取消"), "corners before Cancel: " + tabOrder.join(" → "));
+  console.log(`    Tab order: ${tabOrder.slice(0, tabOrder.indexOf("取消") + 2).join(" → ")}`);
+  await page.locator('.quad-handle[data-corner="tr"]').focus(); // (the Tabs above went on past the editor)
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => document.activeElement?.getAttribute("data-testid") === "page-menu-button", null, { timeout: 3000 });
 
   // 5. Edit → select an element → "這裡錯了" → tags + one sentence → saved and counted.
   await page.getByRole("button", { name: "修正", exact: true }).click();
@@ -185,14 +270,30 @@ test("desktop: yellow bar → drag a corner → apply → re-run → bar gone; r
   await shot(page, "05-desktop-report-wrong");
   await page.keyboard.press("Escape");
 
-  // 6. Rate the page (4 of 5 stars) in the result card.
-  await page.locator('[data-testid="page-rating"] [data-star="4"]').click();
+  // 6. Rate the page in the result card: a click sends at once; a quick run of arrow keys sends one rating.
+  const ratingPosts = [];
+  page.on("request", (r) => {
+    if (r.method() === "POST" && r.url().endsWith(`/api/jobs/${jobId}/feedback`) && /"rating"/.test(r.postData() ?? "")) ratingPosts.push(JSON.parse(r.postData()).rating);
+  });
+  await page.locator('[data-testid="page-rating"] [data-star="3"]').click();
   await page.waitForFunction(() => /已記下/.test(document.querySelector('[data-testid="page-rating"] [data-testid="fb-saved"]')?.textContent ?? ""));
   const count = await page.locator('[data-testid="page-rating"] [data-testid="fb-saved"]').textContent();
   assert(/2 則回饋/.test(count), "rating counted: " + count);
+  await page.locator('[data-testid="page-rating"] [data-star="3"]').focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowRight");
+  await page.waitForTimeout(600);
+  assert(ratingPosts.length === 1, "arrow keys send nothing while pressed: " + ratingPosts.join(","));
+  await page.waitForTimeout(1800);
+  console.log(`    ratings sent: ${ratingPosts.join(", ")} (one click, then → → ← → )`);
+  assert(JSON.stringify(ratingPosts) === "[3,5]", "one click + one key run = two ratings: " + ratingPosts.join(","));
+  await page.waitForFunction(() => /3 則回饋/.test(document.querySelector('[data-testid="page-rating"] [data-testid="fb-saved"]')?.textContent ?? ""));
   await shot(page, "06-desktop-rated");
   const listed = await api(`/api/jobs/${jobId}/feedback`);
-  assert(listed.items.length === 2 && listed.items.some((x) => x.rating === 4 && x.page === 1), "server has the rating");
+  const ratings = listed.items.filter((x) => x.rating != null).map((x) => x.rating);
+  assert(listed.items.length === 3 && JSON.stringify(ratings) === "[3,5]", "server has the two ratings: " + JSON.stringify(ratings));
   assert(listed.items.some((x) => x.correct === false && x.tags.includes("text_wrong") && x.tags.includes("font_wrong") && x.element_id), "server has the report");
   assert(listed.corrections >= 1, "the corners correction is counted");
 
@@ -224,8 +325,8 @@ test("desktop: yellow bar → drag a corner → apply → re-run → bar gone; r
   await page.context().close();
 });
 
-test("mobile: yellow bar and the corner editor fit a phone; touch-size handles; cancel", async () => {
-  const page = await newPage({ width: 390, height: 844 });
+test("mobile: yellow bar and the corner editor fit a phone; touch-size handles; touch drag past the photo; cancel", async () => {
+  const page = await newPage({ width: 390, height: 844 }, "zh-Hant", { hasTouch: true });
   const { jobId } = await convertPhoto(page);
   const bar = page.getByTestId("review-bar");
   await bar.waitFor({ timeout: 15000 });
@@ -242,19 +343,38 @@ test("mobile: yellow bar and the corner editor fit a phone; touch-size handles; 
   }
   const hb = await page.locator(".quad-handle").first().boundingBox();
   assert(hb.width >= 40 && hb.height >= 40, "handle hit area ≥ 40 px: " + hb.width);
-  // Drag a corner a little (mouse stands in for the finger) and show the magnifier.
+  // Every choice is on screen (the chips wrap instead of scrolling sideways).
+  const vw = 390;
+  const chips = await page.locator(".quad-chip").evaluateAll((els) => els.map((e) => { const r = e.getBoundingClientRect(); return { l: r.left, r: r.right, t: e.textContent }; }));
+  for (const c of chips) assert(c.l >= 0 && c.r <= vw, `chip on screen: ${c.t} ${c.l.toFixed(0)}–${c.r.toFixed(0)}`);
+  console.log(`    chips: ${chips.map((c) => c.t).join(" | ")}`);
+  // A real touch drag (touch events through the browser) takes the bottom-left corner below the photo, where the paper ends.
   const tl = page.locator('.quad-handle[data-corner="tl"]');
   const b = await tl.boundingBox();
-  await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
-  await page.mouse.down();
-  for (let i = 1; i <= 6; i++) await page.mouse.move(b.x + b.width / 2 + 2 * i, b.y + b.height / 2 + 2 * i);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [{ x: b.x + b.width / 2, y: b.y + b.height / 2 }] });
+  for (let i = 1; i <= 6; i++) await cdp.send("Input.dispatchTouchEvent", { type: "touchMove", touchPoints: [{ x: b.x + b.width / 2 + 2 * i, y: b.y + b.height / 2 + 2 * i }] });
   await page.getByTestId("magnifier").waitFor();
   await shot(page, "09-mobile-adjust-drag");
-  await page.mouse.up();
+  await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  await cdp.detach();
+  const dBL = await dragCornerTo(page, "bl", TRUTH.corners[3], "touch");
+  console.log(`    touch: bottom-left → ${dBL.at} (true ${TRUTH.corners[3]}, ${dBL.drags} drag)`);
+  assert(Math.hypot(dBL.at[0] - TRUTH.corners[3][0], dBL.at[1] - TRUTH.corners[3][1]) <= 4, `touch drag reaches the true corner: ${dBL.at}`);
+  assert(dBL.at[1] > TRUTH.size[1], "the corner is below the photo");
+  await shot(page, "09b-mobile-dragged-outside");
   await page.getByRole("button", { name: "取消" }).click();
   await page.getByTestId("review-bar").waitFor();
   const g = await api(`/api/jobs/${jobId}/pages/1/geometry`);
   assert(g.needs_review === true, "cancel sent nothing");
+  await page.waitForFunction(() => document.activeElement?.getAttribute("data-testid") === "review-bar", null, { timeout: 3000 });
+  // The page menu stays on the screen.
+  await page.getByTestId("page-menu-button").click();
+  const menu = await page.locator("#page-menu").boundingBox();
+  console.log(`    page menu: x ${menu.x.toFixed(0)}–${(menu.x + menu.width).toFixed(0)} on a ${vw} px screen`);
+  assert(menu.x >= 0 && menu.x + menu.width <= vw, "page menu on screen");
+  await shot(page, "10-mobile-page-menu");
+  await page.keyboard.press("Escape");
   // Clean up the extra job.
   await fetch(`${BASE}/api/jobs/${jobId}`, { method: "DELETE" });
   assert(page.errors.length === 0, "no page errors: " + page.errors.join("; "));

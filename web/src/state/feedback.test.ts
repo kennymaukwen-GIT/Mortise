@@ -1,5 +1,5 @@
 import type { FeedbackItem } from "../api/types";
-import { ELEMENT_TAGS, latestRatings, MAX_COMMENT, PAGE_TAGS, ratingFeedback, reportedElements, reportFeedback, tagsFor } from "./feedback";
+import { confirmedElements, confirmFeedback, ELEMENT_TAGS, latestRatings, MAX_COMMENT, PAGE_TAGS, ratingFeedback, reportedElements, reportFeedback, tagsFor } from "./feedback";
 
 const CONTRACT_TAGS = ["text_wrong", "font_wrong", "size_wrong", "color_wrong", "position_wrong", "missing", "extra", "table_wrong", "layout_broken", "corners_wrong", "other"];
 
@@ -52,5 +52,19 @@ describe("reading the sent feedback back", () => {
   });
   it("knows which elements were reported wrong", () => {
     expect([...reportedElements(items)]).toEqual(["p1-t-1"]);
+  });
+});
+
+describe("this is right", () => {
+  it("is a confirmation of one element", () => {
+    expect(confirmFeedback(2, "p2-t-3")).toEqual({ page: 2, element_id: "p2-t-3", correct: true });
+  });
+  it("lists the elements already confirmed", () => {
+    const items = [
+      { id: "1", element_id: "a", correct: true },
+      { id: "2", element_id: "b", correct: false },
+      { id: "3", rating: 4, page: 1 },
+    ];
+    expect([...confirmedElements(items as never)]).toEqual(["a"]);
   });
 });

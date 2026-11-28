@@ -48,6 +48,18 @@ export function reportFeedback(page: number, elementId: string | null, tags: Ite
   return { ok: true, body };
 }
 
+/** "This is right": the user looked at an element and it is correct (the "seen but not changed" data calibration needs). */
+export function confirmFeedback(page: number, elementId: string): FeedbackIn {
+  return { page, element_id: elementId, correct: true };
+}
+
+/** Elements the user said are right (by element id). */
+export function confirmedElements(items: FeedbackItem[]): Set<string> {
+  const out = new Set<string>();
+  for (const it of items) if (it.element_id && it.correct === true) out.add(it.element_id);
+  return out;
+}
+
 /** The latest rating given to each page (1-based page → 1..5). */
 export function latestRatings(items: FeedbackItem[]): Record<number, number> {
   const out: Record<number, number> = {};

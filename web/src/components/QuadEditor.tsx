@@ -8,10 +8,14 @@ import { hasCjk } from "../lib/errors";
 import {
   CORNERS,
   checkQuad,
+  dragBounds,
+  endSentence,
   frameFor,
   initialChoice,
   isFullImage,
   magnifierPlace,
+  marginsFor,
+  numberedLabels,
   nudge,
   quadOf,
   sameQuad,
@@ -47,10 +51,25 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
   const uid = useId();
   const W = g.source.width;
   const H = g.source.height;
-  const frame = useMemo(() => frameFor(W, H, [g.corners, ...g.alternatives.map((a) => a.corners), g.outline ?? []]), [g, W, H]);
   const start = useMemo(() => initialChoice(g), [g]);
   const [choice, setChoice] = useState<QuadChoice>(start);
-  const [quad, setQuad] = useState<Quad>(() => quadOf(start, g) ?? g.corners);
+  const [quad, setQuadState] = useState<Quad>(() => quadOf(start, g) ?? g.corners);
+  // The corners as they are right now (pointer events can come faster than renders) …
+  const live = useRef<Quad>(quad);
+  const setQuad = (q: Quad) => {
+    live.current = q;
+    setQuadState(q);
+  };
+  // … and as they were when the last drag or key press ended. The frame on screen follows these, not every move:
+  // changing it mid-drag would move the photo under the finger.
+  const [settled, setSettled] = useState<Quad>(quad);
+  const candidates = useMemo(() => [g.corners, ...g.alternatives.map((a) => a.corners), g.outline ?? []], [g]);
+  const margins = useMemo(() => marginsFor(W, H, candidates), [W, H, candidates]);
+  const frame = useMemo(() => frameFor(W, H, [...candidates, settled], margins), [W, H, candidates, settled, margins]);
+  const bounds = useMemo(() => dragBounds(W, H), [W, H]);
+  // Some side of the photo seems to cut the paper off (it got the wide margin): say corners may go past the edge.
+  const narrow = 0.05 * Math.max(W, H);
+  const cutOff = g.status === "cut_off" || Object.values(margins).some((m) => m > narrow + 1e-6);
   const [img, setImg] = useState<{ src: string } | null>(null);
   const [imgError, setImgError] = useState(false);
   const [active, setActive] = useState<number | null>(null);
@@ -114,6 +133,7 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
     if (!q) return;
     setChoice(c);
     setQuad(q);
+    setSettled(q);
     setError(null);
   };
 
@@ -136,8 +156,10 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
     if (!d || d.id !== e.pointerId) return;
     const r = rect();
     if (!r) return;
+    // Not kept inside the frame: paper cut off by the photo's edge has its corner out there. The frame grows to show
+    // the corner when the drag ends.
     const p = screenToSource(e.clientX - d.dx, e.clientY - d.dy, frame, r);
-    setQuad((q) => setCorner(q, d.i, p, frame));
+    setQuad(setCorner(live.current, d.i, p, bounds));
     setChoice({ kind: "custom" });
     setError(null);
   };
@@ -147,6 +169,7 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
     drag.current = null;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
     setActive(null);
+    setSettled(live.current);
   };
   const onHandleKey = (e: React.KeyboardEvent, i: number) => {
     const dirs: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
@@ -156,7 +179,7 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
     e.stopPropagation();
     const r = rect();
     const step = (r ? sourcePerScreenPx(frame, r) : 1) * (e.shiftKey ? 10 : 1);
-    setQuad((q) => nudge(q, i, d[0] * step, d[1] * step, frame));
+    setQuad(nudge(live.current, i, d[0] * step, d[1] * step, bounds));
     setChoice({ kind: "custom" });
     setActive(i);
     setError(null);
@@ -185,9 +208,16 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
   };
 
   const cornerName = (i: number) => t(`adjust.corner.${CORNERS[i]}` as "adjust.corner.tl");
-  const altLabel = (i: number, label: string) => (lang === "zh-Hant" || !hasCjk(label) ? label : t("adjust.alt", { n: i + 1 }));
+  // Candidates with the same label get numbers; a Chinese label in the English interface becomes "Option n".
+  const shownLabels = numberedLabels(g.alternatives.map((a) => a.label));
+  // The suggested choice is the same corners as "found by Mortise" (e.g. cut off: "three edges + photo edge"): show one chip, not two.
+  const pre = g.preselect != null ? g.alternatives[g.preselect] : undefined;
+  const currentIsPreselected = !g.user_set && !!pre && sameQuad(pre.corners, g.corners);
+  const altLabel = (i: number) => (lang === "zh-Hant" || !hasCjk(g.alternatives[i].label) ? shownLabels[i] : t("adjust.alt", { n: i + 1 }));
   const changed = !sameQuad(quad, g.corners);
   const full = isFullImage(quad, W, H);
+  // Darken everything outside the corners; a corner being dragged past the frame is still inside the darkened box.
+  const shade = frameFor(W, H, [[[frame.x, frame.y], [frame.x + frame.w, frame.y + frame.h]], quad], 0);
   const imgPct = { left: `${(-frame.x / frame.w) * 100}%`, top: `${(-frame.y / frame.h) * 100}%`, width: `${(W / frame.w) * 100}%`, height: `${(H / frame.h) * 100}%` };
   const reason = g.review_reason && (lang === "zh-Hant" || !hasCjk(g.review_reason)) ? g.review_reason : g.needs_review ? t(reasonKey(g.status)) : "";
 
@@ -232,11 +262,43 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
 
   return (
     <div className="quad-editor" ref={root} data-testid="quad-editor">
+      {/* Before the photo in the page, so Tab goes: choices → the four corners → zoom → Cancel / Apply. */}
+      <div className="quad-top" ref={topBar}>
+        <div className="quad-top__row">
+          <h2 className="quad-title">{t("adjust.title")}</h2>
+          <div className="quad-choices" role="radiogroup" aria-label={t("adjust.choices")} onKeyDown={(e) => radioKeys(e)}>
+            {!currentIsPreselected && (
+              <ChoiceChip checked={choice.kind === "current"} onClick={() => choose({ kind: "current" })} label={g.user_set ? t("adjust.yours") : t("adjust.current")} testid="choice-current" />
+            )}
+            {g.alternatives.map((a, i) => (
+              <ChoiceChip
+                key={i}
+                checked={choice.kind === "alt" && choice.index === i}
+                onClick={() => choose({ kind: "alt", index: i })}
+                label={altLabel(i)}
+                lang={hasCjk(a.label) && lang === "zh-Hant" ? "zh-Hant" : undefined}
+                hint={g.preselect === i ? t("adjust.suggested") : undefined}
+                testid={`choice-alt-${i}`}
+              />
+            ))}
+            <ChoiceChip checked={choice.kind === "full" || (choice.kind === "custom" && full)} onClick={() => choose({ kind: "full" })} label={t("adjust.full")} testid="choice-full" />
+            {choice.kind === "custom" && !full && <ChoiceChip checked onClick={() => undefined} label={t("adjust.custom")} testid="choice-custom" />}
+          </div>
+        </div>
+        <p className="quad-hint" id={uid + "-keys"}>
+          {reason && <span className="quad-hint__reason">{endSentence(reason)} </span>}
+          {t("adjust.hint")}
+          {cutOff ? " " + t("adjust.hintOutside") : ""}
+          <span className="quad-hint__keys"> {t("adjust.hintKeys")}</span>
+          {g.outline && g.outline.length > 2 ? " " + t("adjust.outlineLegend") : ""}
+        </p>
+      </div>
+
       <Viewer aspect={frame.w / frame.h} resetKey={`adjust:${jobId}:${g.page}`} label={t("adjust.viewer")} inset={{ top: bars.top, right: 20, bottom: bars.bottom, left: 20 }}>
         {(info) => {
           const inv = 1 / info.zoom;
           return (
-            <div className="quad-box" ref={box} style={{ "--quad-stroke": `${2 * inv}px` } as React.CSSProperties}>
+            <div className="quad-box" ref={box} style={{ "--quad-stroke": `${2 * inv}px` } as React.CSSProperties} data-frame={`${frame.x} ${frame.y} ${frame.w} ${frame.h}`}>
               {img && <img className="quad-photo" src={img.src} alt={t("adjust.photoAlt")} style={imgPct} draggable={false} />}
               {!img && !imgError && <span className="spinner" aria-hidden="true" />}
               {imgError && (
@@ -249,7 +311,7 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
                 <path
                   className="quad-svg__shade"
                   fillRule="evenodd"
-                  d={`M${frame.x},${frame.y}h${frame.w}v${frame.h}h${-frame.w}Z M${svgPoints(quad).replace(/ /g, " L")}Z`}
+                  d={`M${shade.x},${shade.y}h${shade.w}v${shade.h}h${-shade.w}Z M${svgPoints(quad).replace(/ /g, " L")}Z`}
                 />
                 {g.outline && g.outline.length > 2 && <polygon className="quad-svg__outline" points={svgPoints(g.outline)} vectorEffect="non-scaling-stroke" data-testid="outline" />}
                 <polygon className="quad-svg__quad-halo" points={svgPoints(quad)} vectorEffect="non-scaling-stroke" />
@@ -273,8 +335,16 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
                     onPointerUp={onHandleUp}
                     onPointerCancel={onHandleUp}
                     onKeyDown={(e) => onHandleKey(e, i)}
-                    onKeyUp={() => setActive((a) => (drag.current ? a : null))}
-                    onBlur={() => !drag.current && setActive(null)}
+                    onKeyUp={() => {
+                      if (drag.current) return;
+                      setActive(null);
+                      setSettled(live.current);
+                    }}
+                    onBlur={() => {
+                      if (drag.current) return;
+                      setActive(null);
+                      setSettled(live.current);
+                    }}
                   >
                     <span className="quad-handle__dot" />
                   </button>
@@ -284,34 +354,6 @@ export function QuadEditor({ jobId, geometry: g, onApply, onCancel }: QuadEditor
           );
         }}
       </Viewer>
-
-      <div className="quad-top" ref={topBar}>
-        <div className="quad-top__row">
-          <h2 className="quad-title">{t("adjust.title")}</h2>
-          <div className="quad-choices" role="radiogroup" aria-label={t("adjust.choices")} onKeyDown={(e) => radioKeys(e)}>
-            <ChoiceChip checked={choice.kind === "current"} onClick={() => choose({ kind: "current" })} label={g.user_set ? t("adjust.yours") : t("adjust.current")} testid="choice-current" />
-            {g.alternatives.map((a, i) => (
-              <ChoiceChip
-                key={i}
-                checked={choice.kind === "alt" && choice.index === i}
-                onClick={() => choose({ kind: "alt", index: i })}
-                label={altLabel(i, a.label)}
-                lang={hasCjk(a.label) && lang === "zh-Hant" ? "zh-Hant" : undefined}
-                hint={g.preselect === i ? t("adjust.suggested") : undefined}
-                testid={`choice-alt-${i}`}
-              />
-            ))}
-            <ChoiceChip checked={choice.kind === "full" || (choice.kind === "custom" && full)} onClick={() => choose({ kind: "full" })} label={t("adjust.full")} testid="choice-full" />
-            {choice.kind === "custom" && !full && <ChoiceChip checked onClick={() => undefined} label={t("adjust.custom")} testid="choice-custom" />}
-          </div>
-        </div>
-        <p className="quad-hint" id={uid + "-keys"}>
-          {reason && <span className="quad-hint__reason">{reason} </span>}
-          {t("adjust.hint")}
-          <span className="quad-hint__keys"> {t("adjust.hintKeys")}</span>
-          {g.outline && g.outline.length > 2 ? " " + t("adjust.outlineLegend") : ""}
-        </p>
-      </div>
 
       {magnifier}
 

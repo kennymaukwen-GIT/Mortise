@@ -8,6 +8,7 @@ flat：整張紙都在畫面裡（通常不必確認）。
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -40,4 +41,5 @@ if __name__ == "__main__":
     mode = sys.argv[2] if len(sys.argv) > 2 else "cut"
     seed = int(sys.argv[3]) if len(sys.argv) > 3 else 7
     target.parent.mkdir(parents=True, exist_ok=True)
-    print(make(target, mode, seed))
+    # 一行 JSON：照片大小與紙的四個角的真值（原圖像素，左上、右上、右下、左下；切掉的角在畫面外）
+    print(json.dumps(make(target, mode, seed)))

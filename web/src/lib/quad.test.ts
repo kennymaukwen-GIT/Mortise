@@ -3,12 +3,16 @@ import {
   checkQuad,
   clampToFrame,
   cornersCorrection,
+  dragBounds,
+  endSentence,
   frameFor,
   fullImageQuad,
   initialChoice,
   isClockwiseConvex,
   isFullImage,
   magnifierPlace,
+  marginsFor,
+  numberedLabels,
   nudge,
   orderQuad,
   quadOf,
@@ -112,6 +116,67 @@ describe("frameFor", () => {
   it("ignores absurd points", () => {
     const f = frameFor(W, H, [[[1e9, 5]]], 0);
     expect(f).toEqual({ x: 0, y: 0, w: W, h: H });
+  });
+
+  it("per-side margins: wide room below a photo that cuts the paper off, and room around a corner further out", () => {
+    const m = { top: 55, right: 55, bottom: 330, left: 55 };
+    // Corners on the photo's bottom edge: the frame reaches 30% below it.
+    expect(frameFor(W, H, [geo().alternatives[0].corners], m)).toEqual({ x: -55, y: -55, w: 1110, h: 1100 + 55 + 330 });
+    // A corner dragged 15% below the photo stays inside that room …
+    expect(frameFor(W, H, [[[150, 1265]]], m).h).toBe(1100 + 55 + 330);
+    // … and one further out than the room grows the frame, with the narrow margin around it.
+    expect(frameFor(W, H, [[[150, 1500]]], m)).toEqual({ x: -55, y: -55, w: 1110, h: 1500 + 55 + 55 });
+  });
+});
+
+describe("marginsFor", () => {
+  it("widens only the side a candidate touches or crosses", () => {
+    const g = geo();
+    // Q's bottom corners are below the photo; the candidate's sit on its edge.
+    expect(marginsFor(W, H, [g.corners, g.alternatives[0].corners])).toEqual({ top: 55, right: 55, bottom: 330, left: 55 });
+    // Paper cut off on the right (x = 1000): 30% of the photo's width there.
+    const right: [number, number][] = [
+      [200, 100],
+      [1000, 120],
+      [1000, 900],
+      [210, 950],
+    ];
+    expect(marginsFor(W, H, [right])).toEqual({ top: 55, right: 300, bottom: 55, left: 55 });
+  });
+
+  it("paper well inside the photo, or 'the whole image': narrow margins all round", () => {
+    const inside: [number, number][] = [
+      [100, 100],
+      [900, 100],
+      [900, 1000],
+      [100, 1000],
+    ];
+    expect(marginsFor(W, H, [inside, fullImageQuad(W, H)])).toEqual({ top: 55, right: 55, bottom: 55, left: 55 });
+  });
+});
+
+describe("how far a corner may go", () => {
+  it("anywhere the server accepts (4 × the photo's diagonal), a little inside", () => {
+    const b = dragBounds(W, H);
+    const limit = 4 * Math.hypot(W, H);
+    expect(b.x).toBeCloseTo(-0.99 * limit, 6);
+    expect(b.x + b.w).toBeCloseTo(0.99 * limit, 6);
+    // 15% below the photo is not held back (it used to stop 5% below).
+    expect(nudge(fullImageQuad(W, H), 3, 0, 0.15 * H, b)[3]).toEqual([0, 1265]);
+    expect(nudge(fullImageQuad(W, H), 1, 1e9, 0, b)[1][0]).toBeCloseTo(0.99 * limit, 6);
+  });
+});
+
+describe("chip labels and sentences", () => {
+  it("numbers labels that appear more than once", () => {
+    expect(numberedLabels(["另一種框法", "三條邊＋畫面邊", "另一種框法", "另一種框法"])).toEqual(["另一種框法 1", "三條邊＋畫面邊", "另一種框法 2", "另一種框法 3"]);
+    expect(numberedLabels(["a", "b"])).toEqual(["a", "b"]);
+  });
+  it("ends a sentence with the right full stop", () => {
+    expect(endSentence("The paper's edges are curved, so its corners are uncertain")).toBe("The paper's edges are curved, so its corners are uncertain.");
+    expect(endSentence("紙邊是彎的")).toBe("紙邊是彎的。");
+    expect(endSentence("已經有句點。")).toBe("已經有句點。");
+    expect(endSentence("Done. ")).toBe("Done.");
   });
 });
 

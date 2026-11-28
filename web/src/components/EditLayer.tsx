@@ -4,9 +4,9 @@ import type { Box, CorrectionIn, FeedbackIn, PageElements, TextBoxInfo } from ".
 import { useI18n } from "../i18n/I18n";
 import { hasCjk, visibleIssues } from "../lib/errors";
 import { diffForm, initialForm, normalizeHex, type TextForm } from "../state/corrections";
-import { tagsFor } from "../state/feedback";
+import { confirmFeedback, tagsFor } from "../state/feedback";
 import { ReportForm } from "./Feedback";
-import { Caret, Close, Flag } from "./Icons";
+import { Caret, Check, Close, Flag } from "./Icons";
 
 /** "Something is wrong here" inside the element panel. */
 export interface ElementReport {
@@ -16,6 +16,8 @@ export interface ElementReport {
   consented: boolean | null;
   /** Elements already reported as wrong. */
   reported: Set<string>;
+  /** Elements the user already said are right. */
+  confirmed?: Set<string>;
 }
 
 const LOW = 0.7;
@@ -96,6 +98,9 @@ export function EditDialog({ elements, elementId, page, onClose, onApply, report
     setError(null);
   }, [before]);
   useEffect(() => setReportOpen(!tb), [elementId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // "This is right" (POST …/feedback {page, element_id, correct: true}).
+  const [right, setRight] = useState<"idle" | "sending" | "done" | "error">("idle");
+  useEffect(() => setRight("idle"), [elementId]);
 
   useEffect(() => {
     // Start in the first text field (the close button comes first in the markup).
@@ -270,6 +275,32 @@ export function EditDialog({ elements, elementId, page, onClose, onApply, report
 
         {report && (
           <section className="dialog__report" aria-label={t("fb.wrong")}>
+            <div className="report-right">
+              <button
+                type="button"
+                className={"btn btn--small report-right__btn " + (right === "done" || report.confirmed?.has(el.id) ? "btn--primary is-done" : "btn--outline")}
+                disabled={right === "sending" || right === "done" || !!report.confirmed?.has(el.id)}
+                aria-pressed={right === "done" || !!report.confirmed?.has(el.id)}
+                onClick={async () => {
+                  setRight("sending");
+                  try {
+                    await report.onSend(confirmFeedback(page, el.id));
+                    setRight("done");
+                  } catch {
+                    setRight("error");
+                  }
+                }}
+                data-testid="report-right"
+              >
+                <Check size={15} />
+                {right === "done" || report.confirmed?.has(el.id) ? t("fb.rightDone") : t("fb.right")}
+              </button>
+              {right === "error" && (
+                <span className="report-right__error" role="alert">
+                  {t("fb.rightFailed")}
+                </span>
+              )}
+            </div>
             <button
               type="button"
               className={"report-toggle" + (reportOpen ? " is-open" : "")}

@@ -42,42 +42,91 @@ export function sourcePerScreenPx(frame: Frame, rect: ScreenRect): number {
   return frame.w / Math.max(1e-9, rect.width);
 }
 
+/** Room kept around the photo on each side, in source pixels. */
+export interface Margins {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/** The server refuses corners further out than this (s2_page: four times the photo's diagonal, on either axis). */
+export function cornerLimit(width: number, height: number): number {
+  return 4 * Math.hypot(width, height);
+}
+
 /**
- * The part of the photo to show: the whole image plus any corner that lies outside it
- * (paper cut off by the edge of the photo), with a margin so corners on the edge can still be grabbed.
+ * Where a corner may be dragged: anywhere the server accepts, a little inside its limit. Paper cut off by the edge of
+ * the photo has its real corner outside the photo, so corners are not kept inside what happens to be on screen.
  */
-export function frameFor(width: number, height: number, quads: Pt[][], margin = 0.05): Frame {
-  let x0 = 0;
-  let y0 = 0;
-  let x1 = width;
-  let y1 = height;
-  const limit = 4 * Math.hypot(width, height); // the server refuses corners further out than this
+export function dragBounds(width: number, height: number): Frame {
+  const l = 0.99 * cornerLimit(width, height);
+  return { x: -l, y: -l, w: 2 * l, h: 2 * l };
+}
+
+/**
+ * Room to leave around the photo on each side. A side that a candidate's corner (or the curved outline) touches or
+ * goes past most likely cuts the paper off, so it gets a wide margin (a share of the photo's size across that side):
+ * the real corner can then be dragged straight out to where the paper ends. Other sides get a narrow margin.
+ * "The whole image" says nothing about the paper and is left out.
+ */
+export function marginsFor(width: number, height: number, quads: Pt[][], narrow = 0.05, wide = 0.3, touch = 0.015): Margins {
+  const n = narrow * Math.max(width, height);
+  const m: Margins = { top: n, right: n, bottom: n, left: n };
+  const limit = cornerLimit(width, height);
+  for (const q of quads) {
+    if (q.length === 4 && isFullImage(q as Quad, width, height)) continue;
+    for (const p of q) {
+      if (!Number.isFinite(p[0]) || !Number.isFinite(p[1]) || Math.abs(p[0]) > limit || Math.abs(p[1]) > limit) continue;
+      if (p[0] <= touch * width) m.left = Math.max(m.left, wide * width);
+      if (p[0] >= width - touch * width) m.right = Math.max(m.right, wide * width);
+      if (p[1] <= touch * height) m.top = Math.max(m.top, wide * height);
+      if (p[1] >= height - touch * height) m.bottom = Math.max(m.bottom, wide * height);
+    }
+  }
+  return m;
+}
+
+/**
+ * The part of the photo to show: the whole image with `margin` around it (a share of the photo's longer side, or
+ * per side in source pixels), grown to show any corner that lies further out, with room around that corner too
+ * (the narrowest margin), so it can still be grabbed.
+ */
+export function frameFor(width: number, height: number, quads: Pt[][], margin: number | Margins = 0.05): Frame {
+  const m: Margins = typeof margin === "number" ? { top: 0, right: 0, bottom: 0, left: 0 } : margin;
+  if (typeof margin === "number") m.top = m.right = m.bottom = m.left = margin * Math.max(width, height);
+  const pad = Math.min(m.top, m.right, m.bottom, m.left);
+  let x0 = 0 - m.left; // (not -m.left: that gives -0)
+  let y0 = 0 - m.top;
+  let x1 = width + m.right;
+  let y1 = height + m.bottom;
+  const limit = cornerLimit(width, height); // the server refuses corners further out than this
   for (const q of quads)
     for (const p of q) {
       if (!Number.isFinite(p[0]) || !Number.isFinite(p[1]) || Math.abs(p[0]) > limit || Math.abs(p[1]) > limit) continue;
-      x0 = Math.min(x0, p[0]);
-      y0 = Math.min(y0, p[1]);
-      x1 = Math.max(x1, p[0]);
-      y1 = Math.max(y1, p[1]);
+      x0 = Math.min(x0, p[0] - pad);
+      y0 = Math.min(y0, p[1] - pad);
+      x1 = Math.max(x1, p[0] + pad);
+      y1 = Math.max(y1, p[1] + pad);
     }
-  const m = margin * Math.max(width, height);
-  return { x: x0 - m, y: y0 - m, w: x1 - x0 + 2 * m, h: y1 - y0 + 2 * m };
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 export function clampToFrame(p: Pt, frame: Frame): Pt {
   return [Math.min(frame.x + frame.w, Math.max(frame.x, p[0])), Math.min(frame.y + frame.h, Math.max(frame.y, p[1]))];
 }
 
-/** Move corner `i` by (dx, dy) source pixels, staying inside the frame. */
-export function nudge(q: Quad, i: number, dx: number, dy: number, frame: Frame): Quad {
+/** Move corner `i` by (dx, dy) source pixels, staying inside `bounds` (see dragBounds). */
+export function nudge(q: Quad, i: number, dx: number, dy: number, bounds: Frame): Quad {
   const out = q.map((p) => [p[0], p[1]] as Pt) as Quad;
-  out[i] = clampToFrame([q[i][0] + dx, q[i][1] + dy], frame);
+  out[i] = clampToFrame([q[i][0] + dx, q[i][1] + dy], bounds);
   return out;
 }
 
-export function setCorner(q: Quad, i: number, p: Pt, frame: Frame): Quad {
+/** Put corner `i` at `p` (source pixels), staying inside `bounds` (see dragBounds). */
+export function setCorner(q: Quad, i: number, p: Pt, bounds: Frame): Quad {
   const out = q.map((c) => [c[0], c[1]] as Pt) as Quad;
-  out[i] = clampToFrame(p, frame);
+  out[i] = clampToFrame(p, bounds);
   return out;
 }
 
@@ -199,4 +248,27 @@ export function magnifierPlace(corner: { x: number; y: number }, box: { width: n
   x = Math.max(4, Math.min(box.width - size - 4, x));
   y = Math.max(4, Math.min(box.height - size - 4, y));
   return { x, y };
+}
+
+/**
+ * Candidate labels as shown: labels that appear more than once get a number ("Another outline 1", "… 2"),
+ * so the chips can be told apart. Unique labels stay as they are.
+ */
+export function numberedLabels(labels: string[]): string[] {
+  const seen = new Map<string, number>();
+  for (const l of labels) seen.set(l, (seen.get(l) ?? 0) + 1);
+  const at = new Map<string, number>();
+  return labels.map((l) => {
+    if ((seen.get(l) ?? 0) < 2) return l;
+    const k = (at.get(l) ?? 0) + 1;
+    at.set(l, k);
+    return `${l} ${k}`;
+  });
+}
+
+/** A sentence that ends with a full stop (。 after Chinese, "." otherwise), so another sentence can follow it. */
+export function endSentence(s: string): string {
+  const t = s.trimEnd();
+  if (!t || /[。.!?！？…:：]$/.test(t)) return t;
+  return t + (/[　-鿿＀-￯]$/.test(t) ? "。" : ".");
 }

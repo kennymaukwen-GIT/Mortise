@@ -1982,6 +1982,12 @@ input.field__input {
   bottom: calc(100% + 12px);
   left: -6px;
   right: auto;
+  /* As wide as its longest item (one line each), never wider than the screen; Stage moves it sideways to stay on it. */
+  width: max-content;
+  max-width: calc(100vw - 24px);
+}
+.popover--page .menu-item {
+  white-space: normal;
 }
 
 /* ------------------------------------------------------------------ feedback */
@@ -2066,6 +2072,19 @@ input.field__input {
   margin-top: 14px;
   padding-top: 12px;
   border-top: 1px solid #e3e5e8;
+}
+.report-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.report-right__btn.is-done:disabled {
+  opacity: 1; /* "已記下" stays readable: it is a state, not an unavailable button */
+}
+.report-right__error {
+  color: #b00020;
+  font-size: 13px;
 }
 .report-toggle {
   display: flex;
@@ -2366,6 +2385,17 @@ input.field__input.field__input--light {
   }
   .quad-title {
     display: none;
+  }
+  /* Every choice stays in sight ("whole image" included): the chips wrap instead of scrolling sideways. */
+  .quad-top__row {
+    width: 100%;
+    justify-content: center;
+  }
+  .quad-choices {
+    flex-wrap: wrap;
+    justify-content: center;
+    border-radius: 19px;
+    overflow: visible;
   }
   .quad-hint {
     font-size: 12px;
