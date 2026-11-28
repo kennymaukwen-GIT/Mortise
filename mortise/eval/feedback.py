@@ -40,7 +40,8 @@
   （resolve_value：在該階段的產物中找 id 相符的元素，再找欄位；找不到就留空並標 resolved=false）。
   文字（field = text）取整行或整段的字（不是第一個樣式段），信心值用③的文字信心值（擷取產線是精確的，記 1.0；
   段落取各行最低的）；整個元素（field = element）取⑦報告的元素信心值（網頁上顯示的那個）。
-  網頁的「這個元素是錯的」（issues 裡 correct = false 而且有 element_id）也變成標註資料（kind = flag、corrected = true），
+  網頁的「這個元素是錯的」（issues 裡 correct = false 而且有 element_id），以及對某個元素「回報錯誤」（有 element_id 與標籤、
+  沒填 correct：網頁的回報表單就是這樣送的）也變成標註資料（kind = flag、corrected = true），
   和「這個元素是對的」（confirmation）一起，就是元素層級的校準資料（calibrate --field element）。
   同一份工作從兩個來源進來（自動收的回饋庫、使用者匯出的回饋包）時：修正依修正單 id、確認與標錯依內容只算一次；
   評分、標記、意見要合在一起看時用 merge_feedback（依內容去重）。
@@ -180,6 +181,11 @@ class FlaggedIssue:
     correct: Optional[bool] = None  # False：使用者說這個元素是錯的；None：只是整頁的標籤或意見
     system_value: Any = None  # （選填）被標錯的元素當時的值（文字框是它的字）
     system_confidence: Optional[float] = None  # （選填）被標錯的元素當時的信心值（⑦報告的元素信心值）
+
+
+def is_element_flag(i: "FlaggedIssue") -> bool:
+    """使用者說「這個元素有錯」：明確標了 correct = false，或對某個元素回報了錯誤（有元素編號與標籤、沒填 correct）。"""
+    return bool(i.element_id) and (i.correct is False or (i.correct is None and bool(i.tags)))
 
 
 # 網頁「回報錯誤」的標籤建議值（與回饋 API 契約一致）→ 白話說明
@@ -530,9 +536,22 @@ class FeedbackStore:
                     # 同一個欄位改第二次時，「系統當時的值」其實是使用者上一次改的值（信心值 1.0），不是系統的判斷：標出來，校準時不算
                     was_user = target in user_values.get(s, {}) and _jsonable(user_values[s][target]) == sv.get("system_value")
                     user_values.setdefault(s, {})[target] = c.new_value
+                    extra: dict[str, Any] = {"system_was_user": True} if was_user else {}
+                    corrected = True
+                    if c.field == "corners" and isinstance(sv.get("system_value"), dict):
+                        # 四角：system_value 是第一次自動偵測的快照（api/jobs.corners_snapshot）。使用者的四角和系統的差在容許範圍內
+                        # （within_tolerance）＝使用者其實是確認了系統的四角（例如網頁上直接按「套用」），校準時當成「沒改」。
+                        # 同一頁第二次以後的拖曳（有 previous_user_corners）和第一次比的是同一個系統判斷：標成重複，校準時不算。
+                        snap_v = sv["system_value"]
+                        if snap_v.get("within_tolerance") is True:
+                            corrected = False
+                            extra["within_tolerance"] = True
+                        if snap_v.get("previous_user_corners") is not None:
+                            extra["system_was_user"] = True
+                            extra["repeat_of_auto"] = True
                     rows.append({"sample": s, "page_index": c.page_index, "stage": c.target_stage, "element_id": c.element_id, "field": c.field,
-                                 **sv, "correct_value": _jsonable(c.new_value), "corrected": True, "kind": "correction",
-                                 "feedback_id": fb.feedback_id, "instruction": c.instruction, **({"system_was_user": True} if was_user else {})})
+                                 **sv, "correct_value": _jsonable(c.new_value), "corrected": corrected, "kind": "correction",
+                                 "feedback_id": fb.feedback_id, "instruction": c.instruction, **extra})
                 for c in fb.confirmations:
                     snap = {"system_value": c.system_value, "system_confidence": c.system_confidence} if c.system_value is not None or c.system_confidence is not None else None
                     sv = system(c.target_stage, c.field, c.element_id, c.page_index, snap)
@@ -541,7 +560,7 @@ class FeedbackStore:
                               **sv, "correct_value": sv["system_value"], "corrected": False, "kind": "confirmation",
                               "feedback_id": fb.feedback_id, "instruction": c.comment})
                 for i in fb.issues:  # 「這個元素是錯的」：元素層級的負面資料（和確認同一個階段與欄位，校準時可以一起看）
-                    if i.correct is not False or not i.element_id:
+                    if not is_element_flag(i):
                         continue
                     snap = {"system_value": i.system_value, "system_confidence": i.system_confidence} if i.system_value is not None or i.system_confidence is not None else None
                     sv = system(4, "element", i.element_id, i.page_index, snap)
@@ -716,9 +735,14 @@ def feedback_from_job(sample: str, records: list[dict[str, Any]], corrections: l
             confirms.append(Confirmation(target_stage=4, field="element", element_id=r["element_id"], page_index=page_index, comment=r.get("comment") or "",
                                          **snap(r["element_id"], page_index)))
         if r.get("tags") or r.get("correct") is False:
-            extra = snap(r.get("element_id"), page_index) if r.get("correct") is False else {}
+            extra = snap(r.get("element_id"), page_index) if r.get("correct") is not True else {}  # 被標錯或被回報的元素
             issues.append(FlaggedIssue(page_index if (r.get("page") or r.get("element_id")) else None, r.get("element_id"), list(r.get("tags") or []),
                                        r.get("comment") or "", r.get("correct"), **extra))
+    latest: dict[Optional[int], PageRating] = {}
+    for r in ratings:  # 同一頁評了好幾次（網頁上改分數）：以最新一次為準（records 依時間排序）
+        latest.pop(r.page_index, None)
+        latest[r.page_index] = r
+    ratings = list(latest.values())
     cors, snaps = [], {}
     for c in corrections:
         if c.source != CorrectionSource.USER:
@@ -738,7 +762,7 @@ def bundle_readme(filename: str, fb: Feedback, has_report: bool) -> str:
     stem = Path(filename).stem
     n_missing = sum(1 for c in fb.corrections if fb.snapshots.get(c.id, {}).get("system_value_missing"))
     n_seen = sum(1 for c in fb.confirmations if c.system_confidence is not None)
-    n_flag = sum(1 for i in fb.issues if i.correct is False and i.system_confidence is not None)
+    n_flag = sum(1 for i in fb.issues if is_element_flag(i) and i.system_confidence is not None)
     lines = [
         "Mortise 回饋包",
         "=" * 14,
@@ -752,7 +776,7 @@ def bundle_readme(filename: str, fb: Feedback, has_report: bool) -> str:
         f"- sample/{stem}.feedback.json：你的評分（{len(fb.page_ratings)} 筆）、修正（{len(fb.corrections)} 筆）、"
         f"標記（{len(fb.issues)} 筆）與意見。修正記著系統當時給的值與信心值"
         + (f"（其中 {n_missing} 筆當時沒有記下，這幾筆不能拿來校準）" if n_missing else "") + "；"
-        f"「這個元素是對的」{n_seen} 筆、「這個元素是錯的」{n_flag} 筆記著元素當時的信心值。",
+        f"「這個元素是對的」{n_seen} 筆、「這個元素有錯」（含對元素的回報錯誤）{n_flag} 筆記著元素當時的信心值。",
         "  校準信心值要兩種資料都有：你改掉或標錯的，以及你看過、確認是對的；只有其中一種時程式會拒絕建表。",
         "- report.json：還原度報告（每個欄位是精確擷取、量測、AI、生成還是你指定的，以及⑦驗證的分數）。" if has_report
         else "- （沒有 report.json：匯出時這份工作還沒處理完，或處理失敗。）",

@@ -35,13 +35,21 @@ _FONTS = None
 _LOCK = threading.Lock()
 
 
+_ENGINE_KEY: Optional[str] = None
+
+
 def _engine(params: Optional[dict]):
-    global _ENGINE
+    """文字辨識引擎（載入模型要時間，同一組參數在行程內共用一個）。參數（例如換了微調過的辨識模型 rec_model_path）改了就重新載入，
+    不必重新啟動伺服器；同一個行程裡也能比較新舊模型。"""
+    global _ENGINE, _ENGINE_KEY
+    import json
+
+    key = json.dumps(params or {}, sort_keys=True, ensure_ascii=False, default=str)
     with _LOCK:
-        if _ENGINE is None:
+        if _ENGINE is None or _ENGINE_KEY != key:
             from ..recognition.ocr import OcrEngine
 
-            _ENGINE = OcrEngine(params)
+            _ENGINE, _ENGINE_KEY = OcrEngine(params), key
         return _ENGINE
 
 

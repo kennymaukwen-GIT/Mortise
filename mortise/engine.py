@@ -188,7 +188,8 @@ def engine_version(cfg: Optional[Config] = None) -> str:
 
 
 def short_name(version: Optional[str] = None, cfg: Optional[Config] = None) -> str:
-    """好記的短名（例如「樟雀-07」）。同一個版本字串永遠得到同一個短名；不同版本極少數會撞名，以完整版本字串為準。"""
+    """好記的短名（例如「樟雀-07」）。同一個版本字串永遠得到同一個短名；但短名只有 25600 種，不同版本會撞名
+    （累積 100 個版本時，至少有兩個撞名的機率約 18%；300 個版本約 83%），所以短名只是方便口頭稱呼，比較、存檔一律以完整版本字串為準。"""
     v = version or engine_version(cfg)
     h = int(hashlib.sha256(v.encode("utf-8")).hexdigest(), 16)
     return f"{_WOODS[h % 16]}{_ANIMALS[(h >> 4) % 16]}-{(h >> 8) % 100:02d}"

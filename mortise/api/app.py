@@ -6,7 +6,7 @@
     MORTISE_JOBS      工作目錄的根目錄（預設 ./jobs）
     MORTISE_WORKERS   同時處理幾份檔案（預設 2）
     MORTISE_CORS      允許的前端來源，逗號分隔（預設不開放跨來源）
-    MORTISE_RETENTION_DAYS  檔案保留天數（預設 30）
+    MORTISE_RETENTION_DAYS  檔案保留天數（預設 30）；啟動時與之後每 MORTISE_PURGE_HOURS 小時（預設 6）清一次過期的工作
     MORTISE_FEEDBACK  回饋資料庫的目錄（預設 工作目錄/_feedback）：只收上傳時同意用於改善辨識的檔案
     MORTISE_WEB_DIST  前端建置結果的目錄（預設 專案根目錄/web/dist）
 
@@ -25,7 +25,10 @@
     GET  /api/jobs/{id}/pages/{n}/elements   可修正的元素清單（文字框、表格、圖片、形狀，含信心值與問題）
     POST /api/jobs/{id}/corrections          送出修正，只從受影響的階段重跑
     GET  /api/jobs/{id}/download/{format}    下載輸出檔（format 為輸出格式或 report）
-    POST /api/jobs/{id}/feedback             回饋（評分、意見）
+    POST /api/jobs/{id}/feedback             回饋（評分、意見、元素對或錯、回報錯誤的標籤）
+    GET  /api/jobs/{id}/feedback             這份工作已送出的回饋、修正單數量、是否同意用於改善辨識（feedback_api.py）
+    GET  /api/jobs/{id}/feedback/export      下載回饋包（zip：原始檔、回饋、還原度報告、白話說明；feedback_api.py）
+    GET  /api/engine                         引擎版本、組成、最新成績單摘要（feedback_api.py）
     DELETE /api/jobs/{id}                    立即刪除這份工作的所有檔案
 
 網頁：
@@ -78,10 +81,27 @@ JOBS = JobManager(
     feedback_root=Path(os.environ.get("MORTISE_FEEDBACK", str(Path(os.environ.get("MORTISE_JOBS", "jobs")) / "_feedback"))),
 )
 
+_PURGE_EVERY_S = float(os.environ.get("MORTISE_PURGE_HOURS", "6")) * 3600.0
+
+
 @asynccontextmanager
 async def _lifespan(_app):
     JOBS.purge_expired()  # 啟動時清掉超過保留期限的工作
-    yield
+    stop = threading.Event()
+
+    def _purge_loop() -> None:  # 之後每隔幾小時再清一次（伺服器一直不重啟時，過期的工作也會刪掉）
+        while not stop.wait(_PURGE_EVERY_S):
+            try:
+                JOBS.purge_expired()
+            except Exception:  # noqa: BLE001 —— 清不掉就下次再試，不影響服務
+                pass
+
+    t = threading.Thread(target=_purge_loop, name="mortise-purge", daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 app = FastAPI(title="Mortise API", version="0.1.0", description="把不可編輯的文件還原成可編輯、排版一致的檔案", lifespan=_lifespan)
@@ -689,7 +709,9 @@ def page_geometry(job_id: str, n: int) -> dict[str, Any]:
     status：ok、low_contrast（邊緣不清楚）、curved_edge（紙邊彎曲）、multiple_pages（不只一張紙）、cut_off（紙超出畫面）、
     not_found（找不到紙，用整張圖）、user（使用者拉過四角）、not_photo（原生 PDF 或截圖：整張就是頁面，不必確認）。
     使用者確認四角：POST /api/jobs/{id}/corrections，[{"field": "corners", "page": n, "value": [[x, y] × 4]}]（原圖像素）；
-    選「整張圖當頁面」就送原圖的四個角。送出後工作從②重跑。
+    選「整張圖當頁面」就送原圖的四個角。送出後工作從②重跑；彎曲的紙在使用者的四角之內照樣攤平（四角不動）。
+    glare：頁面上反光（過曝、看不到內容）的面積比例；null 表示這張沒有量（目前只有像白紙、有做去陰影的照片頁面才量，
+    彩色海報、深色投影片不量），不是「沒有反光」。
     還沒處理到②、或剛送出四角修正而②還沒重跑完時回 409。"""
     pipe = _job(job_id)
     doc = _load(pipe, "s1/source_doc", SourceDoc)
@@ -727,6 +749,17 @@ def page_geometry(job_id: str, n: int) -> dict[str, Any]:
                      "score": float(spec.quad_alternative_scores[i]) if i < len(spec.quad_alternative_scores) else 0.0,
                      "label": spec.quad_alternative_labels[i] if i < len(spec.quad_alternative_labels) else "其他候選"})
     pre = spec.quad_preselect if spec.quad_preselect is not None and 0 <= spec.quad_preselect < len(alts) and not user_set else None
+    if user_set:  # 使用者拉過四角：把系統第一次自動偵測的四角也放進候選，讓使用者可以回到原本的結果
+        from .jobs import _auto_quads
+
+        auto = _auto_quads(pipe).get(str(n - 1)) or {}
+        pts = auto.get("corners")
+        try:
+            ok = isinstance(pts, list) and len(pts) == 4 and all(len(q) == 2 and all(math.isfinite(float(v)) for v in q) for q in pts)
+        except (TypeError, ValueError):
+            ok = False
+        if ok and not any(_close_quads(a["corners"], pts) for a in alts) and not _close_quads(_pt_list(spec.source_corners), pts):
+            alts.append({"corners": [[float(q[0]), float(q[1])] for q in pts], "score": float(auto.get("confidence") or 0.0), "label": "Mortise 原本找到的"})
     return {
         "page": n, "input_type": itype, "source": {"width": int(sw), "height": int(sh), "image": image_url},
         "corners": _pt_list(spec.source_corners), "method": spec.quad_method, "confidence": float(spec.quad_confidence),
@@ -738,6 +771,13 @@ def page_geometry(job_id: str, n: int) -> dict[str, Any]:
                    "residual_px": spec.dewarp_residual_px, "needs_review": bool(spec.dewarp_needs_review)},
         "glare": spec.glare_frac, "user_set": user_set, "notes": list(spec.notes),
     }
+
+
+def _close_quads(a: Any, b: Any, tol: float = 0.5) -> bool:
+    try:
+        return len(a) == len(b) == 4 and all(abs(float(p[0]) - float(q[0])) <= tol and abs(float(p[1]) - float(q[1])) <= tol for p, q in zip(a, b))
+    except (TypeError, ValueError, IndexError):
+        return False
 
 
 def _same_corners(spec: PageSpec, value: Any) -> bool:
@@ -852,11 +892,26 @@ def post_corrections(job_id: str, items: list[CorrectionIn]) -> dict[str, Any]:
                 value = PhysicalSize(**value).model_dump()
             except Exception:
                 raise HTTPException(422, "size 的值要是 {width, height, unit}。")
+        if it.field == "corners" and not _corners_shape_ok(value):
+            raise HTTPException(422, "corners 的值要是原圖像素座標的四個點 [[x, y] × 4]（左上、右上、右下、左下），每個數字都要是有限的數。")
         if it.field == "text" and it.element_id and "-t-" in it.element_id:
             stage = 3  # 指名到文字行：修正辨識結果
         corrections.append(user_correction(stage, it.field, value, it.element_id, (it.page - 1) if it.page else None, n=existing + i))
     JOBS.add_corrections(job_id, corrections)
     return JOBS.status(job_id)
+
+
+def _corners_shape_ok(value: Any) -> bool:
+    """四角修正單的格式檢查（只看形狀：四個有限的 [x, y]）。自我交叉、太小、離畫面太遠由②判斷（略過並寫進備註）。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return False
+    for pt in value:
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            return False
+        for v in pt:
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
+                return False
+    return True
 
 
 class FeedbackIn(BaseModel):

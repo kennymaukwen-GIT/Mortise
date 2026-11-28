@@ -138,6 +138,32 @@ def test_user_corners_rerun_and_feedback_snapshot(client, photo_job):
     assert any(x.field == "corners" for x in fb.corrections)
 
 
+def test_second_drag_snapshot_keeps_auto_detection(client, photo_job):
+    """第二次拖四角：回饋庫的「系統值」仍是第一次自動偵測的結果（不是使用者上一次拉的四角、信心 1.0）；
+    格式不對的四角修正單（②會略過）不收進回饋庫。接在上一個測試之後（同一份工作）。"""
+    c, root, _ = client
+    moved = CUT_GT + np.array([3.0, -2.0])
+    assert c.post(f"/api/jobs/{photo_job}/corrections", json=[{"field": "corners", "page": 1, "value": moved.tolist()}]).status_code == 202
+    assert _wait(c, photo_job)["status"] == "done"
+    r = c.post(f"/api/jobs/{photo_job}/corrections", json=[{"field": "corners", "page": 1, "value": [[0, 0], [1, 1]]}])
+    assert r.status_code == 422  # 介面層就擋下格式不對的四角（不是四個點）
+    for bad in ([[0, 0], [1, 0], [1, 1], [0, "x"]], [[0, 0], [1, 0], [1, 1]], "亂寫"):
+        assert c.post(f"/api/jobs/{photo_job}/corrections", json=[{"field": "corners", "page": 1, "value": bad}]).status_code == 422
+    g = c.get(f"/api/jobs/{photo_job}/pages/1/geometry").json()
+    assert g["status"] == "user" and np.abs(np.array(g["corners"]) - moved).max() < 0.05
+    # 使用者拉過四角後，系統第一次自動偵測的四角仍在候選裡（可以回到原本的結果）
+    orig = [a for a in g["alternatives"] if a["label"] == "Mortise 原本找到的"]
+    assert len(orig) == 1 and len(orig[0]["corners"]) == 4 and g["preselect"] is None
+    data = json.loads(next((root / "_feedback" / "samples").glob("*.feedback.json")).read_text(encoding="utf-8"))
+    cor = [x for x in data["corrections"] if x["field"] == "corners"]
+    assert len(cor) == 2, cor  # 壞的那張沒有收進來
+    sv = cor[1]["system_value"]
+    assert sv["method"] == "frame_edges" and sv["status"] == "cut_off" and sv["confidence"] < 1.0
+    assert np.abs(np.array(sv["corners"]) - np.array(cor[0]["system_value"]["corners"])).max() < 1e-6
+    assert np.abs(np.array(sv["previous_user_corners"]) - CUT_GT).max() < 0.05
+    assert cor[1]["system_confidence"] == pytest.approx(sv["confidence"])
+
+
 def test_pdf_page_is_not_photo(client):
     c, _, _ = client
     with (FIX / "slide_basic.pdf").open("rb") as f:

@@ -189,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"可以用：字典 {info['dict_size']} 個字、模型輸出 {info['model_classes']} 類。換上的方法：設定覆寫檔（例如 new_ocr.toml）寫")
         print(f"\n[recognize.ocr_params]\nrec_model_path = \"{a.out.resolve()}\"\n")
         print("再跑 python -m mortise.eval scorecard --config new_ocr.toml --out 目錄，用 scorecard compare 和舊的成績單比，沒有退步才採用。")
+        print("採用時：網頁伺服器只讀 mortise/config/default.toml（不讀覆寫檔），所以把上面那兩行加在 default.toml 的 [recognize] 那一節後面"
+              "（[recognize] 底下不能已經有 ocr_params 這個鍵），然後重新啟動伺服器（同一個程式只載入一次文字辨識模型）。")
         return 0
     if a.cmd == "vector":
         from . import vector_bench as vbm

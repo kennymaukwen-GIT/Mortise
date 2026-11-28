@@ -9,7 +9,7 @@
 
 修正單「系統當時的值」從哪裡來（依序）：工作目錄 feedback/ 裡的修正單快照（有的話）、回饋資料庫裡這份工作的
 .feedback.json（使用者同意時才有）。都沒有的修正單在回饋包裡記進 snapshot_missing，不拿來校準。
-「這個元素是對的／錯的」在匯出時從工作目錄的產物查出元素當時的值與信心值（⑦報告的元素信心值，網頁上顯示的那個）。
+「這個元素是對的／錯的」與對元素的「回報錯誤」，在匯出時從工作目錄的產物查出元素當時的值與信心值（⑦報告的元素信心值，網頁上顯示的那個）。
 GET /api/engine 只回檔名，不回伺服器上的完整路徑與其他軟體的版本。
 """
 
@@ -85,8 +85,8 @@ def _job_feedback(pipe, job_id: str):
 
 
 def _resolver(pipe, records: list[dict[str, Any]]):
-    """查元素當時的值與信心值（只有使用者標過「對／錯」的元素才需要；讀產物要一點時間，所以用到才讀）。"""
-    if not any(r.get("element_id") and r.get("correct") is not None for r in records):
+    """查元素當時的值與信心值（只有使用者標過「對／錯」或回報過錯誤的元素才需要；讀產物要一點時間，所以用到才讀）。"""
+    if not any(r.get("element_id") and (r.get("correct") is not None or r.get("tags")) for r in records):
         return None
     from ..eval.feedback import resolve_value
     from ..eval.runner import load_artifacts

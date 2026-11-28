@@ -5,22 +5,34 @@
 
 ## 目前的基準
 
-- [`mortise-0.1.0+s1v3.s2v5.s3v3.s4v3.s5v6.s6v4.s7v6-cfg02f7ad68-ocrbbb248-uv753d-src801ad2fd.md`](mortise-0.1.0+s1v3.s2v5.s3v3.s4v3.s5v6.s6v4.s7v6-cfg02f7ad68-ocrbbb248-uv753d-src801ad2fd.md)
-  （短名「橡鯨-90」，快速版考卷，2026-11-23）。版本字串裡的 `src` 是程式碼指紋：之後只要流水線的程式改了，目前的引擎版本就會和這份不同，
-  要重跑一次快速版、把新的成績單放進來（舊的留著，方便比較）。
+- [`mortise-0.1.0+s1v3.s2v6.s3v3.s4v5.s5v6.s6v4.s7v6-cfgf7778fa3-ocrbbb248-uv753d-src53a6cb4e.md`](mortise-0.1.0+s1v3.s2v6.s3v3.s4v5.s5v6.s6v4.s7v6-cfgf7778fa3-ocrbbb248-uv753d-src53a6cb4e.md)
+  （短名「楓鯨-94」，快速版考卷，2026-11-28 整合照片流程、回饋、訓練工廠、兩欄版面之後；10 題、0 筆錯誤、111 秒）。
+  和上一份「柏鷺-75」比：所有分數完全相同（這次的改動多半在使用者拖四角、改字、回饋與 OCR 訓練資料，快速版考卷沒有考到），每頁秒數 20.9 → 17.6
+  （兩次機器負載不同，時間不設門檻），compare 結束碼 0。考卷指紋不同（出題的 synth.py 換掉了一張表格頁的文字、評分的 runner.py 修了彎曲照片的錯誤），
+  報表有粗體警告；快速版不用那張表格頁，所以分數仍可比。
+- 上一份：[`…-cfg15dde96e-ocrbbb248-uv753d-src8536fd8a.md`](mortise-0.1.0+s1v3.s2v6.s3v3.s4v4.s5v6.s6v4.s7v6-cfg15dde96e-ocrbbb248-uv753d-src8536fd8a.md)
+  （「柏鷺-75」，2026-11-28；10 題、0 筆錯誤、129 秒）。這一份開始記考卷指紋（`exam`），compare 才能確認兩份的考卷相同。
+- 更早：[`…-cfg02f7ad68-ocrbbb248-uv753d-src801ad2fd.md`](mortise-0.1.0+s1v3.s2v5.s3v3.s4v3.s5v6.s6v4.s7v6-cfg02f7ad68-ocrbbb248-uv753d-src801ad2fd.md)
+  （「橡鯨-90」，2026-11-23；沒有考卷指紋）。和「柏鷺-75」比：⑦總分 0.560 → 0.596、各格式分數都進步，文字、四角、表格持平。
 
-## 怎麼跑、要多久（4 核、15 GB 的開發機，同時有其他工作在跑；2026-11-23 實測）
+版本字串裡的 `src` 是程式碼指紋：之後只要流水線的程式改了，目前的引擎版本就會和基準不同（`GET /api/engine` 的 `matches_current` 是 false），
+要重跑一次快速版、把新的成績單放進來（舊的留著，方便比較）。
+
+## 怎麼跑、要多久（4 核、15 GB 的開發機，同時有其他工作在跑）
 
 | 考卷 | 指令 | 題數 | 時間 |
 |---|---|---|---|
-| 快速版 | `python -m mortise.eval scorecard --quick --out docs/scorecards` | 10 題（3 份文件；輸出可編輯 PDF、PowerPoint、Word） | 106–107 秒（`--jobs 2`；開始時負載 1.2–1.4） |
+| 快速版 | `python -m mortise.eval scorecard --quick --out docs/scorecards` | 10 題（3 份文件；輸出可編輯 PDF、PowerPoint、Word） | 106–107 秒（2026-11-23，`--jobs 2`；開始時負載 1.2–1.4）；129 秒（2026-11-28，負載 1.5 到 4）；111 秒（2026-11-28 整合後，負載約 2 到 4） |
 | 完整版 | `python -m mortise.eval scorecard --out 成績單` | 32 題（7 份文件；另加 SVG、Excel） | 7 分 29 秒（`--jobs 2`；負載約 3） |
 
 和舊的比：
 
 ```bash
-python -m mortise.eval scorecard compare docs/scorecards/舊的.json 新的.json   # 退步超過門檻時結束碼是 1
+python -m mortise.eval scorecard compare docs/scorecards/舊的.json 新的.json   # 退步超過門檻、缺題、新的錯誤時結束碼是 1
 ```
+
+舊的成績單有、新的沒有的題目（新版本當掉）也算超過門檻的退步；確定是故意的才加 `--allow-missing`。
+兩份的考卷指紋（`exam`：考卷檔與出題、評分程式的雜湊）不同時會用粗體警告，加 `--strict-exam` 時結束碼是 3。
 
 ## 第一次完整版看到的問題（2026-11-23，引擎 櫸獺-26，交給負責的人看）
 

@@ -157,7 +157,8 @@ def image_job(tmp_path_factory):
     pipe._save_state()
     pipe.run()
     run = load_artifacts(pipe)
-    line = next(t for t in run.elements[0].texts if "-t-" in t.id and len(t.text) > 6)
+    # 改後的標籤要在 max_label_chars（25 字）以內：太長的行訓練程式會丟掉，ocr-dataset 也會略過
+    line = next(t for t in run.elements[0].texts if "-t-" in t.id and 6 < len(t.text) <= 20)
     fixed = line.text + "（改）"
     pipe.add_corrections([user_correction(3, "text", fixed, line.id, 0)])
     return root, job_id, png, line, fixed
@@ -193,6 +194,33 @@ def test_feedback_from_bundle_and_rerun_when_job_deleted(image_job, tmp_path):
     assert res["n_lines"] == 1 and res["items"][0]["image_from"] == "重新跑流水線" and res["items"][0]["label"] == fixed
 
 
+def test_untrusted_bundle_stays_inside_output(image_job, tmp_path):
+    """別人交來的回饋包：zip 裡的 job_id 與修正單 id 不能拿來組路徑（裁切圖一律寫在 images/user_correction/ 底下）。"""
+    import zipfile
+
+    from mortise.eval.feedback import feedback_from_job, write_bundle
+    from mortise.pipeline import Pipeline
+
+    root, job_id, png, line, fixed = image_job
+    fb = feedback_from_job("slide.png", [], Pipeline(root / job_id).corrections, {}, {"job_id": job_id, "filename": "slide.png", "consented": True})
+    good = write_bundle(tmp_path / "good.zip", png, "slide.png", fb)
+    data = json.loads(zipfile.ZipFile(good).read("sample/slide.feedback.json"))
+    data["job"]["job_id"] = "../../pwn_import"
+    for c in data["corrections"]:
+        c["id"] = "../../x"
+    evil = tmp_path / "evil.mortise-feedback.zip"
+    with zipfile.ZipFile(good) as zi, zipfile.ZipFile(evil, "w") as zo:
+        for n in zi.namelist():
+            zo.writestr(n, json.dumps(data) if n.endswith(".feedback.json") else zi.read(n))
+    out = tmp_path / "deep" / "out"
+    res = D.build_dataset(out, feedback=[evil], jobs_root=root)  # job_id 不合格 → 丟掉，用回饋包裡的原始檔重跑
+    assert res["n_lines"] == 1 and res["items"][0]["label"] == fixed and res["items"][0]["job_id"] is None
+    rel = res["items"][0]["image"]
+    assert ".." not in rel and rel.startswith("images/user_correction/") and (out / rel).resolve().parent == (out / "images" / "user_correction").resolve()
+    assert not list((tmp_path / "deep").glob("*.png")) and not list(tmp_path.glob("pwn_import*"))
+    assert ".." not in (out / "rec_gt.txt").read_text(encoding="utf-8")
+
+
 def test_embed_dictionary_for_finetuned_model(tmp_path):
     """微調後的模型（paddle2onnx 轉出來沒有字典）放回 Mortise：把字典寫進 metadata，OcrEngine 用設定的路徑就能載入；字典對不上要拒絕。"""
     from mortise.engine import ocr_model_paths
@@ -212,3 +240,51 @@ def test_embed_dictionary_for_finetuned_model(tmp_path):
     assert not (tmp_path / "bad.onnx").exists()
     assert main(["ocr-model", str(tmp_path / "rec.onnx"), "--dict", str(good), "--out", str(tmp_path / "again.onnx")]) == 0
     assert main(["ocr-model", str(tmp_path / "rec.onnx"), "--dict", str(bad), "--out", str(tmp_path / "x.onnx")]) == 2
+
+
+def _fake_line(text: str, x0: float = 0.1, y0: float = 0.2, adv: float = 0.015, h: float = 0.02):
+    """假的③文字行：每個字等寬（adv，相對單位），char_x 是從行首量的距離。"""
+    from types import SimpleNamespace as NS
+
+    w = adv * len(text)
+    pts = [NS(x=x0, y=y0), NS(x=x0 + w, y=y0), NS(x=x0 + w, y=y0 + h), NS(x=x0, y=y0 + h)]
+    run = NS(text=text, char_x=[i * adv for i in range(len(text))])
+    return NS(text=text, runs=[run], quad=NS(points=pts), id="p001-t-x")
+
+
+def test_long_corrected_line_is_split_where_nothing_changed():
+    """使用者改了一行 40 個字的中文：依每個字的位置切成不超過 25 個字的段，改動不會被切開，每段的圖寬與字數成比例。"""
+    from mortise.eval.ocr_dataset import split_long_line
+
+    sys_text = "甲乙丙丁戊己庚辛壬癸" * 4  # 40 個字
+    label = sys_text[:21] + "子" + sys_text[22:]  # 第 22 個字被使用者改掉
+    W = 1000.0
+    img = np.full((600, 1000, 3), 255, np.uint8)
+    segs, why = split_long_line(_fake_line(sys_text), label, W, img)
+    assert why == "" and len(segs) == 2
+    assert "".join(s[1] for s in segs) == label and "".join(s[2] for s in segs) == sys_text
+    assert all(len(s[1]) <= 25 for s in segs)
+    assert "子" in segs[0][1] and segs[0][1] != segs[0][2] and segs[1][1] == segs[1][2]
+    w0, w1 = segs[0][0].shape[1], segs[1][0].shape[1]
+    assert abs(w0 / w1 - len(segs[0][1]) / len(segs[1][1])) < 0.15
+
+
+def test_long_line_split_is_checked_by_reading_each_piece_again():
+    """每段裁好後再讀一次：讀出來和系統原本讀到的那幾個字差太多（裁切框錯了）就不收，並寫明原因；沒有每個字的位置就不切。"""
+    from types import SimpleNamespace as NS
+
+    from mortise.eval.ocr_dataset import split_long_line
+
+    sys_text = "ABCDE FGHIJ KLMNO PQRST UVWXY Z1234 56789"
+    img = np.full((600, 1000, 3), 255, np.uint8)
+    ok, why = split_long_line(_fake_line(sys_text), sys_text, 1000.0, img, verify=lambda crop: "x")
+    assert ok == [] and "裁切驗證沒過" in why
+    good, why = split_long_line(_fake_line(sys_text), sys_text, 1000.0, img, verify=lambda crop: "")
+    assert good == [] and "字錯率 1.00" in why
+    line = _fake_line(sys_text)
+    line.runs = [NS(text=sys_text, char_x=[])]
+    none, why = split_long_line(line, sys_text, 1000.0, img)
+    assert none == [] and "位置" in why
+    # 英文在空白處切，不切斷單字
+    segs, _ = split_long_line(_fake_line(sys_text), sys_text, 1000.0, img)
+    assert all(not s[1].startswith(" ") and not s[1].endswith(" ") for s in segs) and " ".join(s[1] for s in segs) == sys_text

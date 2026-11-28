@@ -14,7 +14,7 @@
       干擾後行高低於 min_height_px（照片 min_height_px_photo）的行略過。
       每個字的位置取 PDFium 的寬鬆字框（字型的上緣到下緣，同一行高度一致），依換行符號與位置分行；
       旋轉的字（PDFium 的字元角度不是 0，例如直排的側標）整個略過，不會切成一字一行配上正立的標籤；
-      太長的行在空白處（中文在字與字之間）切成不超過 max_label_chars 個字的段（PaddleOCR 預設的辨識長度上限是 25 個字，需查證）。
+      太長的行在空白處（中文在字與字之間）切成不超過 max_label_chars 個字的段（PaddleOCR 辨識設定檔的 max_text_length：PP-OCRv3、PP-OCRv5 mobile、PP-OCRv6 small 的設定檔都是 25，2026-11-28 對照 GitHub 上的設定檔）。
       干擾的單應矩陣把行的四角對到干擾後的影像，以透視轉換裁成水平的長條（上下各留 pad_v、左右各留 pad_h 個行高）。
   (b) 使用者的修正（source = "user_correction"）：使用者改過的字，從那份工作的工作影像裁出那一行，標籤是使用者改的字。
       兩種修正都收：
@@ -23,7 +23,8 @@
           多行的段落把使用者改後的整段字和系統原本各行的字（依④的 joiners 接起來）做對齊（difflib），
           換行處左右兩邊都沒被改動、能明確切開時才收那一行；切不出來的行記進 skipped 並寫明原因。
           使用者在段落裡自己打了換行、而且行數相同時，直接依換行切。
-      同一個欄位改了好幾次時只用最後一次。標籤超過 max_label_chars 個字的行略過（訓練程式會把它丟掉）。
+      同一個欄位改了好幾次時只用最後一次。標籤超過 max_label_chars 個字的行切成幾段（split_long_line：依③量到的每個字的位置、
+      只在沒改動的地方切；每段用目前的辨識模型重讀驗證），切不成的略過（訓練程式會把太長的標籤丟掉）。
       回饋來源可以是：
         - 回饋庫目錄（FeedbackStore 的根目錄；工作影像到 --jobs-root/<工作編號>/ 找）
         - 回饋資料庫的樣本目錄（jobs/_feedback/samples/：樣本檔旁有 .feedback.json）
@@ -99,7 +100,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "pad_h": 0.3,  # 左右各留幾個行高
     "min_height_px": 10,  # 裁出來的行高低於這個（像素）就略過：太小的字當訓練資料只會是雜訊
     "min_height_px_photo": 20,  # 照片干擾的行高下限（像素）：照片有模糊、雜訊、JPEG，比截圖更需要大一點的字
-    "max_label_chars": 25,  # 一筆的標籤最多幾個字（PaddleOCR 辨識設定 max_text_length 的預設值 25，需查證；超過的行會被訓練程式丟掉）
+    "max_label_chars": 25,  # 一筆的標籤最多幾個字（PaddleOCR 辨識設定檔的 max_text_length 是 25；超過的行會被訓練程式丟掉）
+    "split_verify_cer": 0.2,  # 使用者修正的長行切段後，用目前的辨識模型讀每一段，和系統原本讀到的那幾個字比，字錯率不超過這個才收（裁切位置量對了）
+    "split_gap_em": 0.12,  # 切段時，每段的右界停在下一段第一個字的起點往左這麼多個行高（不裁進下一段的字）
     "max_aspect_vertical": 1.5,  # 字框高 ÷ 寬超過這個（而且不只一個字）視為直排或旋轉，略過
     "max_char_angle_deg": 1.0,  # 字元角度（PDFium）偏離 0 度超過這個就當成旋轉的字，整個略過（度）
     "line_overlap": 0.5,  # 同一行：字框與目前這一行的垂直重疊至少佔較矮者的這個比例
@@ -628,6 +631,18 @@ def from_feedback(sources: list[Path], out_dir: Path, jobs_root: Optional[Path],
         jobs, skipped = _collect_feedback(sources, jobs_root, tmp)
         seen: set[tuple[str, str]] = set()
         folder = out_dir / "images" / "user_correction"
+        ocr_holder: dict[str, Any] = {}
+
+        def engine_for_split(crop: np.ndarray) -> str:
+            """長行切段的驗證：用目前設定的辨識模型讀一段（第一次用到才載入模型）。"""
+            if "engine" not in ocr_holder:
+                from ..recognition.ocr import OcrEngine
+
+                ocr_holder["engine"] = OcrEngine(cfg.section("recognize").get("ocr_params"))
+            # 四周補白，偵測器才找得到貼邊的字
+            pad = max(8, crop.shape[0] // 2)
+            canvas = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+            return " ".join(ln.text for ln in ocr_holder["engine"].read(canvas))
         for fj in jobs:
             if fj.consented is not True and not include_unconsented:
                 why = "上傳時沒有勾選同意用於改善辨識" if fj.consented is False else "同意狀態不明（回饋裡沒有工作資料）"
@@ -664,36 +679,170 @@ def from_feedback(sources: list[Path], out_dir: Path, jobs_root: Optional[Path],
                     label = clean_label(part)
                     if not label:
                         continue
+                    pieces: list[tuple[np.ndarray, str, str, str, float]] = []  # (裁好的圖, 標籤, 系統讀到的那幾個字, 檔名後綴, 段內是否改過)
                     if len(label) > int(p["max_label_chars"]):
-                        skipped.append({"source": fj.label, "reason": f"標籤有 {len(label)} 個字，超過 {p['max_label_chars']} 個字（訓練程式會丟掉）",
-                                        "correction": c.id, "element_id": line.id})
-                        continue
-                    quad = np.array([[pt.x * W, pt.y * W] for pt in line.quad.points], np.float64)
-                    crop = crop_quad(img, quad, p["pad_v"], p["pad_h"])
-                    if crop is None:
-                        continue
-                    folder.mkdir(parents=True, exist_ok=True)
-                    name = f"{job_tag}.{cid}.png" if _is_line_id(c.element_id) else f"{job_tag}.{cid}.{line.id if safe_id(line.id) else 'l'}.png"
-                    Image.fromarray(crop).save(inside(folder, folder / name))
-                    # 系統當時讀到的字：③的行有快照就用快照；工作目錄裡的③可能已經套用過這筆修正（那時就是使用者的字，不算）。
-                    # ⑤段落的修正不會改③，③的行就是系統當時讀到的
-                    if _is_line_id(c.element_id):
-                        sv = snap.get("system_value")
-                        system_text = sv if isinstance(sv, str) else (line.text if line.text != str(c.new_value) else None)
+                        segs, why_split = split_long_line(line, label, W, img, p, verify=engine_for_split)
+                        if not segs:
+                            skipped.append({"source": fj.label, "reason": f"標籤有 {len(label)} 個字，超過 {p['max_label_chars']} 個字（訓練程式會丟掉），"
+                                            f"也切不成短段：{why_split}", "correction": c.id, "element_id": line.id})
+                            continue
+                        for k, (crop, sub_label, sub_sys) in enumerate(segs):
+                            pieces.append((crop, sub_label, sub_sys, f".s{k + 1}", float(clean_label(sub_label) != clean_label(sub_sys))))
+                        if why_split:
+                            skipped.append({"source": fj.label, "reason": f"長行切段時有幾段沒收：{why_split}", "correction": c.id, "element_id": line.id})
                     else:
-                        system_text = line.text
-                    items.append(Item(f"images/user_correction/{name}", label, "user_correction",
-                                      {"job_id": fj.job_id, "from": fj.label, "file": fj.filename, "page": page + 1, "element_id": line.id,
-                                       "corrected_element": c.element_id, "correction_stage": c.target_stage, "line_changed": bool(changed),
-                                       "correction_id": c.id, "system_text": system_text, "image_from": how},
-                                      fj.consented if fj.consented is not None else None,
-                                      {True: FEEDBACK_LICENSE, False: FEEDBACK_LICENSE_UNCONSENTED}.get(fj.consented, FEEDBACK_LICENSE_UNKNOWN),
-                                      f"job|{fj.job_id or fj.label}", size=(crop.shape[1], crop.shape[0])))
+                        quad = np.array([[pt.x * W, pt.y * W] for pt in line.quad.points], np.float64)
+                        crop = crop_quad(img, quad, p["pad_v"], p["pad_h"])
+                        if crop is None:
+                            continue
+                        pieces.append((crop, label, line.text, "", float(changed)))
+                    for crop, label, seg_sys, suffix, seg_changed in pieces:
+                        self_name = (f"{job_tag}.{cid}" if _is_line_id(c.element_id) else f"{job_tag}.{cid}.{line.id if safe_id(line.id) else 'l'}") + suffix
+                        _save_feedback_item(items, folder, self_name, crop, label, line, c, fj, page, how, snap, seg_sys if suffix else None,
+                                            bool(seg_changed) if suffix else bool(changed))
                 seen.add(key)
             say(f"{fj.label}：{sum(1 for it in items if it.origin.get('from') == fj.label)} 行（{how}）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return items, skipped
+
+
+def _save_feedback_item(items: list, folder: Path, base: str, crop: np.ndarray, label: str, line: Any, c: Any, fj: Any, page: int, how: str,
+                        snap: dict, seg_sys: Optional[str], changed: bool) -> None:
+    """存一張使用者修正的行圖（或長行切出來的一段，seg_sys 是系統在那一段讀到的字），記進 items。"""
+    from .feedback import inside
+
+    folder.mkdir(parents=True, exist_ok=True)
+    name = base + ".png"
+    Image.fromarray(crop).save(inside(folder, folder / name))
+    # 系統當時讀到的字：③的行有快照就用快照；工作目錄裡的③可能已經套用過這筆修正（那時就是使用者的字，不算）。
+    # ⑤段落的修正不會改③，③的行就是系統當時讀到的。長行切段時是系統在那一段讀到的字
+    if seg_sys is not None:
+        system_text = seg_sys
+    elif _is_line_id(c.element_id):
+        sv = snap.get("system_value")
+        system_text = sv if isinstance(sv, str) else (line.text if line.text != str(c.new_value) else None)
+    else:
+        system_text = line.text
+    origin = {"job_id": fj.job_id, "from": fj.label, "file": fj.filename, "page": page + 1, "element_id": line.id,
+              "corrected_element": c.element_id, "correction_stage": c.target_stage, "line_changed": bool(changed),
+              "correction_id": c.id, "system_text": system_text, "image_from": how}
+    if seg_sys is not None:
+        origin["segment_of_long_line"] = True
+    items.append(Item(f"images/user_correction/{name}", label, "user_correction", origin,
+                      fj.consented if fj.consented is not None else None,
+                      {True: FEEDBACK_LICENSE, False: FEEDBACK_LICENSE_UNCONSENTED}.get(fj.consented, FEEDBACK_LICENSE_UNKNOWN),
+                      f"job|{fj.job_id or fj.label}", size=(crop.shape[1], crop.shape[0])))
+
+
+def _char_positions(line: Any) -> Optional[list[Optional[float]]]:
+    """③的一行每個字的起點（從行的起點沿基線量的距離，相對單位；TextRun.char_x 只記不是空白的字時，空白記 None）。
+    量不到（字數對不上）回 None。"""
+    xs: list[Optional[float]] = []
+    for r in line.runs:
+        cx = list(r.char_x or [])
+        if len(cx) == len(r.text):
+            xs += [float(v) for v in cx]
+        elif len(cx) == sum(1 for ch in r.text if not ch.isspace()):
+            it = iter(cx)
+            xs += [None if ch.isspace() else float(next(it)) for ch in r.text]
+        else:
+            return None
+    return xs if len(xs) == len(line.text) else None
+
+
+def split_long_line(line: Any, label: str, W: float, img: np.ndarray, params: Optional[dict] = None,
+                    verify: Optional[Callable[[np.ndarray], str]] = None) -> tuple[list[tuple[np.ndarray, str, str]], str]:
+    """使用者修正的一行太長（超過 max_label_chars 個字）時，切成幾段短的（中文常見：A4 一行 30 到 40 個字）。
+    依據是量到的東西：③記下的每個字的起點（TextRun.char_x）決定在哪裡切；系統原本的字與使用者的字對齊（difflib），
+    只在兩邊都沒改動的地方切（改動不會被切成兩半）；每段裁好後用目前的辨識模型（verify）讀一次，
+    和系統原本在那一段讀到的字比，字錯率不超過 split_verify_cer 才收（證明裁切框住的就是那幾個字）。
+    回傳 [(裁好的圖, 標籤, 系統在那一段讀到的字)] 與沒收的原因（白話，沒有就是空字串）。"""
+    p = _p(params)
+    max_chars = int(p["max_label_chars"])
+    sys_text = line.text
+    xs = _char_positions(line)
+    if xs is None or not any(v is not None for v in xs):
+        return [], "這一行沒有每個字的位置"
+    n = len(sys_text)
+    sm = difflib.SequenceMatcher(None, sys_text, label, autojunk=False)
+    clean: dict[int, int] = {0: 0, n: len(label)}  # 系統字的切點 → 使用者字的切點（只在兩邊都沒改的地方）
+    for a, b, size in sm.get_matching_blocks():
+        for i in range(a + 1, a + size):
+            clean[i] = b + (i - a)
+    q = np.array([[pt.x, pt.y] for pt in line.quad.points], np.float64)  # 相對單位：左上、右上、右下、左下
+    # char_x 是從行的起點沿基線量的距離（相對單位），換成沿行方向的比例 t（0 是行首、1 是行尾）
+    left, right = 0.0, float(0.5 * (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])))
+    h_rel = float(0.5 * (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])))
+    if right - left <= 1e-9:
+        return [], "這一行的位置量不到"
+
+    def x_at(i: int) -> Optional[float]:
+        for k in range(i, n):
+            if xs[k] is not None:
+                return xs[k]
+        return None
+
+    cuts, s0 = [0], 0
+    while s0 < n:
+        if len(clean_label(label[clean[s0]:])) <= max_chars and len(clean_label(sys_text[s0:])) <= max_chars:
+            cuts.append(n)
+            break
+        cand = [e for e in clean if s0 < e < n and len(clean_label(sys_text[s0:e])) <= max_chars and len(clean_label(label[clean[s0]:clean[e]])) <= max_chars]
+        if not cand:
+            return [], "改動太長或沒有可以切的地方"
+        best = max(cand)
+        spaces = [e for e in cand if e >= best - 8 and (sys_text[e - 1].isspace() or sys_text[e].isspace())]  # 有空白就在空白處切（英文不切斷單字）
+        e = max(spaces) if spaces else best
+        cuts.append(e)
+        s0 = e
+    out, why = [], []
+    for k in range(len(cuts) - 1):
+        a, b = cuts[k], cuts[k + 1]
+        sub_sys, sub_label = clean_label(sys_text[a:b]), clean_label(label[clean[a]:clean[b]])
+        if not sub_label or not sub_sys:
+            continue
+        x0 = x_at(a)
+        x1 = x_at(b) if b < n else None
+        if x0 is None:
+            why.append(f"第 {k + 1} 段量不到位置")
+            continue
+        t0 = (x0 - left) / (right - left) if a > 0 else 0.0
+        t1 = ((x1 - p["split_gap_em"] * h_rel) - left) / (right - left) if x1 is not None else 1.0
+        if a > 0:
+            t0 = (x0 - p["split_gap_em"] * 0.5 * h_rel - left) / (right - left)
+        t0, t1 = max(0.0, min(1.0, t0)), max(0.0, min(1.0, t1))
+        if t1 - t0 < 1e-3:
+            why.append(f"第 {k + 1} 段太窄")
+            continue
+        sub = np.array([q[0] + t0 * (q[1] - q[0]), q[0] + t1 * (q[1] - q[0]), q[3] + t1 * (q[2] - q[3]), q[3] + t0 * (q[2] - q[3])]) * W
+        pad_h = p["pad_h"] if (a == 0 and b == n) else min(p["pad_h"], 0.5 * p["split_gap_em"])
+        crop = crop_quad(img, sub, p["pad_v"], pad_h)
+        if crop is None:
+            why.append(f"第 {k + 1} 段裁不出來")
+            continue
+        if verify is not None:
+            try:
+                read = clean_label(verify(crop))
+            except Exception as e:  # noqa: BLE001
+                why.append(f"第 {k + 1} 段驗證失敗（{type(e).__name__}）")
+                continue
+            cer = _edit_distance(read.replace(" ", ""), sub_sys.replace(" ", "")) / max(1, len(sub_sys.replace(" ", "")))
+            if cer > float(p["split_verify_cer"]):
+                why.append(f"第 {k + 1} 段裁切驗證沒過（重讀的字錯率 {cer:.2f}）")
+                continue
+        out.append((crop, sub_label, sub_sys))
+    return out, "；".join(why)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+        prev = cur
+    return prev[-1]
 
 
 # ====================================================================== 把微調好的模型放回 Mortise

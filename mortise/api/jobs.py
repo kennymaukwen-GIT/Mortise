@@ -211,31 +211,27 @@ class JobManager:
 
     # ---------- 回饋 ----------
     def save_feedback(self, job_id: str, feedback: dict[str, Any]) -> Path:
-        """存一份回饋（評分、意見、某個元素對或錯）。
-        一律存在工作目錄（隨工作在保留期限後刪除）；使用者同意用於改善辨識時，另外收進回饋資料庫（見 _to_dataset）。"""
+        """存一份回饋（評分、意見、某個元素對或錯、回報錯誤的標籤）。
+        一律存在工作目錄（隨工作在保留期限後刪除）；使用者同意用於改善辨識時，另外收進回饋資料庫（見 _to_dataset）。
+        收進回饋庫的格式和匯出的回饋包相同（eval.feedback.feedback_from_job）：評分 → page_ratings（同一頁以最新一次為準）；
+        「這個元素是對的」→ confirmations；「這個元素有錯」與標籤 → issues。元素的回饋會記下那個元素當時的值與信心值（校準要用）。"""
         pipe = self.pipeline(job_id)
         folder = pipe.dir / "feedback"
         folder.mkdir(exist_ok=True)
         path = folder / f"{time.strftime('%Y%m%dT%H%M%S')}-{secrets.token_hex(3)}.json"
         record = {"job_id": job_id, "filename": pipe.state.get("filename"), "allow_training": pipe.state.get("allow_training", False), "received_at": time.time(), **feedback}
         path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
-        entry: dict[str, Any] = {"comments": [feedback["comment"]] if feedback.get("comment") else []}
-        if feedback.get("tags"):
-            entry["comments"].append("標籤：" + "、".join(feedback["tags"]))
-        if feedback.get("rating") is not None:
-            entry["page_ratings"] = [{"page_index": (feedback.get("page") or 1) - 1, "score": feedback["rating"], "max_score": 5, "comment": feedback.get("comment") or ""}]
-        if feedback.get("element_id") and feedback.get("correct") is not None:
-            item = {"page_index": (feedback.get("page") or 1) - 1, "element_id": feedback["element_id"], "field": "element", "target_stage": 4}
-            if feedback["correct"]:
-                entry["confirmations"] = [item]
-            else:
-                entry["comments"].append(f"使用者標示元素 {feedback['element_id']} 有錯")
-        self._to_dataset(job_id, entry)
+        if pipe.state.get("allow_training") and self.feedback_root is not None:
+            self._to_dataset(job_id, _feedback_entry(pipe, feedback))
         return path
 
     def record_corrections(self, job_id: str, corrections: list[Correction]) -> None:
         """使用者的修正也是回饋：連同系統當時的值與信心值一起收進回饋資料庫（需同意）。
-        四角（corners）的 system_value 是頁面偵測的快照（四角、status、信心值、各角誤差、使用者拉動的位移，見 corners_snapshot）。"""
+        不論是否同意，每筆修正連同系統當時的值也追加到工作目錄的 feedback/corrections.jsonl（隨工作過期刪除），
+        這樣沒同意的工作匯出回饋包時，修正單也有系統當時的值。
+        四角（corners）的 system_value 是系統「自動偵測」的快照（四角、status、信心值、各角誤差、使用者拉動的位移，見 corners_snapshot）；
+        第二次以後拉四角時，系統當時的值已經是使用者上一次拉的四角，仍以第一次自動偵測的快照為準（另記上一次使用者的四角）。
+        格式不對的四角修正單（②會略過的：不是四個有限的點、自我交叉、太小）不收進回饋庫。"""
         pipe = self.pipeline(job_id)
         items = []
         try:
@@ -248,6 +244,8 @@ class JobManager:
         for c in corrections:
             item = c.model_dump(mode="json")
             if c.field == "corners":
+                if not _corners_usable(pipe, c):
+                    continue  # ②會略過這張修正單：不當成使用者的答案
                 snap = corners_snapshot(pipe, c)
                 if snap is not None:
                     item["system_value"], item["system_confidence"] = snap, snap.get("confidence")
@@ -262,6 +260,7 @@ class JobManager:
                 except Exception:
                     pass
             items.append(item)
+        _append_snapshots(pipe, items)
         self._to_dataset(job_id, {"corrections": items})
 
     def _to_dataset(self, job_id: str, entry: dict[str, Any]) -> Optional[Path]:
@@ -280,9 +279,14 @@ class JobManager:
         data: dict[str, Any] = {"schema": "mortise.feedback/1", "sample": name, "author": "user", "comments": [], "page_ratings": [], "corrections": [], "confirmations": []}
         if fb_path.exists():
             data.update(json.loads(fb_path.read_text(encoding="utf-8")))
-        for key in ("comments", "page_ratings", "corrections", "confirmations"):
+        for key in ("comments", "page_ratings", "corrections", "confirmations", "issues"):
             data.setdefault(key, [])
+            if key == "page_ratings" and entry.get(key):  # 同一頁重新評分：以最新一次為準
+                pages = {r.get("page_index") for r in entry[key]}
+                data[key] = [r for r in data[key] if r.get("page_index") not in pages]
             data[key] += entry.get(key, [])
+        if not data["issues"]:
+            data.pop("issues")
         data["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         fb_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         return fb_path
@@ -325,34 +329,78 @@ class JobManager:
         return removed
 
 
-def corners_snapshot(pipe: Pipeline, c: Correction) -> Optional[dict[str, Any]]:
-    """使用者拖過四角時，系統當時給的頁面四角（校準「什麼時候該請使用者確認」用）：
-    四角（原圖像素）、怎麼來的、status、信心值、各角誤差、當時是否請使用者確認、原圖大小，
-    以及使用者的四角與系統的差（最大位移，像素）與是否在容許範圍內（quad_max_corner_err_frac × 對角線，與②判斷要不要確認的門檻相同）。
-    還沒有②的產物（還沒處理到）時回傳 None。"""
-    import math
+_AUTO_QUADS = "auto_quads.json"  # 工作目錄裡：每一頁第一次自動偵測的四角快照（使用者拉過四角後，②的產物就只剩使用者的四角）
 
+
+def _load_spec(pipe: Pipeline, page: int):
     from ..artifacts import PageSpec
 
-    page = c.page_index or 0
     name = f"s2/page-{page + 1:03d}"
     try:
         if not pipe.store.has(name):
             return None
-        spec = pipe.store.load(name, PageSpec)
+        return pipe.store.load(name, PageSpec)
     except Exception:
+        return None
+
+
+def _corners_usable(pipe: Pipeline, c: Correction) -> bool:
+    """這張四角修正單②會不會採用（同一套檢查：四個有限的 [x, y]、不自我交叉、不太小、不離畫面太遠）。"""
+    from ..stages.s2_page import _user_corners
+
+    spec = _load_spec(pipe, c.page_index or 0)
+    size = tuple(spec.source_size) if spec is not None and spec.source_size else None
+    return _user_corners([c], size) is not None
+
+
+def _auto_quads(pipe: Pipeline) -> dict[str, Any]:
+    try:
+        return json.loads((pipe.dir / _AUTO_QUADS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def corners_snapshot(pipe: Pipeline, c: Correction) -> Optional[dict[str, Any]]:
+    """使用者拖過四角時，系統自動偵測的頁面四角（校準「什麼時候該請使用者確認」用）：
+    四角（原圖像素）、怎麼來的、status、信心值、各角誤差、當時是否請使用者確認、原圖大小，
+    以及使用者的四角與系統的差（最大位移，像素）與是否在容許範圍內（quad_max_corner_err_frac × 對角線，與②判斷要不要確認的門檻相同）。
+    ②的產物是自動偵測的結果時，順便存一份到工作目錄（auto_quads.json）；之後再拖四角時（②的產物已經是使用者上一次的四角），
+    改用那份快照，另記 previous_user_corners（使用者上一次的四角），不把使用者自己的值當成「系統當時信心 1.0 的四角」。
+    還沒有②的產物（還沒處理到），或②的產物已是使用者的四角、又沒有自動偵測的快照時，回傳 None。"""
+    import math
+
+    page = c.page_index or 0
+    spec = _load_spec(pipe, page)
+    if spec is None:
         return None
     sys_c = [[float(p.x), float(p.y)] for p in spec.source_corners]
     size = list(spec.source_size) if spec.source_size else None
-    snap: dict[str, Any] = {
-        "corners": sys_c, "method": spec.quad_method, "status": spec.quad_status, "confidence": float(spec.quad_confidence),
-        "corner_error_px": list(spec.quad_corner_error_px) or None, "needs_review": bool(spec.quad_needs_review),
-        "review_reason": spec.quad_review_reason, "dewarp_source": spec.dewarp_source or None, "source_size": size,
-    }
+    if spec.quad_method == "user":
+        auto = _auto_quads(pipe).get(str(page))
+        if not auto:
+            return None
+        snap: dict[str, Any] = {**auto, "previous_user_corners": sys_c}
+    else:
+        snap = {
+            "corners": sys_c, "method": spec.quad_method, "status": spec.quad_status, "confidence": float(spec.quad_confidence),
+            "corner_error_px": list(spec.quad_corner_error_px) or None, "needs_review": bool(spec.quad_needs_review),
+            "review_reason": spec.quad_review_reason, "dewarp_source": spec.dewarp_source or None, "source_size": size,
+        }
+        try:
+            quads = _auto_quads(pipe)
+            quads[str(page)] = snap
+            (pipe.dir / _AUTO_QUADS).write_text(json.dumps(quads, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+        snap = dict(snap)
+    base = snap.get("corners") or sys_c
+    size = snap.get("source_size") or size
     try:
-        user = [[float(v) for v in pt] for pt in c.new_value]
-        if len(user) == 4 and all(len(pt) == 2 for pt in user):
-            shift = [math.dist(a, b) for a, b in zip(sys_c, user)]
+        from ..stages.s2_page import _user_corners
+
+        user = _user_corners([c], tuple(size) if size else None) or []  # 與②相同的檢查與排序（左上、右上、右下、左下）
+        if len(user) == 4:
+            shift = [math.dist(a, b) for a, b in zip(base, user)]
             snap["shift_px"] = [round(v, 2) for v in shift]
             if size:
                 frac = 0.01
@@ -364,6 +412,39 @@ def corners_snapshot(pipe: Pipeline, c: Correction) -> Optional[dict[str, Any]]:
     except (TypeError, ValueError):
         pass
     return snap
+
+
+def _feedback_entry(pipe: Pipeline, feedback: dict[str, Any]) -> dict[str, Any]:
+    """一筆網頁回饋 → 回饋庫的格式（與匯出回饋包相同的轉法）。元素的回饋查出元素當時的值與信心值。"""
+    from ..eval.feedback import feedback_from_job
+
+    resolver = None
+    if feedback.get("element_id") and (feedback.get("correct") is not None or feedback.get("tags")):
+        try:
+            from ..eval.feedback import resolve_value
+            from ..eval.runner import load_artifacts
+
+            arts = load_artifacts(pipe)
+            resolver = lambda stage, field, eid, page: resolve_value(arts, stage, field, eid, page)  # noqa: E731
+        except Exception:  # noqa: BLE001 —— 產物讀不出來：照樣收，只是沒有信心值
+            resolver = None
+    fb = feedback_from_job(pipe.state.get("filename") or "upload", [feedback], [], {}, resolver=resolver).to_dict()
+    return {k: fb.get(k, []) for k in ("comments", "page_ratings", "confirmations", "issues")}
+
+
+def _append_snapshots(pipe: Pipeline, items: list[dict[str, Any]]) -> None:
+    """修正單連同系統當時的值，每行一筆追加到工作目錄 feedback/corrections.jsonl（eval.feedback.correction_snapshots 讀）。"""
+    rows = [{k: it.get(k) for k in ("id", "field", "page_index", "element_id", "system_value", "system_confidence")} for it in items if it.get("id") and "system_value" in it]
+    if not rows:
+        return
+    try:
+        folder = pipe.dir / "feedback"
+        folder.mkdir(exist_ok=True)
+        with (folder / "corrections.jsonl").open("a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    except OSError:
+        pass
 
 
 def _safe_id(job_id: str) -> bool:

@@ -1,0 +1,2093 @@
+{
+ "schema": "mortise.scorecard/1",
+ "engine": {
+  "version": "mortise-0.1.0+s1v3.s2v6.s3v3.s4v4.s5v6.s6v4.s7v6-cfg15dde96e-ocrbbb248-uv753d-src8536fd8a",
+  "name": "柏鷺-75",
+  "components": {
+   "package": "0.1.0",
+   "stages": {
+    "s1": "3",
+    "s2": "6",
+    "s3": "3",
+    "s4": "4",
+    "s5": "6",
+    "s6": "4",
+    "s7": "6"
+   },
+   "config": {
+    "hash": "15dde96e",
+    "sections": [
+     "ai",
+     "export",
+     "fonts",
+     "input",
+     "output_sizes",
+     "page",
+     "page_sizes",
+     "recognize",
+     "settings",
+     "structure",
+     "verify"
+    ]
+   },
+   "ocr": {
+    "files": {
+     "det": {
+      "file": "PP-OCRv6_det_small.onnx",
+      "path": null,
+      "sha256": "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f",
+      "bundled": true
+     },
+     "rec": {
+      "file": "PP-OCRv6_rec_small.onnx",
+      "path": null,
+      "sha256": "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884",
+      "bundled": true
+     },
+     "cls": {
+      "file": "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+      "path": null,
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
+      "bundled": true
+     }
+    },
+    "hash": "bbb24835"
+   },
+   "uvdoc": {
+    "mode": "auto",
+    "sha256": "753ddb43b021f55437c4f3f62a38e35a894b604700e554b4c804f912d60c9cf3",
+    "file": "uvdoc2d-7e90861b8a51.onnx",
+    "tag": "753d"
+   },
+   "source": {
+    "files": 73,
+    "hash": "8536fd8a"
+   },
+   "verify_engine": "LibreOffice 24.2.7.2 420(Build:2)"
+  }
+ },
+ "suite": "quick",
+ "seed": 0,
+ "outputs": [
+  "pdf",
+  "pptx",
+  "docx_flow"
+ ],
+ "created": "2026-11-28T17:09:28",
+ "machine": {
+  "cpus": 4,
+  "python": "3.13.18",
+  "system": "Linux",
+  "load_at_start": 1.54150390625,
+  "jobs": 2
+ },
+ "wall_seconds": 129.4,
+ "items": [
+  {
+   "name": "slide_basic.pdf",
+   "source": "fixture:slide_basic.pdf",
+   "group": "簡報",
+   "variants": [
+    "screenshot",
+    "photo"
+   ],
+   "pages": 1
+  },
+  {
+   "name": "doc_a4.pdf",
+   "source": "fixture:doc_a4.pdf",
+   "group": "文件",
+   "variants": [
+    "scan",
+    "photo",
+    "curved_curl_top"
+   ],
+   "pages": 1
+  },
+  {
+   "name": "cv_two_column.pdf",
+   "source": "fixture:cv_two_column.pdf",
+   "group": "履歷",
+   "variants": [
+    "screenshot",
+    "curved_bend"
+   ],
+   "pages": 1
+  }
+ ],
+ "exam": {
+  "files": {
+   "slide_basic.pdf": "14e050704ad70091172ad621041887ce3909eafc4a275a231354291b3658b745",
+   "doc_a4.pdf": "1422184277ea992e9d3ca7ad4dcb7131dee4b3ca1b767890275b7fa04e715b0f",
+   "cv_two_column.pdf": "a4f887ff0fa9d23a5ca4a32f4fa9cbedce6aa538c6aa0078308897f301607d54"
+  },
+  "code": {
+   "synth.py": "dd85fcb90c801e3ba1856e3e1c69d5b2bdd51e615002e2167484c6ded83b1df5",
+   "runner.py": "d7be1384cc93c7e61b280de4adfbea6f4b76a746b68f54c8a25a518da4dc4319",
+   "metrics.py": "e3c08eb7a89a4005488e47d9ac5044c5f4c0bf9cd4bcb45bea1ce6cf72740d8f",
+   "scorecard.py": "ea01ed351db3ff904155a7150b1f4e7850f823b4a0e0fde863e17ce4c7244288"
+  },
+  "hash": "c62d6557"
+ },
+ "evaluations": [
+  {
+   "key": "slide_basic.pdf|native",
+   "sample": "slide_basic.pdf",
+   "group": "簡報",
+   "variant": "native",
+   "category": "native",
+   "pages": 1,
+   "seconds": 8.27,
+   "metrics": {
+    "e2e_score": 0.6423652241608491,
+    "e2e_similarity": 0.9982666373252869,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 1.0,
+    "e2e_position_error_pt": 0.007896314559152443,
+    "rasterized_page": 0.0,
+    "composite": 0.8211826120804245,
+    "fmt_pdf": 0.998,
+    "fmt_pptx": 0.999,
+    "fmt_docx_flow": 0.617,
+    "seconds_per_page": 8.27
+   }
+  },
+  {
+   "key": "slide_basic.pdf|screenshot",
+   "sample": "slide_basic.pdf",
+   "group": "簡報",
+   "variant": "screenshot",
+   "category": "screenshot",
+   "pages": 1,
+   "seconds": 11.3,
+   "metrics": {
+    "text_recall": 0.875,
+    "text_precision": 1.0,
+    "text_f1": 0.9333333333333333,
+    "cer": 0.0,
+    "cer_zh": 0.0,
+    "cer_en": 0.0,
+    "page_cer": 0.00625,
+    "position_error_pt": 1.799169358518393,
+    "baseline_error_pt": 0.10178357642204318,
+    "size_error_pt": 0.2576029581332963,
+    "size_error_pct": 1.408911540419657,
+    "color_delta_e": 3.615536171313059,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.8333333333333334,
+    "font_top3": 0.9166666666666666,
+    "bold_accuracy": 1.0,
+    "italic_accuracy": 1.0,
+    "shape_kind_accuracy": 1.0,
+    "reading_order": 1.0,
+    "image_recall": 0.0,
+    "shape_recall": 1.0,
+    "shape_precision": 0.25,
+    "paragraph_pair_f1": 1.0,
+    "boxes_per_paragraph": 0.5,
+    "box_count_error": 0.3333333333333333,
+    "e2e_score": 0.3814125753720082,
+    "e2e_similarity": 0.9916520118713379,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.5,
+    "e2e_position_error_pt": 0.9337052142996005,
+    "rasterized_page": 0.0,
+    "composite": 0.8278054943383655,
+    "fmt_pdf": 0.896,
+    "fmt_pptx": 0.716,
+    "fmt_docx_flow": 0.351,
+    "seconds_per_page": 11.3
+   }
+  },
+  {
+   "key": "slide_basic.pdf|photo",
+   "sample": "slide_basic.pdf",
+   "group": "簡報",
+   "variant": "photo",
+   "category": "photo",
+   "pages": 1,
+   "seconds": 20.0,
+   "metrics": {
+    "text_recall": 0.875,
+    "text_precision": 1.0,
+    "text_f1": 0.9333333333333333,
+    "cer": 0.012578616352201259,
+    "cer_zh": 0.03773584905660377,
+    "cer_en": 0.0,
+    "page_cer": 0.01875,
+    "position_error_pt": 2.092636819483244,
+    "baseline_error_pt": 0.3457316682111263,
+    "size_error_pt": 0.8582174534992794,
+    "size_error_pct": 4.318146579901342,
+    "color_delta_e": 29.191219247789178,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.4166666666666667,
+    "font_top3": 0.5833333333333334,
+    "bold_accuracy": 0.25,
+    "italic_accuracy": 1.0,
+    "reading_order": 1.0,
+    "image_recall": 1.0,
+    "image_precision": 1.0,
+    "shape_recall": 0.0,
+    "shape_precision": 0.0,
+    "paragraph_pair_f1": 1.0,
+    "boxes_per_paragraph": 0.5,
+    "box_count_error": 0.3333333333333333,
+    "e2e_score": 0.6979571469479159,
+    "e2e_similarity": 0.9602331519126892,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.5,
+    "e2e_position_error_pt": 1.28995870790317,
+    "rasterized_page": 0.0,
+    "composite": 0.8107556541083306,
+    "fmt_pdf": 0.86,
+    "fmt_pptx": 0.69,
+    "fmt_docx_flow": 0.76,
+    "page_quad_success": 1.0,
+    "page_quad_review": 0.0,
+    "page_quad_silent_wrong": 0.0,
+    "quad_success": 1.0,
+    "quad_corner_err_pct": 0.010065368199027511,
+    "quad_flagged": 0.0,
+    "quad_confident_wrong": 0.0,
+    "quad_ms": 328.5332870000275,
+    "seconds_per_page": 20.0
+   },
+   "page_quad_status": [
+    "ok"
+   ],
+   "quad_status": [
+    "ok"
+   ],
+   "quad_confidence": [
+    0.8364515180232949
+   ]
+  },
+  {
+   "key": "doc_a4.pdf|native",
+   "sample": "doc_a4.pdf",
+   "group": "文件",
+   "variant": "native",
+   "category": "native",
+   "pages": 2,
+   "seconds": 7.53,
+   "metrics": {
+    "e2e_score": 0.9883219117675438,
+    "e2e_similarity": 0.9965137839317322,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 1.0,
+    "e2e_position_error_pt": 0.02188864240439757,
+    "rasterized_page": 0.0,
+    "composite": 0.9941609558837718,
+    "fmt_pdf": 0.999,
+    "fmt_pptx": 0.998,
+    "fmt_docx_flow": 0.988,
+    "seconds_per_page": 3.765
+   }
+  },
+  {
+   "key": "doc_a4.pdf|scan",
+   "sample": "doc_a4.pdf",
+   "group": "文件",
+   "variant": "scan",
+   "category": "scan",
+   "pages": 1,
+   "seconds": 26.23,
+   "metrics": {
+    "text_recall": 1.0,
+    "text_precision": 1.0,
+    "text_f1": 1.0,
+    "cer": 0.0026109660574412533,
+    "cer_zh": 0.005988023952095809,
+    "cer_en": 0.0,
+    "page_cer": 0.0026109660574412533,
+    "position_error_pt": 0.9695884062671923,
+    "baseline_error_pt": 0.22774414517873406,
+    "size_error_pt": 0.5146240773032623,
+    "size_error_pct": 4.65848040259481,
+    "color_delta_e": 29.97011638911093,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.41935483870967744,
+    "font_top3": 0.6774193548387096,
+    "bold_accuracy": 0.4838709677419355,
+    "italic_accuracy": 1.0,
+    "reading_order": 1.0,
+    "paragraph_pair_f1": 1.0,
+    "boxes_per_paragraph": 0.1111111111111111,
+    "box_count_error": 0.0,
+    "e2e_score": 0.717494247008463,
+    "e2e_similarity": 0.9806804060935974,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.5,
+    "e2e_position_error_pt": 1.7589200927917943,
+    "rasterized_page": 0.0,
+    "composite": 0.8626008931235005,
+    "fmt_pdf": 0.886,
+    "fmt_pptx": 0.705,
+    "fmt_docx_flow": 0.903,
+    "table_found": 1.0,
+    "table_shape_exact": 1.0,
+    "seconds_per_page": 26.23
+   }
+  },
+  {
+   "key": "doc_a4.pdf|photo",
+   "sample": "doc_a4.pdf",
+   "group": "文件",
+   "variant": "photo",
+   "category": "photo",
+   "pages": 1,
+   "seconds": 39.78,
+   "metrics": {
+    "text_recall": 1.0,
+    "text_precision": 1.0,
+    "text_f1": 1.0,
+    "cer": 0.06788511749347259,
+    "cer_zh": 0.1317365269461078,
+    "cer_en": 0.018518518518518517,
+    "page_cer": 0.06788511749347259,
+    "position_error_pt": 1.6334373035422063,
+    "baseline_error_pt": 0.3723697558839042,
+    "size_error_pt": 1.0207659409117527,
+    "size_error_pct": 8.619736025932202,
+    "color_delta_e": 42.973383591113205,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.22580645161290322,
+    "font_top3": 0.5161290322580645,
+    "bold_accuracy": 0.4838709677419355,
+    "italic_accuracy": 0.967741935483871,
+    "reading_order": 1.0,
+    "image_precision": 0.0,
+    "shape_precision": 0.0,
+    "paragraph_pair_f1": 1.0,
+    "boxes_per_paragraph": 0.1111111111111111,
+    "box_count_error": 0.0,
+    "e2e_score": 0.1650014169857342,
+    "e2e_similarity": 0.9826067686080933,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.5,
+    "e2e_position_error_pt": 1.4785384397007408,
+    "rasterized_page": 0.0,
+    "composite": 0.7590764866154908,
+    "fmt_pdf": 0.545,
+    "fmt_pptx": 0.405,
+    "fmt_docx_flow": 0.143,
+    "table_found": 1.0,
+    "table_shape_exact": 1.0,
+    "page_quad_success": 1.0,
+    "page_quad_review": 1.0,
+    "page_quad_silent_wrong": 0.0,
+    "quad_success": 1.0,
+    "quad_corner_err_pct": 0.028255097518213552,
+    "quad_flagged": 1.0,
+    "quad_confident_wrong": 0.0,
+    "quad_ms": 571.3776889999735,
+    "seconds_per_page": 39.78
+   },
+   "page_quad_status": [
+    "low_contrast"
+   ],
+   "quad_status": [
+    "low_contrast"
+   ],
+   "quad_confidence": [
+    0.21091952213005016
+   ]
+  },
+  {
+   "key": "doc_a4.pdf|curved_curl_top",
+   "sample": "doc_a4.pdf",
+   "group": "文件",
+   "variant": "curved_curl_top",
+   "category": "curved",
+   "pages": 1,
+   "seconds": 20.71,
+   "metrics": {
+    "text_recall": 0.9545454545454546,
+    "text_precision": 0.9545454545454546,
+    "text_f1": 0.9545454545454546,
+    "cer": 0.0027397260273972603,
+    "cer_zh": 0.006211180124223602,
+    "cer_en": 0.0,
+    "page_cer": 0.09660574412532637,
+    "position_error_pt": 1.5765985027523062,
+    "baseline_error_pt": 0.5302876317895576,
+    "size_error_pt": 0.852265571181693,
+    "size_error_pct": 7.7478688289244815,
+    "color_delta_e": 52.29732498646576,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.13793103448275862,
+    "font_top3": 0.5172413793103449,
+    "bold_accuracy": 0.27586206896551724,
+    "italic_accuracy": 1.0,
+    "reading_order": 0.9428571428571428,
+    "shape_precision": 0.0,
+    "paragraph_pair_f1": 1.0,
+    "boxes_per_paragraph": 0.2777777777777778,
+    "box_count_error": 1.5,
+    "dewarp_pos_p95_px": 8.410491691782557,
+    "page_coverage": 0.9937876506024096,
+    "background_frac": 0.0,
+    "pdf_text_cer": 0.005221932114882507,
+    "e2e_score": 0.3439679765416072,
+    "e2e_similarity": 0.9785513877868652,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.8,
+    "e2e_position_error_pt": 0.8819571267972488,
+    "rasterized_page": 0.0,
+    "composite": 0.7546419031082562,
+    "fmt_pdf": 0.825,
+    "fmt_pptx": 0.707,
+    "fmt_docx_flow": 0.314,
+    "table_found": 1.0,
+    "table_shape_exact": 0.0,
+    "page_quad_success": 0.0,
+    "page_quad_review": 1.0,
+    "page_quad_silent_wrong": 0.0,
+    "quad_success": 0.0,
+    "quad_corner_err_pct": 5.643071600836754,
+    "quad_flagged": 1.0,
+    "quad_confident_wrong": 0.0,
+    "quad_ms": 713.3299800000259,
+    "seconds_per_page": 20.71
+   },
+   "page_quad_status": [
+    "low_contrast"
+   ],
+   "quad_status": [
+    "low_contrast"
+   ],
+   "quad_confidence": [
+    0.050175321590595144
+   ]
+  },
+  {
+   "key": "cv_two_column.pdf|native",
+   "sample": "cv_two_column.pdf",
+   "group": "履歷",
+   "variant": "native",
+   "category": "native",
+   "pages": 1,
+   "seconds": 9.0,
+   "metrics": {
+    "e2e_score": 0.890753745441023,
+    "e2e_similarity": 0.9939765930175781,
+    "e2e_text_match": 1.0,
+    "e2e_linebreak_match": 0.9615384615384616,
+    "e2e_position_error_pt": 0.3765770076627947,
+    "rasterized_page": 0.0,
+    "composite": 0.9453768727205115,
+    "fmt_pdf": 0.927,
+    "fmt_pptx": 0.888,
+    "fmt_docx_flow": 0.93,
+    "seconds_per_page": 9.0
+   }
+  },
+  {
+   "key": "cv_two_column.pdf|screenshot",
+   "sample": "cv_two_column.pdf",
+   "group": "履歷",
+   "variant": "screenshot",
+   "category": "screenshot",
+   "pages": 1,
+   "seconds": 37.01,
+   "metrics": {
+    "text_recall": 1.0,
+    "text_precision": 1.0,
+    "text_f1": 1.0,
+    "cer": 0.0007042253521126761,
+    "cer_en": 0.0007042253521126761,
+    "page_cer": 0.0007042253521126761,
+    "position_error_pt": 1.9570534750704003,
+    "baseline_error_pt": 0.17045762387689736,
+    "size_error_pt": 0.3494369969823936,
+    "size_error_pct": 3.957373913637104,
+    "color_delta_e": 10.617579594235751,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.09615384615384616,
+    "font_top3": 0.4230769230769231,
+    "bold_accuracy": 0.2692307692307692,
+    "italic_accuracy": 1.0,
+    "shape_kind_accuracy": 1.0,
+    "reading_order": 0.8974358974358975,
+    "shape_recall": 0.75,
+    "shape_precision": 0.8571428571428571,
+    "paragraph_pair_f1": 0.7777777777777778,
+    "boxes_per_paragraph": 0.5263157894736842,
+    "box_count_error": 0.23076923076923078,
+    "e2e_score": 0.6725492908617777,
+    "e2e_similarity": 0.9821291565895081,
+    "e2e_text_match": 0.85,
+    "e2e_linebreak_match": 0.75,
+    "e2e_position_error_pt": 0.8624600648185575,
+    "rasterized_page": 0.0,
+    "composite": 0.805761133268535,
+    "fmt_pdf": 0.783,
+    "fmt_pptx": 0.667,
+    "fmt_docx_flow": 0.713,
+    "seconds_per_page": 37.01
+   }
+  },
+  {
+   "key": "cv_two_column.pdf|curved_bend",
+   "sample": "cv_two_column.pdf",
+   "group": "履歷",
+   "variant": "curved_bend",
+   "category": "curved",
+   "pages": 1,
+   "seconds": 32.45,
+   "metrics": {
+    "text_recall": 0.9038461538461539,
+    "text_precision": 1.0,
+    "text_f1": 0.9494949494949495,
+    "cer": 0.004035512510088781,
+    "cer_en": 0.004035512510088781,
+    "page_cer": 0.13098591549295774,
+    "position_error_pt": 1.92390443315874,
+    "baseline_error_pt": 0.17551271682980654,
+    "size_error_pt": 0.7629518914299925,
+    "size_error_pct": 8.344389746494407,
+    "color_delta_e": 22.468521409916857,
+    "orientation_accuracy": 1.0,
+    "font_top1": 0.0,
+    "font_top3": 0.0851063829787234,
+    "bold_accuracy": 0.3191489361702128,
+    "italic_accuracy": 0.9148936170212766,
+    "shape_kind_accuracy": 0.8333333333333334,
+    "reading_order": 0.8917668825161887,
+    "shape_recall": 0.75,
+    "shape_precision": 0.6666666666666666,
+    "paragraph_pair_f1": 0.6875,
+    "boxes_per_paragraph": 0.5526315789473685,
+    "box_count_error": 0.19230769230769232,
+    "dewarp_pos_p95_px": 13.793716367001155,
+    "page_coverage": 0.5766594516594516,
+    "background_frac": 0.004139258065959606,
+    "pdf_text_cer": 0.13098591549295774,
+    "e2e_score": 0.46174726462801,
+    "e2e_similarity": 0.9724968671798706,
+    "e2e_text_match": 0.6666666666666666,
+    "e2e_linebreak_match": 0.6190476190476191,
+    "e2e_position_error_pt": 3.3347336627386226,
+    "rasterized_page": 0.0,
+    "composite": 0.7148270311255082,
+    "fmt_pdf": 0.536,
+    "fmt_pptx": 0.44,
+    "fmt_docx_flow": 1.0,
+    "page_quad_success": 0.0,
+    "page_quad_review": 1.0,
+    "page_quad_silent_wrong": 0.0,
+    "quad_success": 0.0,
+    "quad_corner_err_pct": 26.399600360144426,
+    "quad_flagged": 1.0,
+    "quad_confident_wrong": 0.0,
+    "quad_ms": 364.33905500007313,
+    "seconds_per_page": 32.45
+   },
+   "page_quad_status": [
+    "curved_edge"
+   ],
+   "quad_status": [
+    "curved_edge"
+   ],
+   "quad_confidence": [
+    0.0500000482851022
+   ]
+  }
+ ],
+ "summary": {
+  "overall": {
+   "background_frac": {
+    "mean": 0.002069629032979803,
+    "n": 2
+   },
+   "baseline_error_pt": {
+    "mean": 0.2748410168845813,
+    "n": 7
+   },
+   "bold_accuracy": {
+    "mean": 0.44028338712148146,
+    "n": 7
+   },
+   "box_count_error": {
+    "mean": 0.36996336996337,
+    "n": 7
+   },
+   "boxes_per_paragraph": {
+    "mean": 0.3684210526315789,
+    "n": 7
+   },
+   "cer": {
+    "mean": 0.012936309113244832,
+    "n": 7
+   },
+   "cer_en": {
+    "mean": 0.0033226080543885678,
+    "n": 7
+   },
+   "cer_zh": {
+    "mean": 0.0363343160158062,
+    "n": 5
+   },
+   "color_delta_e": {
+    "mean": 27.304811627134967,
+    "n": 7
+   },
+   "composite": {
+    "mean": 0.8296189036372695,
+    "n": 10
+   },
+   "dewarp_pos_p95_px": {
+    "mean": 11.102104029391857,
+    "n": 2
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.7130586080586081,
+    "n": 10
+   },
+   "e2e_position_error_pt": {
+    "mean": 1.094663527367608,
+    "n": 10
+   },
+   "e2e_score": {
+    "mean": 0.5961570799714931,
+    "n": 10
+   },
+   "e2e_similarity": {
+    "mean": 0.9837106764316559,
+    "n": 10
+   },
+   "e2e_text_match": {
+    "mean": 0.9516666666666665,
+    "n": 10
+   },
+   "fmt_docx_flow": {
+    "mean": 0.6719,
+    "n": 10
+   },
+   "fmt_pdf": {
+    "mean": 0.8255000000000001,
+    "n": 10
+   },
+   "fmt_pptx": {
+    "mean": 0.7215,
+    "n": 10
+   },
+   "font_top1": {
+    "mean": 0.30417802442274083,
+    "n": 7
+   },
+   "font_top3": {
+    "mean": 0.5312818674946808,
+    "n": 7
+   },
+   "image_precision": {
+    "mean": 0.5,
+    "n": 2
+   },
+   "image_recall": {
+    "mean": 0.5,
+    "n": 2
+   },
+   "italic_accuracy": {
+    "mean": 0.9832336503578782,
+    "n": 7
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 7
+   },
+   "page_cer": {
+    "mean": 0.04625599550304438,
+    "n": 7
+   },
+   "page_coverage": {
+    "mean": 0.7852235511309307,
+    "n": 2
+   },
+   "page_quad_review": {
+    "mean": 0.75,
+    "n": 4
+   },
+   "page_quad_silent_wrong": {
+    "mean": 0.0,
+    "n": 4
+   },
+   "page_quad_success": {
+    "mean": 0.5,
+    "n": 4
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.923611111111111,
+    "n": 7
+   },
+   "pdf_text_cer": {
+    "mean": 0.06810392380392012,
+    "n": 2
+   },
+   "position_error_pt": {
+    "mean": 1.7074840426846405,
+    "n": 7
+   },
+   "quad_confident_wrong": {
+    "mean": 0.0,
+    "n": 4
+   },
+   "quad_corner_err_pct": {
+    "mean": 8.020248106674606,
+    "n": 4
+   },
+   "quad_flagged": {
+    "mean": 0.75,
+    "n": 4
+   },
+   "quad_ms": {
+    "mean": 494.395002750025,
+    "n": 4
+   },
+   "quad_success": {
+    "mean": 0.5,
+    "n": 4
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 10
+   },
+   "reading_order": {
+    "mean": 0.9617228461156042,
+    "n": 7
+   },
+   "seconds_per_page": {
+    "mean": 20.851499999999998,
+    "n": 10
+   },
+   "shape_kind_accuracy": {
+    "mean": 0.9444444444444445,
+    "n": 3
+   },
+   "shape_precision": {
+    "mean": 0.29563492063492064,
+    "n": 6
+   },
+   "shape_recall": {
+    "mean": 0.625,
+    "n": 4
+   },
+   "size_error_pct": {
+    "mean": 5.579272433986286,
+    "n": 7
+   },
+   "size_error_pt": {
+    "mean": 0.6594092699202384,
+    "n": 7
+   },
+   "table_found": {
+    "mean": 1.0,
+    "n": 3
+   },
+   "table_shape_exact": {
+    "mean": 0.6666666666666666,
+    "n": 3
+   },
+   "text_f1": {
+    "mean": 0.9672438672438674,
+    "n": 7
+   },
+   "text_precision": {
+    "mean": 0.9935064935064936,
+    "n": 7
+   },
+   "text_recall": {
+    "mean": 0.9440559440559442,
+    "n": 7
+   }
+  },
+  "images": {
+   "background_frac": {
+    "mean": 0.002069629032979803,
+    "n": 2
+   },
+   "baseline_error_pt": {
+    "mean": 0.2748410168845813,
+    "n": 7
+   },
+   "bold_accuracy": {
+    "mean": 0.44028338712148146,
+    "n": 7
+   },
+   "box_count_error": {
+    "mean": 0.36996336996337,
+    "n": 7
+   },
+   "boxes_per_paragraph": {
+    "mean": 0.3684210526315789,
+    "n": 7
+   },
+   "cer": {
+    "mean": 0.012936309113244832,
+    "n": 7
+   },
+   "cer_en": {
+    "mean": 0.0033226080543885678,
+    "n": 7
+   },
+   "cer_zh": {
+    "mean": 0.0363343160158062,
+    "n": 5
+   },
+   "color_delta_e": {
+    "mean": 27.304811627134967,
+    "n": 7
+   },
+   "composite": {
+    "mean": 0.7907812279554267,
+    "n": 7
+   },
+   "dewarp_pos_p95_px": {
+    "mean": 11.102104029391857,
+    "n": 2
+   },
+   "e2e_linebreak_match": {
+    "mean": 0.5955782312925171,
+    "n": 7
+   },
+   "e2e_position_error_pt": {
+    "mean": 1.5057533298642478,
+    "n": 7
+   },
+   "e2e_score": {
+    "mean": 0.4914471311922166,
+    "n": 7
+   },
+   "e2e_similarity": {
+    "mean": 0.9783356785774231,
+    "n": 7
+   },
+   "e2e_text_match": {
+    "mean": 0.930952380952381,
+    "n": 7
+   },
+   "fmt_docx_flow": {
+    "mean": 0.5977142857142858,
+    "n": 7
+   },
+   "fmt_pdf": {
+    "mean": 0.7615714285714285,
+    "n": 7
+   },
+   "fmt_pptx": {
+    "mean": 0.6185714285714285,
+    "n": 7
+   },
+   "font_top1": {
+    "mean": 0.30417802442274083,
+    "n": 7
+   },
+   "font_top3": {
+    "mean": 0.5312818674946808,
+    "n": 7
+   },
+   "image_precision": {
+    "mean": 0.5,
+    "n": 2
+   },
+   "image_recall": {
+    "mean": 0.5,
+    "n": 2
+   },
+   "italic_accuracy": {
+    "mean": 0.9832336503578782,
+    "n": 7
+   },
+   "orientation_accuracy": {
+    "mean": 1.0,
+    "n": 7
+   },
+   "page_cer": {
+    "mean": 0.04625599550304438,
+    "n": 7
+   },
+   "page_coverage": {
+    "mean": 0.7852235511309307,
+    "n": 2
+   },
+   "page_quad_review": {
+    "mean": 0.75,
+    "n": 4
+   },
+   "page_quad_silent_wrong": {
+    "mean": 0.0,
+    "n": 4
+   },
+   "page_quad_success": {
+    "mean": 0.5,
+    "n": 4
+   },
+   "paragraph_pair_f1": {
+    "mean": 0.923611111111111,
+    "n": 7
+   },
+   "pdf_text_cer": {
+    "mean": 0.06810392380392012,
+    "n": 2
+   },
+   "position_error_pt": {
+    "mean": 1.7074840426846405,
+    "n": 7
+   },
+   "quad_confident_wrong": {
+    "mean": 0.0,
+    "n": 4
+   },
+   "quad_corner_err_pct": {
+    "mean": 8.020248106674606,
+    "n": 4
+   },
+   "quad_flagged": {
+    "mean": 0.75,
+    "n": 4
+   },
+   "quad_ms": {
+    "mean": 494.395002750025,
+    "n": 4
+   },
+   "quad_success": {
+    "mean": 0.5,
+    "n": 4
+   },
+   "rasterized_page": {
+    "mean": 0.0,
+    "n": 7
+   },
+   "reading_order": {
+    "mean": 0.9617228461156042,
+    "n": 7
+   },
+   "seconds_per_page": {
+    "mean": 26.782857142857146,
+    "n": 7
+   },
+   "shape_kind_accuracy": {
+    "mean": 0.9444444444444445,
+    "n": 3
+   },
+   "shape_precision": {
+    "mean": 0.29563492063492064,
+    "n": 6
+   },
+   "shape_recall": {
+    "mean": 0.625,
+    "n": 4
+   },
+   "size_error_pct": {
+    "mean": 5.579272433986286,
+    "n": 7
+   },
+   "size_error_pt": {
+    "mean": 0.6594092699202384,
+    "n": 7
+   },
+   "table_found": {
+    "mean": 1.0,
+    "n": 3
+   },
+   "table_shape_exact": {
+    "mean": 0.6666666666666666,
+    "n": 3
+   },
+   "text_f1": {
+    "mean": 0.9672438672438674,
+    "n": 7
+   },
+   "text_precision": {
+    "mean": 0.9935064935064936,
+    "n": 7
+   },
+   "text_recall": {
+    "mean": 0.9440559440559442,
+    "n": 7
+   }
+  },
+  "by_type": {
+   "native": {
+    "composite": {
+     "mean": 0.9202401468949026,
+     "n": 3
+    },
+    "e2e_linebreak_match": {
+     "mean": 0.9871794871794872,
+     "n": 3
+    },
+    "e2e_position_error_pt": {
+     "mean": 0.13545398820878157,
+     "n": 3
+    },
+    "e2e_score": {
+     "mean": 0.8404802937898053,
+     "n": 3
+    },
+    "e2e_similarity": {
+     "mean": 0.9962523380915324,
+     "n": 3
+    },
+    "e2e_text_match": {
+     "mean": 1.0,
+     "n": 3
+    },
+    "fmt_docx_flow": {
+     "mean": 0.8450000000000001,
+     "n": 3
+    },
+    "fmt_pdf": {
+     "mean": 0.9746666666666667,
+     "n": 3
+    },
+    "fmt_pptx": {
+     "mean": 0.9616666666666666,
+     "n": 3
+    },
+    "rasterized_page": {
+     "mean": 0.0,
+     "n": 3
+    },
+    "seconds_per_page": {
+     "mean": 7.011666666666667,
+     "n": 3
+    }
+   },
+   "screenshot": {
+    "baseline_error_pt": {
+     "mean": 0.13612060014947028,
+     "n": 2
+    },
+    "bold_accuracy": {
+     "mean": 0.6346153846153846,
+     "n": 2
+    },
+    "box_count_error": {
+     "mean": 0.28205128205128205,
+     "n": 2
+    },
+    "boxes_per_paragraph": {
+     "mean": 0.513157894736842,
+     "n": 2
+    },
+    "cer": {
+     "mean": 0.00035211267605633805,
+     "n": 2
+    },
+    "cer_en": {
+     "mean": 0.00035211267605633805,
+     "n": 2
+    },
+    "cer_zh": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "color_delta_e": {
+     "mean": 7.116557882774405,
+     "n": 2
+    },
+    "composite": {
+     "mean": 0.8167833138034503,
+     "n": 2
+    },
+    "e2e_linebreak_match": {
+     "mean": 0.625,
+     "n": 2
+    },
+    "e2e_position_error_pt": {
+     "mean": 0.8980826395590791,
+     "n": 2
+    },
+    "e2e_score": {
+     "mean": 0.526980933116893,
+     "n": 2
+    },
+    "e2e_similarity": {
+     "mean": 0.986890584230423,
+     "n": 2
+    },
+    "e2e_text_match": {
+     "mean": 0.925,
+     "n": 2
+    },
+    "fmt_docx_flow": {
+     "mean": 0.532,
+     "n": 2
+    },
+    "fmt_pdf": {
+     "mean": 0.8395,
+     "n": 2
+    },
+    "fmt_pptx": {
+     "mean": 0.6915,
+     "n": 2
+    },
+    "font_top1": {
+     "mean": 0.46474358974358976,
+     "n": 2
+    },
+    "font_top3": {
+     "mean": 0.6698717948717948,
+     "n": 2
+    },
+    "image_recall": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "italic_accuracy": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "orientation_accuracy": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "page_cer": {
+     "mean": 0.003477112676056338,
+     "n": 2
+    },
+    "paragraph_pair_f1": {
+     "mean": 0.8888888888888888,
+     "n": 2
+    },
+    "position_error_pt": {
+     "mean": 1.8781114167943966,
+     "n": 2
+    },
+    "rasterized_page": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "reading_order": {
+     "mean": 0.9487179487179487,
+     "n": 2
+    },
+    "seconds_per_page": {
+     "mean": 24.155,
+     "n": 2
+    },
+    "shape_kind_accuracy": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "shape_precision": {
+     "mean": 0.5535714285714286,
+     "n": 2
+    },
+    "shape_recall": {
+     "mean": 0.875,
+     "n": 2
+    },
+    "size_error_pct": {
+     "mean": 2.6831427270283803,
+     "n": 2
+    },
+    "size_error_pt": {
+     "mean": 0.303519977557845,
+     "n": 2
+    },
+    "text_f1": {
+     "mean": 0.9666666666666667,
+     "n": 2
+    },
+    "text_precision": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "text_recall": {
+     "mean": 0.9375,
+     "n": 2
+    }
+   },
+   "scan": {
+    "baseline_error_pt": {
+     "mean": 0.22774414517873406,
+     "n": 1
+    },
+    "bold_accuracy": {
+     "mean": 0.4838709677419355,
+     "n": 1
+    },
+    "box_count_error": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "boxes_per_paragraph": {
+     "mean": 0.1111111111111111,
+     "n": 1
+    },
+    "cer": {
+     "mean": 0.0026109660574412533,
+     "n": 1
+    },
+    "cer_en": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "cer_zh": {
+     "mean": 0.005988023952095809,
+     "n": 1
+    },
+    "color_delta_e": {
+     "mean": 29.97011638911093,
+     "n": 1
+    },
+    "composite": {
+     "mean": 0.8626008931235005,
+     "n": 1
+    },
+    "e2e_linebreak_match": {
+     "mean": 0.5,
+     "n": 1
+    },
+    "e2e_position_error_pt": {
+     "mean": 1.7589200927917943,
+     "n": 1
+    },
+    "e2e_score": {
+     "mean": 0.717494247008463,
+     "n": 1
+    },
+    "e2e_similarity": {
+     "mean": 0.9806804060935974,
+     "n": 1
+    },
+    "e2e_text_match": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "fmt_docx_flow": {
+     "mean": 0.903,
+     "n": 1
+    },
+    "fmt_pdf": {
+     "mean": 0.886,
+     "n": 1
+    },
+    "fmt_pptx": {
+     "mean": 0.705,
+     "n": 1
+    },
+    "font_top1": {
+     "mean": 0.41935483870967744,
+     "n": 1
+    },
+    "font_top3": {
+     "mean": 0.6774193548387096,
+     "n": 1
+    },
+    "italic_accuracy": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "orientation_accuracy": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "page_cer": {
+     "mean": 0.0026109660574412533,
+     "n": 1
+    },
+    "paragraph_pair_f1": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "position_error_pt": {
+     "mean": 0.9695884062671923,
+     "n": 1
+    },
+    "rasterized_page": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "reading_order": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "seconds_per_page": {
+     "mean": 26.23,
+     "n": 1
+    },
+    "size_error_pct": {
+     "mean": 4.65848040259481,
+     "n": 1
+    },
+    "size_error_pt": {
+     "mean": 0.5146240773032623,
+     "n": 1
+    },
+    "table_found": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "table_shape_exact": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "text_f1": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "text_precision": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "text_recall": {
+     "mean": 1.0,
+     "n": 1
+    }
+   },
+   "photo": {
+    "baseline_error_pt": {
+     "mean": 0.35905071204751526,
+     "n": 2
+    },
+    "bold_accuracy": {
+     "mean": 0.36693548387096775,
+     "n": 2
+    },
+    "box_count_error": {
+     "mean": 0.16666666666666666,
+     "n": 2
+    },
+    "boxes_per_paragraph": {
+     "mean": 0.3055555555555556,
+     "n": 2
+    },
+    "cer": {
+     "mean": 0.04023186692283692,
+     "n": 2
+    },
+    "cer_en": {
+     "mean": 0.009259259259259259,
+     "n": 2
+    },
+    "cer_zh": {
+     "mean": 0.08473618800135578,
+     "n": 2
+    },
+    "color_delta_e": {
+     "mean": 36.08230141945119,
+     "n": 2
+    },
+    "composite": {
+     "mean": 0.7849160703619107,
+     "n": 2
+    },
+    "e2e_linebreak_match": {
+     "mean": 0.5,
+     "n": 2
+    },
+    "e2e_position_error_pt": {
+     "mean": 1.3842485738019554,
+     "n": 2
+    },
+    "e2e_score": {
+     "mean": 0.43147928196682506,
+     "n": 2
+    },
+    "e2e_similarity": {
+     "mean": 0.9714199602603912,
+     "n": 2
+    },
+    "e2e_text_match": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "fmt_docx_flow": {
+     "mean": 0.4515,
+     "n": 2
+    },
+    "fmt_pdf": {
+     "mean": 0.7025,
+     "n": 2
+    },
+    "fmt_pptx": {
+     "mean": 0.5475,
+     "n": 2
+    },
+    "font_top1": {
+     "mean": 0.32123655913978494,
+     "n": 2
+    },
+    "font_top3": {
+     "mean": 0.549731182795699,
+     "n": 2
+    },
+    "image_precision": {
+     "mean": 0.5,
+     "n": 2
+    },
+    "image_recall": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "italic_accuracy": {
+     "mean": 0.9838709677419355,
+     "n": 2
+    },
+    "orientation_accuracy": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "page_cer": {
+     "mean": 0.0433175587467363,
+     "n": 2
+    },
+    "page_quad_review": {
+     "mean": 0.5,
+     "n": 2
+    },
+    "page_quad_silent_wrong": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "page_quad_success": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "paragraph_pair_f1": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "position_error_pt": {
+     "mean": 1.8630370615127252,
+     "n": 2
+    },
+    "quad_confident_wrong": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "quad_corner_err_pct": {
+     "mean": 0.01916023285862053,
+     "n": 2
+    },
+    "quad_flagged": {
+     "mean": 0.5,
+     "n": 2
+    },
+    "quad_ms": {
+     "mean": 449.9554880000005,
+     "n": 2
+    },
+    "quad_success": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "rasterized_page": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "reading_order": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "seconds_per_page": {
+     "mean": 29.89,
+     "n": 2
+    },
+    "shape_precision": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "shape_recall": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "size_error_pct": {
+     "mean": 6.468941302916772,
+     "n": 2
+    },
+    "size_error_pt": {
+     "mean": 0.9394916972055161,
+     "n": 2
+    },
+    "table_found": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "table_shape_exact": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "text_f1": {
+     "mean": 0.9666666666666667,
+     "n": 2
+    },
+    "text_precision": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "text_recall": {
+     "mean": 0.9375,
+     "n": 2
+    }
+   },
+   "curved": {
+    "background_frac": {
+     "mean": 0.002069629032979803,
+     "n": 2
+    },
+    "baseline_error_pt": {
+     "mean": 0.35290017430968207,
+     "n": 2
+    },
+    "bold_accuracy": {
+     "mean": 0.297505502567865,
+     "n": 2
+    },
+    "box_count_error": {
+     "mean": 0.8461538461538461,
+     "n": 2
+    },
+    "boxes_per_paragraph": {
+     "mean": 0.41520467836257313,
+     "n": 2
+    },
+    "cer": {
+     "mean": 0.0033876192687430206,
+     "n": 2
+    },
+    "cer_en": {
+     "mean": 0.0020177562550443904,
+     "n": 2
+    },
+    "cer_zh": {
+     "mean": 0.006211180124223602,
+     "n": 1
+    },
+    "color_delta_e": {
+     "mean": 37.38292319819131,
+     "n": 2
+    },
+    "composite": {
+     "mean": 0.7347344671168822,
+     "n": 2
+    },
+    "dewarp_pos_p95_px": {
+     "mean": 11.102104029391857,
+     "n": 2
+    },
+    "e2e_linebreak_match": {
+     "mean": 0.7095238095238096,
+     "n": 2
+    },
+    "e2e_position_error_pt": {
+     "mean": 2.1083453947679356,
+     "n": 2
+    },
+    "e2e_score": {
+     "mean": 0.4028576205848086,
+     "n": 2
+    },
+    "e2e_similarity": {
+     "mean": 0.9755241274833679,
+     "n": 2
+    },
+    "e2e_text_match": {
+     "mean": 0.8333333333333333,
+     "n": 2
+    },
+    "fmt_docx_flow": {
+     "mean": 0.657,
+     "n": 2
+    },
+    "fmt_pdf": {
+     "mean": 0.6805,
+     "n": 2
+    },
+    "fmt_pptx": {
+     "mean": 0.5735,
+     "n": 2
+    },
+    "font_top1": {
+     "mean": 0.06896551724137931,
+     "n": 2
+    },
+    "font_top3": {
+     "mean": 0.30117388114453414,
+     "n": 2
+    },
+    "italic_accuracy": {
+     "mean": 0.9574468085106382,
+     "n": 2
+    },
+    "orientation_accuracy": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "page_cer": {
+     "mean": 0.11379582980914205,
+     "n": 2
+    },
+    "page_coverage": {
+     "mean": 0.7852235511309307,
+     "n": 2
+    },
+    "page_quad_review": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "page_quad_silent_wrong": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "page_quad_success": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "paragraph_pair_f1": {
+     "mean": 0.84375,
+     "n": 2
+    },
+    "pdf_text_cer": {
+     "mean": 0.06810392380392012,
+     "n": 2
+    },
+    "position_error_pt": {
+     "mean": 1.7502514679555232,
+     "n": 2
+    },
+    "quad_confident_wrong": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "quad_corner_err_pct": {
+     "mean": 16.02133598049059,
+     "n": 2
+    },
+    "quad_flagged": {
+     "mean": 1.0,
+     "n": 2
+    },
+    "quad_ms": {
+     "mean": 538.8345175000495,
+     "n": 2
+    },
+    "quad_success": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "rasterized_page": {
+     "mean": 0.0,
+     "n": 2
+    },
+    "reading_order": {
+     "mean": 0.9173120126866658,
+     "n": 2
+    },
+    "seconds_per_page": {
+     "mean": 26.580000000000002,
+     "n": 2
+    },
+    "shape_kind_accuracy": {
+     "mean": 0.8333333333333334,
+     "n": 1
+    },
+    "shape_precision": {
+     "mean": 0.3333333333333333,
+     "n": 2
+    },
+    "shape_recall": {
+     "mean": 0.75,
+     "n": 1
+    },
+    "size_error_pct": {
+     "mean": 8.046129287709444,
+     "n": 2
+    },
+    "size_error_pt": {
+     "mean": 0.8076087313058428,
+     "n": 2
+    },
+    "table_found": {
+     "mean": 1.0,
+     "n": 1
+    },
+    "table_shape_exact": {
+     "mean": 0.0,
+     "n": 1
+    },
+    "text_f1": {
+     "mean": 0.952020202020202,
+     "n": 2
+    },
+    "text_precision": {
+     "mean": 0.9772727272727273,
+     "n": 2
+    },
+    "text_recall": {
+     "mean": 0.9291958041958042,
+     "n": 2
+    }
+   }
+  }
+ },
+ "headline": {
+  "page_cer": {
+   "mean": 0.04625599550304438,
+   "n": 7,
+   "scope": "images"
+  },
+  "size_error_pt": {
+   "mean": 0.6594092699202384,
+   "n": 7,
+   "scope": "images"
+  },
+  "e2e_score": {
+   "mean": 0.5961570799714931,
+   "n": 10,
+   "scope": "overall"
+  },
+  "fmt_pdf": {
+   "mean": 0.8255000000000001,
+   "n": 10,
+   "scope": "overall"
+  },
+  "fmt_pptx": {
+   "mean": 0.7215,
+   "n": 10,
+   "scope": "overall"
+  },
+  "fmt_docx_flow": {
+   "mean": 0.6719,
+   "n": 10,
+   "scope": "overall"
+  },
+  "quad_success": {
+   "mean": 0.5,
+   "n": 4,
+   "scope": "images"
+  },
+  "quad_confident_wrong": {
+   "mean": 0.0,
+   "n": 4,
+   "scope": "images"
+  },
+  "page_quad_success": {
+   "mean": 0.5,
+   "n": 4,
+   "scope": "images"
+  },
+  "page_quad_silent_wrong": {
+   "mean": 0.0,
+   "n": 4,
+   "scope": "images"
+  },
+  "table_shape_exact": {
+   "mean": 0.6666666666666666,
+   "n": 3,
+   "scope": "images"
+  },
+  "seconds_per_page": {
+   "mean": 20.851499999999998,
+   "n": 10,
+   "scope": "overall"
+  }
+ },
+ "metric_meta": {
+  "background_frac": {
+   "label": "輸出裡不是這張紙的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "baseline_error_pt": {
+   "label": "基線偏移",
+   "unit": "pt",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "bold_accuracy": {
+   "label": "粗體正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "box_count_error": {
+   "label": "文字框數相對誤差（與標準答案比）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "boxes_per_paragraph": {
+   "label": "文字框數 ÷ 段落數（越低越不碎）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "cer": {
+   "label": "文字錯字率（找到的行）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "cer_en": {
+   "label": "字元錯誤率（英文與數字標點）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "cer_zh": {
+   "label": "字元錯誤率（中文）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "color_delta_e": {
+   "label": "文字顏色差（CIE76 ΔE）",
+   "unit": "ΔE",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "composite": {
+   "label": "綜合分數（評測模組）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "dewarp_pos_p95_px": {
+   "label": "攤平位置誤差 p95（頁面像素，150 dpi）",
+   "unit": "px",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "e2e_linebreak_match": {
+   "label": "斷行一致率（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "e2e_position_error_pt": {
+   "label": "輸出位置誤差（⑦）",
+   "unit": "pt",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "e2e_score": {
+   "label": "還原度總分（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "e2e_similarity": {
+   "label": "整頁相似度（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "e2e_text_match": {
+   "label": "文字一致率（⑦）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "fmt_docx_flow": {
+   "label": "⑦ Word（可重排） 分數",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "fmt_pdf": {
+   "label": "⑦ 可編輯 PDF 分數",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "fmt_pptx": {
+   "label": "⑦ PowerPoint 分數",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "font_top1": {
+   "label": "字型命中率（第一名）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "font_top3": {
+   "label": "字型命中率（前三名）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "image_precision": {
+   "label": "圖片精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "image_recall": {
+   "label": "圖片召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "italic_accuracy": {
+   "label": "斜體正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "orientation_accuracy": {
+   "label": "文字方向正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "page_cer": {
+   "label": "文字錯字率（整頁，含漏字多字）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": "0.01"
+  },
+  "page_coverage": {
+   "label": "頁面覆蓋率（頁面有多少落在輸出裡）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "page_quad_review": {
+   "label": "流程請使用者確認四角的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "page_quad_silent_wrong": {
+   "label": "流程用錯的四角卻沒請使用者確認的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": "0"
+  },
+  "page_quad_success": {
+   "label": "照片四角成功率（整條流程，②最後用的四角）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0"
+  },
+  "paragraph_pair_f1": {
+   "label": "段落分組成對 F1",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "pdf_text_cer": {
+   "label": "文字錯字率（彎曲照片，以 PDF 文字層為答案）",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": "0.02"
+  },
+  "position_error_pt": {
+   "label": "文字行位置誤差（四角平均，與方向無關）",
+   "unit": "pt",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "quad_confident_wrong": {
+   "label": "四角錯了卻沒請使用者確認的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": "0"
+  },
+  "quad_corner_err_pct": {
+   "label": "照片四角最大誤差（佔對角線）",
+   "unit": "%",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "quad_flagged": {
+   "label": "請使用者確認四角的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "quad_success": {
+   "label": "照片四角成功率（誤差 ≤ 對角線 1%）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0"
+  },
+  "rasterized_page": {
+   "label": "整頁變成圖片（文字不可編輯）的比例",
+   "unit": "比例",
+   "higher_is_better": false,
+   "gate": "0"
+  },
+  "reading_order": {
+   "label": "閱讀順序一致率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "seconds_per_page": {
+   "label": "每頁處理時間",
+   "unit": "秒",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "shape_kind_accuracy": {
+   "label": "形狀種類正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "shape_precision": {
+   "label": "形狀精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "shape_recall": {
+   "label": "形狀召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "size_error_pct": {
+   "label": "字級相對誤差",
+   "unit": "%",
+   "higher_is_better": false,
+   "gate": null
+  },
+  "size_error_pt": {
+   "label": "字級誤差",
+   "unit": "pt",
+   "higher_is_better": false,
+   "gate": "0.25"
+  },
+  "table_found": {
+   "label": "表格找到率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0"
+  },
+  "table_shape_exact": {
+   "label": "表格列數欄數完全正確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0"
+  },
+  "text_f1": {
+   "label": "文字行找到率（F1）",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": "0.02"
+  },
+  "text_precision": {
+   "label": "文字行精確率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  },
+  "text_recall": {
+   "label": "文字行召回率",
+   "unit": "比例",
+   "higher_is_better": true,
+   "gate": null
+  }
+ },
+ "errors": []
+}
