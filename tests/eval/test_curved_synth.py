@@ -75,11 +75,11 @@ def test_dewarp_geometry_perfect_and_wrong_maps():
 
 
 def test_pdf_text_cer_assignment():
-    truth = [{"text": "Module Study Plan", "bbox": [100, 100, 400, 130]}, {"text": "第二行 文字", "bbox": [100, 200, 300, 230]}]
-    perfect = [("Module Study", (200, 115)), ("Plan", (380, 116)), ("第二行文字", (200, 215))]
+    truth = [{"text": "Garden Club Rota", "bbox": [100, 100, 400, 130]}, {"text": "第二行 文字", "bbox": [100, 200, 300, 230]}]
+    perfect = [("Garden Club", (200, 115)), ("Rota", (380, 116)), ("第二行文字", (200, 215))]
     assert M.pdf_text_cer(perfect, truth)["pdf_text_cer"] == 0.0
-    one = M.pdf_text_cer([("Module Studv Plan", (250, 115)), ("第二行文字", (200, 215))], truth)
-    assert one["errors"] == 1 and one["chars"] == len("ModuleStudyPlan") + len("第二行文字")
+    one = M.pdf_text_cer([("Garden Clnb Rota", (250, 115)), ("第二行文字", (200, 215))], truth)
+    assert one["errors"] == 1 and one["chars"] == len("GardenClubRota") + len("第二行文字")
     stray = M.pdf_text_cer(perfect + [("noise", (900, 900)), ("x", None)], truth)
     assert stray["unassigned"] == 2 and stray["errors"] == 6
 
@@ -88,7 +88,7 @@ def test_table_page_has_text_layer_and_grid():
     img, lines = S.table_page(seed=0)
     assert img.shape[:2] == (1754, 1241)
     texts = " ".join(t["text"] for t in lines)
-    assert "Module Study Plan 6003" in texts and "Session 1" in texts and len(lines) > 40
+    assert "Garden Club Work Rota 4127" in texts and "Morning" in texts and len(lines) > 40
     gray = img.mean(axis=2)
     dark_rows = (gray < 128).mean(axis=1) > 0.6  # 表格橫線：整列大半是黑的
     assert dark_rows.sum() >= 14

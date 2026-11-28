@@ -35,7 +35,7 @@ class PageSpec(Model):
     quad_corner_error_px: list[float] = []  # 四角各自的位置誤差（來源影像像素，約一個標準差）：左上、右上、右下、左下
     quad_alternatives: list[list[Point]] = []  # 其他候選的頁面四角（來源座標，每組 4 點，依分數由高到低）：例如照片裡的第二張紙
     source_outline: list[Point] = []  # 紙邊彎曲時的頁面外框（來源座標，沿外框依序取點）；平的紙留空，用 source_corners
-    dewarp_map: Optional[BlobRef] = None  # 彎曲的紙攤平時：工作影像每個像素對應到來源影像哪裡（npz：map_x、map_y，float32）；沒有攤平就留空
+    dewarp_map: Optional[BlobRef] = None  # 彎曲的紙攤平時：工作影像每個像素對應到來源影像哪裡（npz：mortise.dewarp_map/2 粗網格（format、shape、rows、cols、grid_x、grid_y），用 recognition.dewarp.load_maps 讀；舊產物是逐像素的 map_x、map_y，load_maps 也讀得懂）；沒有攤平就留空
     dewarp_source: str = ""  # 攤平的依據：measured（由紙邊、格線、文字行量出）、uvdoc_prior（學習式模型給的初值再量測修正）；沒有攤平就留空
     dewarp_residual_px: Optional[float] = None  # 攤平後格線與文字行離直線的殘差（工作影像像素，第 95 百分位）
     # ---- 照片的頁面確認（②接上找紙與攤平後追加；給「拖曳四角確認」的介面與校準用；PDF 與截圖留預設值）----

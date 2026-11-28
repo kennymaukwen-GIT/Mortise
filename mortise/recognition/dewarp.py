@@ -45,6 +45,9 @@
        （pseudo_quad；rectify 會採用，上層應請使用者確認）；否則外框只放在 candidate_outline 當候選，維持整張圖。
        信心值 = 外框支持率 × 頁內殘差項（有修正時用交叉驗證殘差：線分兩組，一組擬合位移場、量另一組的預測誤差）
        × 來源（外框有推估的邊 × 0.5、紙超出四角 × 0.6、四角是自己量的 × 0.8）× 直線度進步幅度。
+    7. 使用者拉的四角（quad.method == "user"）：四角釘住不動（使用者的修正永不被覆蓋）。不改用量到的外框、不因紙超出四角
+       而外擴；外框曲線只在兩端貼近使用者的角時才採用（否則只用沿四角連線量到的紙邊），Coons 曲面的四角位移固定為 0。
+       判定彎曲與第 6 步的驗證照常：平的紙、或攤平沒有比透視好，就只做透視（與使用者拉四角以前的行為相同）。
 
     輸出尺寸：與 rectify 相同，「最長的那一組對邊」1:1 取樣（量的是外框曲線的弧長）；長寬比優先用 find_page_quad
     由透視反推的值，沒有四角或紙被裁掉時以外框四角用 Zhang–He 方法估。對原照片只做一次 remap（避免兩次內插變模糊）。
@@ -56,7 +59,7 @@ UVDoc 權重
     scripts/export_uvdoc_onnx.py 用 torch 官方匯出做交叉比對（網格差異 < 1e-6，torch 不是產品相依）。
     攤平時快取裡沒有模型，就在背景執行緒下載（這張照片先只用量測式，不讓使用者的請求等下載）；部署時可先執行
     python -m mortise.recognition.dewarp --download。下載有總時限，失敗後一小時內不再重試，.part 一律清掉。
-    環境變數 MORTISE_OFFLINE=1 或 params["uvdoc"]="cache_only" 時不下載；下載或載入失敗就退回純量測式並寫進 notes。
+    環境變數 MORTISE_OFFLINE=1、params["uvdoc"]="cache_only"、或在 pytest 裡（測試不連網）時不下載；下載或載入失敗就退回純量測式並寫進 notes。
 
 已知限制
     - 捲起處的透視縮短（字被壓扁、行距變小）直線度量不到；只有 UVDoc 的初值在網格間距上帶有這個資訊，
@@ -151,6 +154,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "quad_doubt_area": 0.75,  # 四角框住的面積不到量到的外框面積的這個比例（框到紙上的一塊、或把紙切掉一大半）時改用量到的外框
     "quad_doubt_support": 0.7,  # ……而且外框至少三邊量到、平均支持率至少這麼高
     "crop_touch_frac": 0.015,  # UVDoc 的外框貼到裁切邊（這個比例內，且裁切邊不是畫面邊）：四角可能框小了，改用全圖重推
+    # ---- 使用者拉的四角（quad.method == "user"）：四角釘住不動，只在四角之內攤平
+    "rebase_prior": True,  # 外框精修後四角移動時，頁內透視初值改以精修後的四角為準（False：沿用原本四角的透視＋外框混合，舊行為）
+    "pin_curve_tol_frac": 0.02,  # 學習式模型外框的這條邊，兩端離使用者的角都在這個比例 × 對角線內，才拿它當這條邊的彎曲形狀（否則只用沿直線量到的紙邊）
     # ---- 輸出
     "max_output_side": 12000,  # 輸出長邊上限（像素）
     "output_interp": "linear",  # 最後取樣的內插："linear" 或 "cubic"
@@ -208,11 +214,74 @@ class DewarpResult:
     candidate_outline: list[np.ndarray] = field(default_factory=list)  # 沒有採用、只當候選的外框（學習式模型推估，量測支持不足）；給介面讓使用者確認
     needs_review: bool = False  # 建議請使用者確認外框（信心值低、外框有推估的邊、紙超出四角、或四角是自己量的）
 
-    def maps_npz(self) -> bytes:
-        """對應圖存成 npz（map_x、map_y，float32），給 PageSpec.dewarp_map 用。"""
+    def maps_npz(self, step: int = 0, max_err_px: float = 0.25) -> bytes:
+        """對應圖存成 npz，給 PageSpec.dewarp_map 用（讀回請用 load_maps()）。
+        對應圖很平滑（透視＋外框曲面＋粗格點的位移場），只存每 step 像素一點的粗網格（一定含最後一列、最後一行），
+        讀回時線性內插成逐像素。存檔前先驗證：內插回來與逐像素的對應圖差超過 max_err_px（像素）就把網格加密
+        （8 → 4 → 2 → 1 像素一點；step=1 就是逐像素存）。12 MP 照片的對應圖從約 55 MB 降到 1 MB 左右，壓縮從 2 秒多降到幾十毫秒。
+        給了 step 就照 step 存，不驗證。"""
+        Ho, Wo = self.map_x.shape
+        mx, my = self.map_x.astype(np.float32), self.map_y.astype(np.float32)
+        for st in ([int(step)] if step else [MAP_STEP, 4, 2, 1]):
+            rows, cols = _grid_index(Ho, st), _grid_index(Wo, st)
+            gx, gy = mx[np.ix_(rows, cols)], my[np.ix_(rows, cols)]
+            if step or st == 1:
+                break
+            rx = _interp_axis(_interp_axis(gx, cols, Wo, 1), rows, Ho, 0)
+            ry = _interp_axis(_interp_axis(gy, cols, Wo, 1), rows, Ho, 0)
+            if float(max(np.abs(rx - mx).max(), np.abs(ry - my).max())) <= max_err_px:
+                break
         buf = io.BytesIO()
-        np.savez_compressed(buf, map_x=self.map_x.astype(np.float32), map_y=self.map_y.astype(np.float32))
+        np.savez_compressed(buf, format=np.array(MAP_FORMAT), shape=np.array([Ho, Wo], np.int64), rows=rows, cols=cols, grid_x=gx, grid_y=gy)
         return buf.getvalue()
+
+
+MAP_FORMAT = "mortise.dewarp_map/2"  # 粗網格（grid_x、grid_y 在 rows × cols 的像素中心上取樣）；舊格式直接存逐像素的 map_x、map_y
+MAP_STEP = 8  # 粗網格的間距（輸出像素）
+
+
+def _grid_index(n: int, step: int) -> np.ndarray:
+    idx = np.arange(0, n, max(1, int(step)), dtype=np.int64)
+    if idx[-1] != n - 1:
+        idx = np.append(idx, n - 1)
+    return idx
+
+
+def _interp_axis(g: np.ndarray, idx: np.ndarray, n: int, axis: int) -> np.ndarray:
+    """沿 axis 把取樣在 idx（遞增的整數像素索引）上的 g 線性內插到 0..n-1。"""
+    if len(idx) == 1:
+        return np.repeat(g, n, axis=axis)
+    x = np.arange(n, dtype=np.float64)
+    k = np.clip(np.searchsorted(idx, x, side="right") - 1, 0, len(idx) - 2)
+    w = ((x - idx[k]) / (idx[k + 1] - idx[k])).astype(np.float32)
+    a, b = np.take(g, k, axis=axis), np.take(g, k + 1, axis=axis)
+    shape = [1, 1]
+    shape[axis] = n
+    w = w.reshape(shape)
+    return a * (1.0 - w) + b * w
+
+
+def load_maps(src) -> tuple[np.ndarray, np.ndarray]:
+    """讀攤平對應圖（PageSpec.dewarp_map 的檔案路徑、bytes、或 np.load 的結果）→ 逐像素的 (map_x, map_y)：
+    float32、輸出高 × 輸出寬，輸出像素中心 → 原照片的連續座標（交給 cv2.remap 時各減 0.5）。新舊兩種格式都讀得懂。"""
+    if isinstance(src, (bytes, bytearray)):
+        src = io.BytesIO(src)
+    if hasattr(src, "files"):
+        return _maps_from(src)
+    with np.load(src) as z:
+        return _maps_from(z)
+
+
+def _maps_from(z) -> tuple[np.ndarray, np.ndarray]:
+    if "map_x" in z.files:  # 舊格式：逐像素
+        return z["map_x"].astype(np.float32), z["map_y"].astype(np.float32)
+    Ho, Wo = (int(v) for v in z["shape"])
+    rows, cols = z["rows"].astype(np.int64), z["cols"].astype(np.int64)
+    out = []
+    for key in ("grid_x", "grid_y"):
+        g = z[key].astype(np.float32)
+        out.append(np.ascontiguousarray(_interp_axis(_interp_axis(g, cols, Wo, 1), rows, Ho, 0), dtype=np.float32))
+    return out[0], out[1]
 
 
 # ============================================================ 小工具
@@ -900,6 +969,14 @@ def _download(url: str, dest: Path, sha256: str, size: int, timeout: float) -> N
 _FAIL_FILE = "download_failed.json"
 
 
+def _downloads_blocked() -> bool:
+    """不准連網下載權重：環境變數 MORTISE_OFFLINE=1，或正在跑 pytest（PYTEST_CURRENT_TEST；測試一律不連網，
+    要測下載流程的測試把下載函數換成假的，再設 MORTISE_ALLOW_DOWNLOAD=1）。"""
+    if os.environ.get("MORTISE_OFFLINE") == "1":
+        return True
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) and os.environ.get("MORTISE_ALLOW_DOWNLOAD") != "1"
+
+
 def _cached_uvdoc(d: Path) -> Optional[Path]:
     """快取裡已有、而且驗證過的 ONNX 路徑；沒有就 None。"""
     onnx = d / f"uvdoc2d-{UVDOC_SHA256[:12]}.onnx"
@@ -939,7 +1016,7 @@ def ensure_uvdoc_model(params: dict | None = None) -> tuple[Optional[Path], list
         return onnx, []
     onnx = d / f"uvdoc2d-{UVDOC_SHA256[:12]}.onnx"
     meta = d / "uvdoc2d.json"
-    if mode == "cache_only" or os.environ.get("MORTISE_OFFLINE") == "1":
+    if mode == "cache_only" or _downloads_blocked():
         return None, ["快取裡沒有學習式初值模型（UVDoc），而且設定為不下載：只用量測式攤平。"]
     err = _recent_failure(d, float(p["uvdoc_retry_s"]))
     if err is not None and not (params or {}).get("_force_retry"):
@@ -998,7 +1075,7 @@ def _uvdoc_session(p: dict):
     path = _cached_uvdoc(uvdoc_model_dir())
     notes: list[str] = []
     if path is None:
-        if mode == "auto" and os.environ.get("MORTISE_OFFLINE") != "1":
+        if mode == "auto" and not _downloads_blocked():
             return None, _start_background_download(p)
         path, notes = ensure_uvdoc_model(p)  # "sync"：在這次請求裡下載（腳本、評測用）；"cache_only"／離線：不下載
         if path is None:
@@ -1353,6 +1430,7 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
     notes: list[str] = []
     mode = p["dewarp_mode"]
     have_quad = quad is not None and getattr(quad, "method", "") != "full_image" and quad.corners is not None
+    pinned = have_quad and getattr(quad, "method", "") == "user"  # 使用者拉的四角：釘住不動，只在四角之內攤平
     t0 = time.time()
     img_f = img.astype(np.float32)
     cv2.GaussianBlur(img_f, (0, 0), p["edge_blur_sigma"], dst=img_f)  # 就地模糊：大照片少一份 float32 全圖（12 MP 約 144 MB）
@@ -1498,7 +1576,7 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
     tm["boundary"] = time.time() - t0
 
     # 四角框住的面積明顯比紙邊量到的外框小（框到紙上的一塊、或把紙切掉一大半）：改用量到的外框
-    if have_quad and grid is not None and sum(uv_use) >= 3 and float(np.mean([sd["support"] for sd in uv_sides])) >= p["quad_doubt_support"]:
+    if have_quad and not pinned and grid is not None and sum(uv_use) >= 3 and float(np.mean([sd["support"] for sd in uv_sides])) >= p["quad_doubt_support"]:
         c4 = _corners_from_curves(_side_curves(prior_uv, uv_sides, uv_use, K, inner_uv))
         ratio = _poly_area(np.asarray(quad.corners, np.float64)) / max(_poly_area(c4), 1e-9)
         if ratio < p["quad_doubt_area"]:
@@ -1545,7 +1623,7 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
 
     # 紙有沒有被四角裁掉（捲起的上緣常被丟掉）：UVDoc 外框有邊緣支持的部分明顯在四邊形外
     truncated = []
-    if have_quad and grid is not None:
+    if have_quad and not pinned and grid is not None:  # 使用者拉的四角不外擴：紙超出四角是使用者的選擇
         thr = max(p["outside_px"], p["outside_frac"] * diag)
         poly = np.asarray(quad.corners, np.float64)
         for k, sd in enumerate(uv_sides):
@@ -1583,8 +1661,17 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
     # ---- 4. 對應圖：初值 + Coons 外框修正
     t0 = time.time()
     uv_curves = _side_curves(prior_uv, uv_sides, uv_use, K, inner_uv) if grid is not None else None
+    if pinned and uv_curves is not None:
+        # 使用者的四角：學習式模型外框的某條邊，兩端要貼近使用者的角，才拿它當那條邊的形狀（使用者框的是紙上的一塊時，不要撐到整張紙）
+        qc = np.asarray(quad.corners, np.float64)
+        ends = [(0, 1), (1, 2), (3, 2), (0, 3)]
+        tol = p["pin_curve_tol_frac"] * diag
+        for k in range(4):
+            a_, b_ = ends[k]
+            if uv_use[k] and max(np.linalg.norm(uv_curves[k][0] - qc[a_]), np.linalg.norm(uv_curves[k][-1] - qc[b_])) > tol:
+                uv_use[k] = False
     from_uv = False  # 外框或四角是否用到 UVDoc 沒有量測支持的推估
-    if p["interior_prior"] == "uvdoc" and grid is not None:
+    if p["interior_prior"] == "uvdoc" and grid is not None and not pinned:
         prior = prior_uv
         tabs, cdisp = _normal_tables(prior_uv, uv_sides, uv_use, K, inner_uv)
         coons = _Coons(tabs, cdisp)
@@ -1613,7 +1700,7 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
                 targets.append(base + _eval_spline(q_sides[k]["coef"], tt, K)[:, None] * _normals(base, corners0.mean(axis=0)))
                 support.append(float(q_sides[k]["support"]))
                 use.append(True)
-            elif grid is not None:
+            elif grid is not None and not pinned:
                 targets.append(uv_curves[k])  # 量不到：用 UVDoc 推估的位置
                 support.append(float(uv_sides[k]["support"]))
                 use.append(False)
@@ -1622,12 +1709,22 @@ def dewarp(photo: np.ndarray, quad: Optional[PageQuad] = None, params: dict | No
                 targets.append(None)
                 support.append(float(q_sides[k]["support"]) if q_sides else 0.0)
                 use.append(False)
-        coons = _Coons(_abs_tables(hu0, targets))
+        zero = np.zeros(2)
+        pin0 = {"tl": zero, "tr": zero, "br": zero, "bl": zero}
+        coons = _Coons(_abs_tables(hu0, targets), pin0 if pinned else None)
+        if not pinned and p["rebase_prior"]:
+            # 外框精修後四角移動了（相鄰兩條外框曲線端點的平均）：頁內的透視初值改以精修後的四角為準再算一次外框修正量。
+            # 否則頁內是「舊四角的透視＋把角拉過去的雙線性混合」，離四角越近扭得越多（合成的折痕照片實測，輸出版面因此變差）
+            c1 = corners0 + np.array([coons.c["tl"], coons.c["tr"], coons.c["br"], coons.c["bl"]], np.float64)
+            if float(np.max(np.linalg.norm(c1 - corners0, axis=1))) > 0.5 and _poly_area(c1) > 0.5 * _poly_area(corners0):
+                hu0 = _homography(_UNIT, c1)
+                prior = _Prior(hu=hu0)
+                coons = _Coons(_abs_tables(hu0, targets), pin0)
     source = "uvdoc_prior" if from_uv else "measured"
     weak = [names[k] for k in range(4) if not use[k]]
     if weak:
         notes.append(f"{'、'.join(weak)}邊的紙邊量不到（支持率 {', '.join(f'{support[k]:.2f}' for k in range(4) if not use[k])}），"
-                     + ("用學習式模型推估的位置" if grid is not None else "維持四角連線"))
+                     + ("用學習式模型推估的位置" if grid is not None and not pinned else "維持四角連線"))
 
     def M1(S, T):
         x, y = prior(S, T)

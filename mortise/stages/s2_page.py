@@ -5,7 +5,7 @@
   s2.corners    照片：recognition/page_geometry.find_page_quad 找頁面四角，連同狀態（ok、low_contrast、curved_edge、multiple_pages、
                 cut_off、not_found）、各角誤差、其他候選（第二張紙、三條邊＋畫面邊）與彎曲外框寫進 PageSpec 的 quad_* 欄位；
                 找不到就以整張圖為頁面（紙被畫面切掉、三條邊都量到時預選「三條邊＋畫面邊」）。截圖與掃描以整張圖為頁面。
-                使用者拉過四角（修正單 corners，原圖像素）時一律用使用者的四角，不再自動找。
+                使用者拉過四角（修正單 corners，原圖像素）時一律用使用者的四角，不再自動找；紙是彎的照樣攤平（四角釘住不動）。
   s2.rectify    透視攤平，建立頁面座標系（頁寬為 1）。照片另試彎曲攤平（recognition/dewarp.py；設定 dewarp_photos）：
                 判定彎曲、驗證比透視好才採用，逐像素對應圖存進 dewarp_map。找不到四角時採用攤平量出的外框四角（需確認）。
   s2.review     要不要請使用者確認四角：status 不是 ok、信心值低於 quad_review_confidence、任一角誤差超過
@@ -30,7 +30,7 @@ from ..tools import pdfium as pdf
 from ..tools.units import to_pt
 
 NAME = "s2"
-VERSION = "5"
+VERSION = "6"
 
 
 def _png(im: Image.Image) -> bytes:
@@ -210,7 +210,8 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
     判定彎曲、驗證比透視好才採用，對應圖存進 dewarp_map）→ 去陰影（反光只標記、寫進備註）。
     只有「整張圖＋紙被畫面切掉（cut_off）」時預選 alternatives[0]（三條量到的紙邊＋畫面邊）；找不到（not_found）不預選。
     找不到四角、但攤平時由紙邊量出外框四角（至少三邊有量測支持）時，用那組四角，標成需要確認。
-    使用者拉過四角（修正單 corners）時一律用使用者的四角（method "user"、信心值 1.0、不攤平，其他處理照常）。"""
+    使用者拉過四角（修正單 corners）時一律用使用者的四角（method "user"、信心值 1.0）。照片照樣試攤平：四角釘住不動，
+    只在四角之內攤平，同樣要判定彎曲、驗證比透視好才採用（使用者只是按「確認」時，彎紙也不會因此變成只做透視）。"""
     import numpy as np
 
     raw = ImageOps.exif_transpose(Image.open(store.blob_path(doc.source))).convert("RGB")
@@ -245,6 +246,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
             quad = pg.find_page_quad(arr, {"input_type": kind.value, "review_conf": float(c.get("quad_review_confidence", 0.6)),
                                            "max_corner_err_frac": float(c.get("quad_max_corner_err_frac", 0.01))})
         dres = None
+        from_dres = False
         method, conf = "full_image", 1.0
         if quad is not None and user is None:
             geo.update(_quad_fields(quad, pw, ph))
@@ -258,12 +260,15 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
                 geo["quad_preselect"] = 0
             notes += list(getattr(quad, "notes", []))
         if quad is not None:
-            # 攤平只給照片、而且不是使用者拉的四角；find_page_quad 判定「整張圖就是頁面」（status ok 的整張圖，例如沒有雜訊的數位畫面）時也不試
+            # 攤平只給照片（使用者拉的四角也試：四角釘住不動）；find_page_quad 判定「整張圖就是頁面」（status ok 的整張圖，例如沒有雜訊的數位畫面）時不試
             whole_ok = quad.method == "full_image" and quad.status == "ok"
-            params = {**c, "dewarp": bool(c.get("dewarp_photos", True)) and kind == InputType.PHOTO and user is None and not whole_ok}
+            params = {**c, "dewarp": bool(c.get("dewarp_photos", True)) and kind == InputType.PHOTO and not whole_ok}
             flat, H, dres = pg.rectify(arr, quad, params, return_dewarp=True)
             from_dres = dres is not None and dres.image is not None and flat is dres.image
-            if from_dres:
+            if from_dres and user is not None:
+                corners_src = quad.corners  # 使用者的四角釘住不動（攤平只在四角之內）
+                method, conf = "user", 1.0
+            elif from_dres:
                 corners_src = dres.corners if dres.corners is not None else (dres.pseudo_quad if dres.pseudo_quad is not None else quad.corners)
                 if quad.method == "full_image":
                     method, conf = "outline", float(dres.confidence)
@@ -272,6 +277,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
                 else:
                     method, conf = quad.method, float(quad.confidence)
                     if np.max(np.linalg.norm(np.asarray(corners_src) - np.asarray(quad.corners), axis=1)) > 0.01 * diag:
+                        geo.pop("quad_corner_error_px", None)  # 各角誤差是 find_page_quad 那組四角的，攤平量出的外框四角沒有逐角誤差
                         geo["quad_alternatives"] = [_pts(quad.corners)] + geo.get("quad_alternatives", [])
                         geo["quad_alternative_scores"] = [1.0] + geo.get("quad_alternative_scores", [])
                         geo["quad_alternative_labels"] = ["原本找到的四角"] + geo.get("quad_alternative_labels", [])
@@ -294,11 +300,11 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
                 if getattr(quad, "aspect", None) is not None and method not in ("outline",):
                     aspect_err = float(quad.aspect.error)
                 if method == "user":
-                    notes.append("頁面四角使用你拉的位置，已透視攤平。")
+                    notes.append("頁面四角使用你拉的位置，紙是彎的，已在這四角之內攤平。" if from_dres else "頁面四角使用你拉的位置，已透視攤平。")
                 else:
                     notes.append(f"已找出頁面四角並透視攤平（{method}，信心值 {conf:.2f}）。")
             if dres is not None:
-                geo.update(_dewarp_fields(dres, from_dres, store, geo))
+                geo.update(_dewarp_fields(dres, from_dres, store, geo, user_set=user is not None))
                 if dres.applied or from_dres or dres.curved:
                     notes += list(dres.notes)
                 elif any("UVDoc" in n and ("下載" in n or "無法取得" in n) for n in dres.notes):
@@ -326,7 +332,7 @@ def _image_geometry(doc: SourceDoc, ref, c: dict, corrections: list[Correction],
                 notes += list(info.get("notes", []))
         _ASPECT_ERR[id(work)] = aspect_err
         if kind == InputType.PHOTO and user is None:
-            _decide_review(geo, conf, diag, c, method)
+            _decide_review(geo, conf, diag, c, method, list(getattr(quad, "notes", []) or []) if quad is not None else [], from_dres)
         return work, color, matrix, corners_l, aspect, method, conf, notes, geo
     except Exception as e:  # 幾何處理失敗不中斷：退回整張圖
         geo = {"source_size": (pw, ph), "quad_status": "user" if user is not None else ("not_found" if kind == InputType.PHOTO else "not_photo")}
@@ -367,17 +373,18 @@ def _alt_label(alt, main, pw: int, ph: int, quad, index: int) -> str:
           or (abs(a[k, 0]) <= tol and abs(a[(k + 1) % 4, 0]) <= tol) or (abs(a[k, 0] - pw) <= tol and abs(a[(k + 1) % 4, 0] - pw) <= tol) for k in range(4)]
     if quad.method == "full_image" and quad.status == "cut_off" and index == 0:
         return "三條邊＋畫面邊"
-    if sum(on) == 1:
-        return "三條邊＋畫面邊"
     if quad.method == "full_image":
-        return "可能的紙張範圍"
+        return "三條邊＋畫面邊" if sum(on) == 1 else "可能的紙張範圍"
     iou = _poly_iou(a, main)
     area_a = abs(cv2.contourArea(a.astype(np.float32)))
     area_m = abs(cv2.contourArea(np.asarray(main, np.float32)))
+    # 先看和目前的四角的關係：比目前的框大很多（貼著畫面邊也一樣）多半是連旁邊的紙一起框
     if iou < 0.3:
         return "另一張紙"
     if area_a > 1.15 * area_m:
         return "較大的框（可能連旁邊的紙一起框）"
+    if sum(on) == 1:
+        return "三條邊＋畫面邊"
     if area_a < 0.85 * area_m:
         return "較小的框（可能是紙上的一塊）"
     return "另一種框法"
@@ -417,12 +424,13 @@ def _outline_from_sides(sides, per_side: int = 24) -> list:
     return _pts(ring)
 
 
-def _dewarp_fields(dres, used: bool, store: Store, geo: dict) -> dict:
-    """攤平結果 → PageSpec 的 dewarp_* 欄位（採用時存對應圖）；沒採用的外框候選放進其他候選。"""
+def _dewarp_fields(dres, used: bool, store: Store, geo: dict, user_set: bool = False) -> dict:
+    """攤平結果 → PageSpec 的 dewarp_* 欄位（採用時存對應圖）；沒採用的外框候選放進其他候選。
+    user_set：四角是使用者拉的（已經確認過，不再請使用者確認外框，也不列其他候選）。"""
     import numpy as np
 
     # 攤平建議確認外框，只在真的採用了它的結果（攤平、或它量出的四角）時才算；沒採用的外框只放進其他候選
-    out: dict = {"dewarp_confidence": round(float(dres.confidence), 3), "dewarp_needs_review": bool(dres.needs_review) and used}
+    out: dict = {"dewarp_confidence": round(float(dres.confidence), 3), "dewarp_needs_review": bool(dres.needs_review) and used and not user_set}
     if dres.applied and dres.map_x is not None:
         out["dewarp_map"] = store.put_blob(dres.maps_npz(), "application/x-npz", "npz")
         out["dewarp_source"] = dres.source or "measured"
@@ -430,6 +438,8 @@ def _dewarp_fields(dres, used: bool, store: Store, geo: dict) -> dict:
         ring = _outline_from_sides(dres.boundary)
         if ring:
             out["source_outline"] = ring
+    if user_set:
+        return out
     alts = list(geo.get("quad_alternatives", []))
     scores = list(geo.get("quad_alternative_scores", []))
     labels = list(geo.get("quad_alternative_labels", []))
@@ -446,31 +456,58 @@ def _dewarp_fields(dres, used: bool, store: Store, geo: dict) -> dict:
 
 
 _STATUS_REASON = {
-    "low_contrast": "紙的邊緣不夠清楚，四角可能不準",
+    "low_contrast": "系統對四角的位置沒有把握，四角可能不準",
     "curved_edge": "紙邊是彎的，四角與外框可能不準",
     "multiple_pages": "照片裡有不只一張紙，請確認要的是哪一張",
     "cut_off": "紙有一部分超出畫面，已先用量到的三條邊加畫面邊",
     "not_found": "找不到紙張的邊緣，目前以整張圖為頁面",
 }
 
+# low_contrast 是「信心值低或某角誤差大」的總稱：依 find_page_quad 備註裡實際扣分的原因，換成白話（依序取第一個對上的）
+_LOW_REASONS = [
+    ("頁面與背景對比低", "紙和背景的顏色太接近，紙邊不夠清楚"),
+    ("部分邊緣被遮住", "有一段紙邊被遮住或看不清楚"),
+    ("某條邊兩側顏色幾乎相同", "有一條邊可能是紙上的線，不是紙邊"),
+    ("某條邊外側緊貼著還有字", "有一條邊外面還有字，紙可能比框到的大"),
+    ("相鄰兩邊越過角落後仍有邊緣", "框到的可能是紙上的色塊或圖框"),
+    ("影像模糊", "照片有點模糊，紙邊不夠清楚"),
+    ("同一張紙的其他框法", "同一張紙有幾種差不多的框法，四角可能差幾個像素"),
+]
+_NEIGHBOR_LABELS = ("另一張紙", "較大的框（可能連旁邊的紙一起框）")
 
-def _decide_review(geo: dict, conf: float, diag: float, c: dict, method: str) -> None:
+
+def _decide_review(geo: dict, conf: float, diag: float, c: dict, method: str, quad_notes: Optional[list] = None, dewarped: bool = False) -> None:
     """要不要請使用者確認四角：status 不是 ok、信心值低於 quad_review_confidence、任一角誤差超過 quad_max_corner_err_frac × 對角線、
-    或攤平建議確認外框。理由寫成白話一句。"""
+    或攤平建議確認外框。理由寫成白話一句，依實際的原因寫（旁邊有分數接近的另一張紙、紙邊對比低、紙邊彎曲……），
+    不寫信心值數字（紙邊彎曲時信心值本來就很低，那不代表四角錯）。"""
     reasons = []
     status = geo.get("quad_status", "ok")
+    labels = list(geo.get("quad_alternative_labels") or [])
+    scores = list(geo.get("quad_alternative_scores") or [])
+    neighbor = any(lb in _NEIGHBOR_LABELS and (scores[i] if i < len(scores) else 0.0) >= 0.3 for i, lb in enumerate(labels))
     if method == "outline":
         reasons.append("照片中找不到完整的頁面四角，四角是由紙邊量出的外框先填上的")
     elif status == "cut_off" and method != "frame_edges":
         reasons.append("紙的一角超出畫面，那個角是由紙邊延長推出來的")
+    elif status == "low_contrast":
+        if neighbor:
+            reasons.append("旁邊還有一張紙（或框到兩張紙），請確認要的是哪一張")
+        joined = "；".join(quad_notes or [])
+        reasons.append(next((r for key, r in _LOW_REASONS if key in joined), _STATUS_REASON["low_contrast"]))
+    elif status == "curved_edge":
+        reasons.append("紙是彎的，已經攤平；外框是量出來的，請確認" if dewarped else _STATUS_REASON["curved_edge"])
     elif status not in ("ok", "user", "not_photo"):
         reasons.append(_STATUS_REASON.get(status, "四角可能不準"))
-    if conf < float(c.get("quad_review_confidence", 0.6)) and method != "full_image":
-        reasons.append(f"四角的信心值偏低（{conf:.2f}）")
+    if not reasons and conf < float(c.get("quad_review_confidence", 0.6)) and method != "full_image":
+        reasons.append("系統對四角的位置沒有把握")
     errs = geo.get("quad_corner_error_px") or []
     lim = float(c.get("quad_max_corner_err_frac", 0.01)) * diag
     if errs and max(errs) > lim:
-        reasons.append(f"有一個角的位置可能差到約 {max(errs):.0f} 像素")
+        # 紙邊彎曲、紙超出畫面時，各角誤差是刻意放大的保守估計，理由已經寫了原因，不再報像素數（免得嚇人又不準）
+        if status in ("ok", "low_contrast") and method not in ("outline", "frame_edges"):
+            reasons.append(f"有一個角的位置可能差到約 {max(errs):.0f} 像素")
+        elif not reasons:
+            reasons.append("有一個角的位置可能不準")
     if geo.get("dewarp_needs_review"):
         reasons.append("彎曲紙張攤平的外框有推估的部分")
     # 同樣的理由只留一個，最多兩個串成一句
@@ -479,7 +516,7 @@ def _decide_review(geo: dict, conf: float, diag: float, c: dict, method: str) ->
         if r not in seen:
             seen.add(r)
             uniq.append(r)
-    _review(geo, bool(uniq), ("，".join(uniq[:2]) + "：請拖曳四角確認。") if uniq else "")
+    _review(geo, bool(uniq), ("；".join(uniq[:2]) + "：請拖曳四角確認。") if uniq else "")
 
 
 def _paper_like(arr, c: dict) -> bool:

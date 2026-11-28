@@ -69,8 +69,41 @@ def test_curved_paper_measured_dewarp_beats_perspective(table, kind):
     # 對應圖與影像一致：用對應圖重新取樣原照片就是輸出影像
     again = cv2.remap(ph, r.map_x - 0.5, r.map_y - 0.5, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     assert np.abs(again.astype(int) - r.image.astype(int)).max() <= 1
-    z = np.load(io.BytesIO(r.maps_npz()))
-    assert set(z.files) == {"map_x", "map_y"} and z["map_x"].dtype == np.float32
+    # 存檔是粗網格（PageSpec.dewarp_map），load_maps 內插回逐像素：與原本的對應圖差不到 0.25 像素
+    blob = r.maps_npz()
+    z = np.load(io.BytesIO(blob))
+    assert set(z.files) == {"format", "shape", "rows", "cols", "grid_x", "grid_y"} and z["grid_x"].dtype == np.float32
+    mx, my = D.load_maps(blob)
+    assert mx.shape == r.map_x.shape and mx.dtype == np.float32
+    assert max(np.abs(mx - r.map_x).max(), np.abs(my - r.map_y).max()) <= 0.25
+    assert len(blob) < 0.5 * r.map_x.nbytes  # 比逐像素存小很多
+
+
+def test_load_maps_reads_old_per_pixel_format():
+    """舊產物的 dewarp_map 是逐像素的 map_x、map_y：load_maps 照樣讀得懂。"""
+    mx = np.random.default_rng(0).random((7, 5)).astype(np.float32)
+    my = mx[::-1].copy()
+    buf = io.BytesIO()
+    np.savez_compressed(buf, map_x=mx, map_y=my)
+    a, b = D.load_maps(buf.getvalue())
+    assert np.array_equal(a, mx) and np.array_equal(b, my)
+    r = D.DewarpResult(image=None, map_x=mx, map_y=my, applied=True, source="measured", curved=True)
+    a, b = D.load_maps(r.maps_npz(step=1))
+    assert np.array_equal(a, mx) and np.array_equal(b, my)
+
+
+def test_no_download_inside_pytest(monkeypatch, tmp_path):
+    """測試不連網：沒設 MORTISE_OFFLINE、快取是空的，在 pytest 裡也不下載（下載函數不會被呼叫，也不開背景執行緒）。"""
+    monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    monkeypatch.delenv("MORTISE_ALLOW_DOWNLOAD", raising=False)
+    calls = []
+    monkeypatch.setattr(D, "_download", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(D, "_start_background_download", lambda p: calls.append(2) or [])
+    path, notes = D.ensure_uvdoc_model({"uvdoc": "sync"})
+    sess, notes2 = D._uvdoc_session(D._p({"uvdoc": "auto"}))
+    assert path is None and sess is None and not calls
+    assert "不下載" in notes[0] and "不下載" in notes2[0]
 
 
 def test_no_quad_and_no_model_falls_back(table, monkeypatch, tmp_path):
@@ -88,6 +121,7 @@ def test_no_quad_and_no_model_falls_back(table, monkeypatch, tmp_path):
 def test_download_failure_is_reported(monkeypatch, tmp_path):
     monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    monkeypatch.setenv("MORTISE_ALLOW_DOWNLOAD", "1")  # 下載函數已換成假的，不會真的連網
 
     def boom(*a, **k):
         raise OSError("network unreachable")
@@ -310,6 +344,7 @@ def test_param_prefix_from_config_file():
 def test_download_failure_is_remembered(monkeypatch, tmp_path):
     monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    monkeypatch.setenv("MORTISE_ALLOW_DOWNLOAD", "1")  # 下載函數已換成假的，不會真的連網
     calls = []
 
     def boom(*a, **k):
@@ -353,6 +388,7 @@ def test_first_use_downloads_in_background(monkeypatch, tmp_path):
 
     monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
+    monkeypatch.setenv("MORTISE_ALLOW_DOWNLOAD", "1")  # 下載函數已換成假的，不會真的連網
     gate = threading.Event()
 
     def slow(params=None):

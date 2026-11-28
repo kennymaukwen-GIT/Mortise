@@ -54,10 +54,10 @@ def synth_photo(name: str, seed: int, strength: float):
 
 
 def table_page(w: int = 900, h: int = 1270) -> np.ndarray:
-    """像課表的頁面：標題、外框與格線、格子裡的字、頁尾。"""
+    """像課表的頁面（文字全是虛構的）：標題、外框與格線、格子裡的字、頁尾。"""
     img = np.full((h, w, 3), 250, np.uint8)
-    cv2.putText(img, "Module Study Plan 6003", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (30, 30, 30), 2, cv2.LINE_AA)
-    cv2.putText(img, "Thursday mornings from 24th Sept", (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 1, cv2.LINE_AA)
+    cv2.putText(img, "Course Outline Week 41", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (30, 30, 30), 2, cv2.LINE_AA)
+    cv2.putText(img, "Tuesday afternoons from 3rd March", (70, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 1, cv2.LINE_AA)
     x0, y0, x1, y1 = 70, 190, w - 70, h - 190
     cv2.rectangle(img, (x0, y0), (x1, y1), (20, 20, 20), 2)
     cols = [x0, x0 + 110, x0 + 380, x0 + 600, x1]
@@ -67,13 +67,13 @@ def table_page(w: int = 900, h: int = 1270) -> np.ndarray:
     for y in rows[1:-1]:
         cv2.line(img, (x0, y), (x1, y), (20, 20, 20), 1)
     rng = np.random.default_rng(0)
-    words = ["Planning", "Policy", "Session", "Thames", "Valley", "workshop", "Strategic", "Oct", "Nov", "group"]
+    words = ["Review", "Draft", "Seminar", "Harbor", "Meadow", "studio", "Design", "Mar", "Apr", "team"]
     for r in range(12):
         for c in range(4):
             for line in range(2):
                 txt = " ".join(rng.choice(words, 2))
                 cv2.putText(img, txt, (cols[c] + 8, rows[r] + 28 + 26 * line), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1, cv2.LINE_AA)
-    cv2.putText(img, "Module Guide 2026-27", (w // 2 - 130, h - 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 1, cv2.LINE_AA)
+    cv2.putText(img, "Course Handbook 2031", (w // 2 - 130, h - 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 1, cv2.LINE_AA)
     return img
 
 

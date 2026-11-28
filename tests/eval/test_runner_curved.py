@@ -56,3 +56,27 @@ def test_transform_elements_pointwise_drops_unmapped():
     assert [i.id for i in got.images] == ["a"]
     tl = got.images[0].quad.tl
     assert abs(tl.x - (0.2 + 0.05 * np.sin(0.3))) < 1e-9 and abs(tl.y - (0.2 + 0.05 * np.sin(0.3))) < 1e-9
+
+
+def test_working_to_photo_reads_coarse_maps_and_many_points(tmp_path):
+    """攤平對應圖用新的粗網格格式存（dewarp.load_maps 讀），一次查超過 32767 個點也不會被 cv2.remap 的上限擋下。"""
+    from types import SimpleNamespace
+
+    from mortise.recognition.dewarp import DewarpResult
+
+    H, W = 300, 240
+    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32) + 0.5
+    mx, my = xs * 1.5 + 10.0, ys * 1.5 + 20.0  # 輸出像素中心 → 照片座標（線性，內插沒有誤差）
+    res = DewarpResult(image=np.zeros((H, W, 3), np.uint8), map_x=mx, map_y=my, applied=True, source="measured", curved=True)
+    blob = tmp_path / "map.npz"
+    blob.write_bytes(res.maps_npz())
+    pspec = SimpleNamespace(source_to_page=np.eye(3).ravel().tolist(), dewarp_map="x", working_image_size=(W, H))
+    store = SimpleNamespace(blob_path=lambda ref: blob)
+    fn = R._working_to_photo(pspec, store)
+    gy, gx = np.mgrid[0:H:1, 0:W:1].astype(np.float64) + 0.5  # 72000 點，超過 32767
+    pts = np.stack([gx.ravel() / W, gy.ravel() / W], 1)
+    out = fn(pts)
+    assert out.shape == (len(pts), 2)
+    assert np.allclose(out[:, 0], gx.ravel() * 1.5 + 10.0, atol=1e-2)
+    assert np.allclose(out[:, 1], gy.ravel() * 1.5 + 20.0, atol=1e-2)
+    assert fn(np.zeros((0, 2))).shape == (0, 2)

@@ -816,13 +816,13 @@ def table_page_pdf(seed: int = 0, rows: int = 13) -> bytes:
     c = canvas.Canvas(buf, pagesize=A4, invariant=1)
     W, H = A4
     c.setFont("Helvetica-Bold", 15)
-    c.drawString(60, H - 88, "Module Study Plan 6003")
+    c.drawString(60, H - 88, "Garden Club Work Rota 4127")
     c.setFont("Helvetica", 8.5)
-    c.drawString(60, H - 106, "Thursday mornings from 24th September, Room 2.14")
+    c.drawString(60, H - 106, "Saturday mornings from 3rd May, Potting Shed B")
     x0, x1 = 56, W - 56
     cols = [x0, x0 + 48, x0 + 196, x0 + 344, x1]
-    words = ("Introduction to Strategic Planning and Policy institutional context rise fall emergence regional economy "
-             "urban rebalancing environment sustainable development housing transport delivery growth corridor review").split()
+    words = ("Planting basics for Community Gardens and Compost seasonal soil water seed bulb harvest "
+             "pruning hedges flower allotment greenhouse orchard composting watering shed tools volunteer").split()
     y = H - 124
     bands = []
     for r in range(rows + 1):
@@ -839,7 +839,7 @@ def table_page_pdf(seed: int = 0, rows: int = 13) -> bytes:
         for k in range(4):
             if r == 0:
                 c.setFont("Helvetica-Bold", 9.5)
-                c.drawString(cols[k] + 5, ya - 15, ["Week", "Session 1", "Session 2", "Deadlines"][k])
+                c.drawString(cols[k] + 5, ya - 15, ["Week", "Morning", "Afternoon", "Notes"][k])
                 continue
             if k == 0:
                 c.setFont("Helvetica", 9)
@@ -853,7 +853,7 @@ def table_page_pdf(seed: int = 0, rows: int = 13) -> bytes:
                 s = " ".join(str(wd) for wd in rng.choice(words, int(rng.integers(3, 6))))
                 c.drawString(cols[k] + 5, ya - 12 - li * 10, s[:32])
     c.setFont("Helvetica", 8.5)
-    c.drawString(W / 2 - 42, 46, "Module Guide 2026-27")
+    c.drawString(W / 2 - 42, 46, "Club Handbook 2031-32")
     c.drawString(W - 76, 46, "3")
     c.showPage()
     c.save()

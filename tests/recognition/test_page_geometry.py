@@ -542,12 +542,12 @@ def test_table_frame_inside_page_is_not_the_page():
     """紙內有一個很強的表格外框、紙與背景對比低：要框紙，不是框表格（以前的候選全是表格框）。"""
     W, H = 900, 1270
     page = np.full((H, W, 3), 248, np.uint8)
-    cv2.putText(page, "Module Study Plan", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (30, 30, 30), 2, cv2.LINE_AA)
+    cv2.putText(page, "Course Outline", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (30, 30, 30), 2, cv2.LINE_AA)
     cv2.rectangle(page, (70, 190), (W - 70, H - 190), (20, 20, 20), 3)
     for y in np.linspace(190, H - 190, 11).astype(int)[1:-1]:
         cv2.line(page, (70, y), (W - 70, y), (20, 20, 20), 1)
-        cv2.putText(page, "Strategic planning group work", (90, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 1, cv2.LINE_AA)
-    cv2.putText(page, "Module Guide 2026-27", (W // 2 - 140, H - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 1, cv2.LINE_AA)
+        cv2.putText(page, "Weekly design studio notes", (90, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (30, 30, 30), 1, cv2.LINE_AA)
+    cv2.putText(page, "Course Handbook 2031", (W // 2 - 140, H - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 1, cv2.LINE_AA)
     photo, G, corners = make_photo(page, 1200, 1600, "light", seed=4, f_frac=0.7, rx=12, ry=-6, rz=2, fill=0.75)
     photo = degrade(photo, np.random.default_rng(4), blur=1.0, noise=2.5, light=True, jpeg=85)
     q = find_page_quad(photo)

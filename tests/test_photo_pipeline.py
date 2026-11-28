@@ -21,6 +21,7 @@ from mortise.config import Config
 from mortise.eval import synth as S
 from mortise.eval.truth import render_truth
 from mortise.pipeline.store import Store
+from mortise.recognition import dewarp as D
 from mortise.stages import s1_input, s2_page
 
 FIX = Path(__file__).resolve().parent / "fixtures"
@@ -82,6 +83,7 @@ def cut_off_photo() -> np.ndarray:
 
 def _run(tmp_path: Path, img: np.ndarray, name: str, corrections=(), cfg: Config | None = None, fmt: str = "JPEG"):
     cfg = cfg or _cfg()
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / name
     Image.fromarray(img).save(path, fmt, **({"quality": 90} if fmt == "JPEG" else {}))
     store = Store(tmp_path / (Path(name).stem + "-job"))
@@ -140,7 +142,7 @@ def test_user_corners_always_win(tmp_path):
     assert spec.quad_method == "user" and spec.quad_confidence == 1.0 and spec.quad_status == "user"
     assert spec.quad_needs_review is False and spec.quad_review_reason == ""
     assert np.abs(_corners(spec) - CUT_GT).max() < 1e-6  # 角落在畫面外也照用
-    assert spec.dewarp_map is None  # 使用者的四角不再攤平
+    assert spec.dewarp_map is None  # 平的紙：使用者的四角也只做透視
     assert any("你拉的位置" in n for n in spec.notes)
     w, h = spec.working_image_size
     assert abs(h / w - spec.aspect_ratio) < 0.01
@@ -173,16 +175,76 @@ def test_curved_photo_is_dewarped_with_map(tmp_path):
     assert spec.quad_status == "curved_edge"
     assert spec.dewarp_map is not None and spec.dewarp_source in ("measured", "uvdoc_prior"), spec.notes
     assert spec.dewarp_residual_px is not None and spec.dewarp_residual_px < 3.0
-    z = np.load(store.blob_path(spec.dewarp_map))
+    mx, my = D.load_maps(store.blob_path(spec.dewarp_map))
     w, h = spec.working_image_size
-    assert z["map_x"].shape == (h, w) and z["map_y"].shape == (h, w)
+    assert mx.shape == (h, w) and my.shape == (h, w)
+    assert store.blob_path(spec.dewarp_map).stat().st_size < 0.25 * mx.nbytes  # 存的是粗網格
     assert len(spec.source_outline) >= 8  # 攤平時量到的外框
     assert spec.quad_needs_review is True  # 紙邊是彎的：請使用者確認
     # 對應圖的四個角落要落在原照片的紙角附近（與 source_corners 一致）
     c = _corners(spec)
-    got = np.array([[z["map_x"][0, 0], z["map_y"][0, 0]], [z["map_x"][0, -1], z["map_y"][0, -1]],
-                    [z["map_x"][-1, -1], z["map_y"][-1, -1]], [z["map_x"][-1, 0], z["map_y"][-1, 0]]])
+    got = np.array([[mx[0, 0], my[0, 0]], [mx[0, -1], my[0, -1]], [mx[-1, -1], my[-1, -1]], [mx[-1, 0], my[-1, 0]]])
     assert np.abs(got - c).max() < 0.02 * math.hypot(*photo.shape[:2])
+
+
+def _geo_err(store, spec, page_map, page) -> float:
+    """工作影像每個像素對回原頁面的位置誤差（第 95 百分位，頁面像素）：有攤平對應圖用對應圖，否則用透視矩陣。"""
+    from mortise.eval import metrics as M
+
+    w, h = spec.working_image_size
+    if spec.dewarp_map is not None:
+        mx, my = D.load_maps(store.blob_path(spec.dewarp_map))
+    else:
+        Hn = np.asarray(spec.source_to_page, np.float64).reshape(3, 3)
+        Hi = np.linalg.inv(np.diag([w, w, 1.0]) @ Hn)
+        ys, xs = np.mgrid[0:h, 0:w].astype(np.float64) + 0.5
+        d = Hi[2, 0] * xs + Hi[2, 1] * ys + Hi[2, 2]
+        mx = ((Hi[0, 0] * xs + Hi[0, 1] * ys + Hi[0, 2]) / d).astype(np.float32)
+        my = ((Hi[1, 0] * xs + Hi[1, 1] * ys + Hi[1, 2]) / d).astype(np.float32)
+    return M.dewarp_geometry(mx, my, page_map, (page.shape[1], page.shape[0]))["dewarp_pos_p95_px"]
+
+
+@pytest.mark.parametrize("kind,seed", [("crease", 37), ("bend", 41)])
+def test_confirming_curved_corners_keeps_dewarp(tmp_path, kind, seed):
+    """彎曲照片：使用者把系統給的四角原封不動送回（等於按「確認」）後照樣攤平，四角釘住不動，
+    位置誤差不可以比自動的結果差（以前確認後只做透視，弓起的頁錯字率從 0.5% 跳到 44%）。"""
+    page = _page("doc_a4" if kind == "bend" else "cv_two_column", 150)
+    photo, page_map, _ = S.degrade_curved(page, kind, seed)
+    _, auto, st1 = _run(tmp_path / "auto", photo, f"{kind}.png", fmt="PNG")
+    assert auto.dewarp_map is not None, auto.notes
+    corners = _corners(auto)
+    _, conf, st2 = _run(tmp_path / "confirm", photo, f"{kind}.png", [_user(corners.tolist())], fmt="PNG")
+    assert conf.quad_method == "user" and conf.quad_status == "user" and conf.quad_needs_review is False
+    assert conf.dewarp_map is not None and conf.dewarp_source in ("measured", "uvdoc_prior"), conf.notes
+    assert conf.dewarp_needs_review is False and conf.quad_alternatives == []
+    assert np.abs(_corners(conf) - corners).max() < 1e-6  # 使用者的四角原樣保留
+    assert any("四角之內攤平" in n for n in conf.notes), conf.notes
+    mx, my = D.load_maps(st2.blob_path(conf.dewarp_map))
+    got = np.array([[mx[0, 0], my[0, 0]], [mx[0, -1], my[0, -1]], [mx[-1, -1], my[-1, -1]], [mx[-1, 0], my[-1, 0]]])
+    assert np.abs(got - corners).max() < 2.0  # 對應圖的四個角就在使用者的角上（差不到半個像素到一個像素的取樣位移）
+    e_auto, e_conf = _geo_err(st1, auto, page_map, page), _geo_err(st2, conf, page_map, page)
+    _, persp, st3 = _run(tmp_path / "persp", photo, f"{kind}.png", [_user(corners.tolist())], cfg=_cfg(dewarp_photos=False), fmt="PNG")
+    assert persp.dewarp_map is None
+    e_persp = _geo_err(st3, persp, page_map, page)
+    assert e_conf <= 1.25 * e_auto + 0.5, (e_auto, e_conf)
+    assert e_conf < e_persp, (e_conf, e_persp)  # 攤平確實比只做透視準
+
+
+def test_user_corners_inside_curved_paper_are_not_stretched(tmp_path):
+    """使用者只框彎曲紙張的一塊（四角往內縮）：攤平不能把框撐到整張紙，四角釘在使用者的位置。"""
+    page = _page("cv_two_column", 150)
+    photo, _, _ = S.degrade_curved(page, "crease", 37)
+    _, auto, _ = _run(tmp_path / "auto", photo, "crease.png", fmt="PNG")
+    c = _corners(auto)
+    inner = c + 0.12 * (c.mean(axis=0) - c)
+    _, spec, store = _run(tmp_path / "inner", photo, "crease.png", [_user(inner.tolist())], fmt="PNG")
+    assert spec.quad_method == "user" and np.abs(_corners(spec) - inner).max() < 1e-6
+    if spec.dewarp_map is not None:
+        mx, my = D.load_maps(store.blob_path(spec.dewarp_map))
+        got = np.array([[mx[0, 0], my[0, 0]], [mx[0, -1], my[0, -1]], [mx[-1, -1], my[-1, -1]], [mx[-1, 0], my[-1, 0]]])
+        assert np.abs(got - inner).max() < 2.0
+    w, h = spec.working_image_size
+    assert w < 0.95 * auto.working_image_size[0]  # 沒有撐回整張紙
 
 
 def test_dewarp_can_be_turned_off(tmp_path):
@@ -205,7 +267,8 @@ def test_review_threshold_comes_from_config(tmp_path):
     """quad_review_confidence 由設定檔決定：門檻拉到 0.99，信心 0.98 的四角也要確認。"""
     _, spec, _ = _run(tmp_path, flat_photo(), "flat.jpg", cfg=_cfg(quad_review_confidence=0.99))
     assert spec.quad_confidence < 0.99
-    assert spec.quad_needs_review is True and "信心值" in spec.quad_review_reason
+    assert spec.quad_needs_review is True and "沒有把握" in spec.quad_review_reason
+    assert "0." not in spec.quad_review_reason  # 理由不寫信心值數字
 
 
 def test_pdf_page_spec_defaults_unchanged(tmp_path):
@@ -225,6 +288,7 @@ def test_first_use_does_not_wait_for_uvdoc_download(tmp_path, monkeypatch):
 
     monkeypatch.delenv("MORTISE_OFFLINE", raising=False)
     monkeypatch.setenv("MORTISE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("MORTISE_ALLOW_DOWNLOAD", "1")  # 下載函數換成卡住的假函數，不會真的連網
     gate = threading.Event()
 
     def stuck(params=None):
@@ -241,3 +305,19 @@ def test_first_use_does_not_wait_for_uvdoc_download(tmp_path, monkeypatch):
         assert spec.dewarp_map is not None  # 量測式攤平照做
     finally:
         gate.set()
+
+
+def test_review_reason_names_the_real_cause():
+    """確認理由依實際原因寫：旁邊有另一張紙時說「旁邊還有一張紙」；紙邊彎曲時不報信心值、也不報刻意放大的像素誤差。"""
+    c = {"quad_review_confidence": 0.6, "quad_max_corner_err_frac": 0.01}
+    geo = {"quad_status": "low_contrast", "quad_alternative_labels": ["較大的框（可能連旁邊的紙一起框）"], "quad_alternative_scores": [0.42],
+           "quad_corner_error_px": [0.1, 4.7, 4.7, 0.1]}
+    s2_page._decide_review(geo, 0.29, 2000.0, c, "edge_fit", ["同一張紙的其他框法與此相差最多 4.7 像素，已計入四角誤差"])
+    assert geo["quad_needs_review"] and "旁邊還有一張紙" in geo["quad_review_reason"] and "不夠清楚" not in geo["quad_review_reason"]
+    geo = {"quad_status": "curved_edge", "quad_corner_error_px": [3.0, 95.0, 4.0, 2.0]}
+    s2_page._decide_review(geo, 0.05, 2000.0, c, "edge_fit", [], True)
+    r = geo["quad_review_reason"]
+    assert geo["quad_needs_review"] and "彎" in r and "攤平" in r and not any(ch.isdigit() for ch in r)
+    geo = {"quad_status": "ok", "quad_corner_error_px": [1.0, 1.0, 1.0, 1.0]}
+    s2_page._decide_review(geo, 0.95, 2000.0, c, "edge_fit", [])
+    assert geo["quad_needs_review"] is False and geo["quad_review_reason"] == ""

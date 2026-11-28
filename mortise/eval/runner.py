@@ -447,16 +447,23 @@ def _working_to_photo(pspec: PageSpec, store) -> Callable[[np.ndarray], np.ndarr
     if pspec.dewarp_map is not None:
         import cv2
 
-        z = np.load(store.blob_path(pspec.dewarp_map))
-        mx, my = z["map_x"].astype(np.float32), z["map_y"].astype(np.float32)
+        from ..recognition.dewarp import load_maps
+
+        mx, my = load_maps(store.blob_path(pspec.dewarp_map))  # 新（粗網格）舊（逐像素）兩種格式都讀得懂
         ww = float(pspec.working_image_size[0])
 
         def fn(pts: np.ndarray) -> np.ndarray:
-            q = np.asarray(pts, np.float64) * ww - 0.5
-            xs = q[:, 0].astype(np.float32).reshape(1, -1)
-            ys = q[:, 1].astype(np.float32).reshape(1, -1)
-            x = cv2.remap(mx, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
-            y = cv2.remap(my, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()
+            q = np.asarray(pts, np.float64).reshape(-1, 2) * ww - 0.5
+            n = len(q)
+            if n == 0:
+                return np.zeros((0, 2), np.float64)
+            # cv2.remap 的查詢圖每一維不能超過 32767：補齊成 1024 的倍數、排成 (列, 1024) 再查
+            cols = 1024
+            pad = (-n) % cols
+            xs = np.pad(q[:, 0], (0, pad)).astype(np.float32).reshape(-1, cols)
+            ys = np.pad(q[:, 1], (0, pad)).astype(np.float32).reshape(-1, cols)
+            x = cv2.remap(mx, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()[:n]
+            y = cv2.remap(my, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).ravel()[:n]
             return np.stack([x, y], 1).astype(np.float64)
         return fn
 
