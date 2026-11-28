@@ -4,7 +4,8 @@
 只有類型與編號都相符的空間才能組在一起（取代「距離近就合併」）。
 
 步驟：
-  s4.text_flow   文字流：行 → 段落 → 文字框（發放 text_flow 編號）
+  s4.text_flow   文字流：行 → 段落 → 文字框（發放 text_flow 編號）；字級量歪而落單的一行，若剛好補上別的區塊空出的一行，
+                放回那個區塊（_adopt_orphans）
   s4.align       段落對齊方式
   s4.roles       角色標籤：標題、內文、頁碼（規則判斷；之後由大型 AI 仲裁）
   s4.contain     包含關係：文字框落在形狀裡（發放 contain 編號）
@@ -30,7 +31,7 @@ from ..config import Config
 from ..tools.fonts import is_cjk
 
 NAME = "s4"
-VERSION = "4"
+VERSION = "5"
 
 _BULLET = re.compile(r"^\s*([•‧·●○■□▪◆◇▶➤\-–—*]|\(?\d{1,2}[.)、]|[a-zA-Z][.)]|[一二三四五六七八九十]+[、.])\s*")
 _PAGE_NUMBER = re.compile(r"^[\-–— ]*(第\s*)?\d{1,4}(\s*頁)?(\s*[/／]\s*\d{1,4})?[\-–— ]*$")
@@ -120,6 +121,7 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
             blocks.append([line])
         else:
             best.append(line)
+    blocks = _adopt_orphans(blocks, c)
 
     # ---------- 區塊 → 段落 ----------
     paragraphs: list[Paragraph] = []
@@ -210,6 +212,69 @@ def run_page(elements: ElementList, spec: PageSpec, cfg: Config, corrections: li
     return _apply_corrections(layout, corrections)
 
 
+def _adopt_orphans(blocks: list[list[TextLine]], c: dict) -> list[list[TextLine]]:
+    """文字流的補漏：只有一行的區塊，剛好落在另一個區塊「空出一行」的位置，就把它放回那個區塊。
+
+    為什麼需要：照片、掃描的字級是量出來的，一行字沒有上伸或下伸的筆畫、或文字辨識把框切得比較扁時，量到的字級可能比上下行小兩成，
+    超過 text_flow 的字級容差，這一行就自己成一個文字框，疊在大框的中間（大框在那裡留了一行空），輸出時兩個框疊在一起、
+    大框下面的段落位置也跟著錯。條件（全部符合）：
+      - 這一行的基線在另一個區塊相鄰兩行的正中間：上下各離一個「一般行距」（該區塊最小的行距，差不到兩成五）。
+        只補「中間空一行」的洞，不接在區塊的最後面：接在後面等於放寬字級容差（例如靠右對齊的聯絡資料，
+        字小一點的地址會被併進電話那一段），洞則是區塊已經跨過去、明明白白留給這一行的位置；
+      - 左緣和區塊對齊（或首行縮排的範圍內），右緣不超出區塊；
+      - 字級和區塊的中位數差不到 max(size_tolerance, 2.5 × 量測誤差)（原生 PDF 的量測誤差是 0，等於沒有放寬）；粗體、斜體相同；
+        顏色和上下其中一行接近（每個色版差不到 60；履歷裡夾在職稱與說明之間、字小一點的灰色日期不會被放進來）。"""
+    tol_x = c["left_align_tolerance"]
+    max_angle = c.get("flow_max_angle_deg", 2.0)
+    hosts = [b for b in blocks if len(b) >= 2]
+    keep: list[list[TextLine]] = []
+    for blk in blocks:
+        if len(blk) != 1 or abs(blk[0].quad.angle_deg) >= max_angle:
+            keep.append(blk)
+            continue
+        o = blk[0]
+        oy = o.baseline[0].y
+        ol, orr = o.quad.bbox[0], o.quad.bbox[2]
+        home = None
+        for host in hosts:
+            pitches = [b2.baseline[0].y - b1.baseline[0].y for b1, b2 in zip(host, host[1:])]
+            base = min(pitches)
+            if base <= 0:
+                continue
+            hl, hr = min(t.quad.bbox[0] for t in host), max(t.quad.bbox[2] for t in host)
+            size = statistics.median(t.font_size for t in host)
+            err = max(o.font_size_rel_error, statistics.median(t.font_size_rel_error for t in host))
+            if abs(o.font_size - size) > max(c["size_tolerance"], 2.5 * err) * size:
+                continue
+            if _style_sig(o)[2:4] != _style_sig(host[0])[2:4] and _style_sig(o)[2:4] != _style_sig(host[-1])[2:4]:
+                continue
+            if not (abs(ol - hl) <= tol_x or 0 < ol - hl <= 3 * size) or orr > hr + tol_x:
+                continue
+            near = lambda d: abs(d - base) <= 0.25 * base  # noqa: E731
+            at = None
+            for i, (a, b) in enumerate(zip(host, host[1:])):
+                if a.baseline[0].y < oy < b.baseline[0].y and near(oy - a.baseline[0].y) and near(b.baseline[0].y - oy):
+                    at = i + 1
+                    break
+            if at is not None and not any(_same_ink(o, n) for n in host[max(0, at - 1): at + 1]):
+                at = None
+            if at is not None:
+                home = (host, at)
+                break
+        if home is None:
+            keep.append(blk)
+        else:
+            home[0].insert(home[1], o)
+    return keep
+
+
+def _same_ink(a: TextLine, b: TextLine, tol: int = 60) -> bool:
+    """兩行字的顏色接近（主要那一段的顏色，每個色版差不到 tol）。"""
+    ca = max(a.runs, key=lambda r: len(r.text)).color.value
+    cb = max(b.runs, key=lambda r: len(r.text)).color.value
+    return max(abs(ca.r - cb.r), abs(ca.g - cb.g), abs(ca.b - cb.b)) <= tol
+
+
 def _covered(segments: list[tuple[float, float, float, float]], vertical: bool, at: float, lo: float, hi: float, tol: float) -> bool:
     """在位置 at、範圍 lo 到 hi 之間，是否有格線線段蓋住至少六成。"""
     need = 0.6 * (hi - lo)
@@ -239,11 +304,12 @@ def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dic
     used: set[str] = set()
     for reg in elements.table_regions:
         if not reg.ruled:
-            n_cont = _sentences_cross_rows(reg, lines)
-            if n_cont >= int(c.get("table_flow_min_continuations", 2)):
+            n_cont, ratio = _sentences_cross_rows(reg, lines, float(c.get("table_flow_fill_min", 0.85)))
+            if n_cont >= int(c.get("table_flow_min_continuations", 2)) and ratio >= float(c.get("table_flow_min_ratio", 0.3)):
                 if notes is not None:
                     notes.append(f"③由文字對齊推得的無框線表格（{len(reg.h_lines) - 1} 列 × {len(reg.v_lines) - 1} 欄）裡，有 {n_cont} 處句子從上一列"
-                                 "接到下一列（段落換行或項目的第二行），比較像兩欄各自排的文字，不做成表格，照一般段落處理。")
+                                 f"接到下一列（段落換行或項目的第二行；最多的一欄佔上下相鄰兩行的 {ratio:.0%}），比較像兩欄各自排的文字，"
+                                 "不做成表格，照一般段落處理。")
                 continue
         ys, xs = reg.h_lines, reg.v_lines
         nr, nc = len(ys) - 1, len(xs) - 1
@@ -311,28 +377,51 @@ def _tables(elements: ElementList, lines: list[TextLine], spec: PageSpec, c: dic
     return out, pars, used
 
 
-def _sentences_cross_rows(reg, lines: list[TextLine]) -> int:
-    """無框線表格的某一欄裡，有幾處「句子從上一列接到下一列」。
+_CODE_LIKE = re.compile(r"[@/\\#_]|\w\.\w|\d")  # 電子郵件、網址、路徑、檔名（字母中間有點）、代碼、數字
+_SENTENCE_END = (".", "!", "?", ":", ";", "。", "！", "？", "：", "；")  # 句子在這一行結束：下一行小寫開頭也不是接續
+
+
+def _wordy(text: str) -> bool:
+    """這一行像不像一般句子的一行：至少 3 個詞（中日韓文字至少 6 個字），最後一個詞不是電子郵件、檔名、代碼或數字。
+    表格的儲存格常常只有一個詞（電子郵件、檔名、代號、價格），或兩個詞的名稱；這種格子放不下下一格的第一個詞是當然的，不是被迫換行。"""
+    words = text.split()
+    if not words or _CODE_LIKE.search(words[-1]):
+        return False
+    if any(is_cjk(ch) for ch in text):
+        return sum(1 for ch in text if ch.strip()) >= 6
+    return len(words) >= 3
+
+
+def _sentences_cross_rows(reg, lines: list[TextLine], fill_min: float = 0.85) -> tuple[int, float]:
+    """無框線表格裡有幾處「句子從上一列接到下一列」，以及接續最多的一欄佔上下相鄰兩行的比例。回傳（處數、比例）。
 
     無框線表格的每一列各自獨立，儲存格裡的字不會接到下一列；兩欄版面（例如履歷右欄的經歷）的一欄卻是一段一段排下去的。
     ③只看得到文字框的位置；這裡看得到字，所以多看一層：同一欄上下相鄰的兩行（不同列），符合下面全部條件就算一處接續：
       - 字級相同（差不到一成二）、行距是一般的行距（基線距離在字級的 0.8 到 1.8 倍之間）；
+      - 上一行像一般句子的一行（_wordy：至少 3 個詞，結尾不是電子郵件、檔名、數字），而且幾乎排滿這一格：
+        從這一欄文字的左緣量到下一條欄界（不是量到欄裡最長那一行），至少排到 fill_min（預設八成五）；
       - 上一行排到這一欄的右緣附近：右邊剩下的空間放不下下一行的第一個詞（被迫換行，同 text_flow 的硬換行判斷）；
-      - 下一行不是新的項目（不以項目符號開頭），左緣和上一行差不多（或在項目符號後面縮排）；
-      - 看得出是同一句：下一行以小寫英文字母開頭、上一行以連字號或逗號結尾，或上一行是項目而下一行縮排接在符號後面。
-    欄太窄（不到 8 個字寬）時不看：短的儲存格本來就不會換行。"""
+      - 下一行不是新的項目（不以項目符號開頭），第一個詞不是電子郵件、檔名、代碼或數字，左緣和上一行差不多（或在項目符號後面縮排）；
+      - 看得出是同一句：上一行沒有以句號結束而下一行以小寫英文字母開頭、上一行以連字號或逗號結尾，
+        或上一行是項目而下一行縮排接在符號後面。
+    欄太窄（不到 8 個字寬）時不看：短的儲存格本來就不會換行。
+    為什麼要這麼嚴：真正的無框線表格也常有小寫開頭的欄（電子郵件、檔名、備註），每一格都放不下下一格的第一個詞；
+    只看「放不下＋小寫開頭」會把通訊錄、菜單、檔案清單拆掉。呼叫端另外要求接續佔一欄相鄰兩行的一定比例（table_flow_min_ratio）。"""
     xs = reg.v_lines
     l, t, r, b = reg.quad.bbox
     inside = [ln for ln in lines if l <= ln.quad.center.x <= r and t <= ln.quad.center.y <= b]
-    count = 0
+    count, best = 0, 0.0
     for k in range(len(xs) - 1):
         col = sorted((ln for ln in inside if xs[k] <= ln.quad.center.x <= xs[k + 1]), key=lambda ln: ln.baseline[0].y)
         if len(col) < 2:
             continue
         right = max(ln.quad.bbox[2] for ln in col)
+        left = min(ln.quad.bbox[0] for ln in col)
         size = statistics.median(ln.font_size for ln in col)
-        if right - min(ln.quad.bbox[0] for ln in col) < 8 * size:
+        if right - left < 8 * size:
             continue
+        cell_w = max(xs[k + 1] - left, 1e-9)
+        n_col = 0
         for a, nxt in zip(col, col[1:]):
             sa = a.font_size
             if abs(sa - nxt.font_size) > 0.12 * max(sa, nxt.font_size):
@@ -340,18 +429,24 @@ def _sentences_cross_rows(reg, lines: list[TextLine]) -> int:
             pitch = nxt.baseline[0].y - a.baseline[0].y
             if not 0.8 * sa <= pitch <= 1.8 * sa:
                 continue
+            if not _wordy(a.text) or (a.quad.bbox[2] - left) < fill_min * cell_w:
+                continue  # 上一行太短、或離欄界還有一大段：不是排滿一行的句子
             if right - a.quad.bbox[2] > _first_token_width(nxt) + 0.3 * sa:
                 continue  # 上一行放得下卻沒放：硬換行，不是同一句
-            if _BULLET.match(nxt.text):
+            head = nxt.text.split()[:1]
+            if _BULLET.match(nxt.text) or not head or _CODE_LIKE.search(head[0]):
                 continue
             dx = nxt.quad.bbox[0] - a.quad.bbox[0]
             if not -0.6 * sa <= dx <= 2.5 * sa:
                 continue
             first, last = nxt.text.strip()[:1], a.text.rstrip()[-1:]
             hanging = bool(_BULLET.match(a.text)) and dx >= 0.3 * sa
-            if (first.isalpha() and first.islower()) or last in ("-", ",", "，", "、") or hanging:
-                count += 1
-    return count
+            lower = first.isalpha() and first.islower() and last not in _SENTENCE_END
+            if lower or last in ("-", ",", "，", "、") or hanging:
+                n_col += 1
+        count += n_col
+        best = max(best, n_col / (len(col) - 1))
+    return count, best
 
 
 def _cell_groups(lines: list[TextLine]) -> list[list[TextLine]]:

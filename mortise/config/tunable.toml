@@ -118,3 +118,44 @@ min = 0.05
 max = 0.3
 step = 0.025
 note = "頁內格線與文字行離直線的最大距離（佔頁寬 %）中位數低於此值才算平的紙（平的紙只做透視攤平）"
+
+# 兩欄版面與無框線表格（③ regions.py、④ s4_structure.py）
+[[param]]
+path = "recognize.region_bl_flow_pair_min"
+min = 0.7
+max = 0.9
+step = 0.05
+note = "無框線表格候選的欄延伸成文字流後，有別欄同高鄰居的行低於此比例就當成兩欄版面"
+
+[[param]]
+path = "recognize.region_bl_flow_unpaired_min"
+min = 3
+max = 6
+step = 1
+note = "沒有同高鄰居的行至少這麼多行，才當成兩欄版面（小表的表題與註記只有 1–3 行）"
+
+[[param]]
+path = "recognize.region_bl_col_edge_pad"
+min = 0.3
+max = 1.0
+step = 0.1
+note = "無框線表格的欄界放在下一欄文字左緣再往左這麼多個字高"
+
+[[param]]
+path = "structure.table_flow_min_continuations"
+values = [2, 3]
+note = "表格裡有這麼多處句子從上一列接到下一列，就不當表格"
+
+[[param]]
+path = "structure.table_flow_min_ratio"
+min = 0.2
+max = 0.5
+step = 0.05
+note = "接續最多的一欄，接續佔相鄰兩行的比例超過此值才拆表"
+
+[[param]]
+path = "structure.table_flow_fill_min"
+min = 0.8
+max = 0.92
+step = 0.02
+note = "算接續時，上一行要排到下一條欄界的這個比例以上"

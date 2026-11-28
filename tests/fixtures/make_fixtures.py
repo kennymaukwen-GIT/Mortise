@@ -5,6 +5,7 @@
     python tests/fixtures/make_fixtures.py flattened  只產生被扁平化內容的兩個（flattened_*.pdf；不需要 LibreOffice，輸出的位元組固定）
     python tests/fixtures/make_fixtures.py cv         只產生假資料的兩欄履歷（cv_two_column.pdf；不需要 LibreOffice，輸出的位元組固定）
     python tests/fixtures/make_fixtures.py columns    只產生假資料的兩欄講義與無框線表格（two_column_notes.pdf、borderless_tables.pdf；不需要 LibreOffice，輸出的位元組固定）
+    python tests/fixtures/make_fixtures.py lowercase  只產生假資料的「小寫開頭欄」無框線表格（lowercase_tables.pdf：通訊錄、檔案清單、書單、小表；不需要 LibreOffice，輸出的位元組固定）
 """
 
 from __future__ import annotations
@@ -1044,9 +1045,84 @@ def borderless_tables() -> None:
     c.save()
 
 
+def lowercase_tables() -> None:
+    """假資料的無框線表格（內容全部虛構），專門放「容易被誤認成兩欄段落」的真表格：
+      - 小表：3 列 × 2 欄的開放時間，上面一行只在第一欄的表題、下面一行短短的註記（太小，表題與註記就佔了文字流的四分之一）；
+      - 職員通訊錄：7 列 × 4 欄（含表頭），電子郵件一欄全是小寫開頭、一格只有一個詞，行距 1.6 倍字級；
+      - 共用檔案清單：5 列 × 3 欄（含表頭），檔名小寫開頭，行距 1.5 倍字級；
+      - 讀書會書單：5 列 × 3 欄（含表頭），備註一欄是小寫開頭的短句，行距 1.4 倍字級。
+    表格之間是橫跨整頁的說明段落。用來確認④的保險（句子一列接一列就不當表格）與③的兩欄判斷不會把這些真表格拆掉
+    （tests/recognition/test_two_column_layout.py）。不需要 LibreOffice，輸出的位元組固定。"""
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    w, h = 595.276, 841.89
+    c = _vector_canvas("lowercase_tables.pdf", (w, h))
+    ink, grey, green, light = HexColor("#1E1E1E"), HexColor("#3A3A3A"), HexColor("#2E5E3E"), HexColor("#666666")
+
+    def text(x, top, s, sz=10.0, font="LS", color=grey, align="left"):
+        c.setFillColor(color)
+        c.setFont(font, sz)
+        c.drawString(x - (stringWidth(s, font, sz) if align == "right" else 0), h - top, s)
+
+    def para(top, s):
+        for line in _wrap(s, "LS", 10, w - 112):
+            text(56, top, line)
+            top += 14
+        return top
+
+    def table(top, xs, aligns, rows, lead, header=True):
+        for r, row in enumerate(rows):
+            bold = header and r == 0
+            for k, cell in enumerate(row):
+                text(xs[k], top, cell, 10, "LSB" if bold else "LS", ink if bold else grey, aligns[k])
+            top += lead
+        return top
+
+    text(56, 62, "Elm Street Library", 21, "LSB", ink)
+    top = para(94, "The library is run by the parish council with help from volunteers. Membership is free for everyone who lives or "
+                   "works in the parish, and you can borrow up to ten items at a time.")
+    top += 14
+    text(56, top, "Opening hours", 12, "LSB", green)
+    top += 22
+    top = table(top, [56, 240], ["left", "left"], [("Monday to Friday", "9:30 to 19:00"), ("Saturday", "9:30 to 16:00"),
+                                                   ("Sunday", "11:00 to 15:00")], 18.5, header=False)
+    text(56, top + 2, "Closed on public holidays.", 8.5, "LS", light)
+    top += 32
+    top = para(top, "Please ask at the desk if you need help finding anything. The people below look after the different parts of the "
+                    "library; email is the quickest way to reach them outside opening hours.")
+    top += 18
+    top = table(top, [56, 170, 300, 480], ["left"] * 4,
+                [("Name", "Role", "Email", "Desk"), ("Ines Varga", "Head librarian", "ines.varga@example.org", "A1"),
+                 ("Tom Achebe", "Children's books", "kids@example.org", "B2"), ("Lena Fischer", "Local history", "lena.fischer@example.org", "C1"),
+                 ("Omar Haddad", "Computers", "omar.haddad@example.org", "A3"), ("Rosa Lindqvist", "Volunteers", "helpers@example.org", "B1"),
+                 ("Kofi Mensah", "Deliveries", "kofi.mensah@example.org", "D2")], 16)
+    top += 22
+    top = para(top, "Volunteers keep their rotas and forms in the shared folder on the desk computer. The newest copy of each file "
+                    "is listed here.")
+    top += 18
+    top = table(top, [56, 300, 420], ["left"] * 3,
+                [("File", "Size", "Updated"), ("rota-spring.xlsx", "48 KB", "monday"), ("welcome-pack.pdf", "1.2 MB", "tuesday"),
+                 ("lost-property.docx", "36 KB", "thursday"), ("photos-open-day.zip", "64 MB", "saturday")], 15)
+    top += 22
+    top = para(top, "The reading group meets in the back room on the last Thursday of the month. Copies can be reserved at the desk "
+                    "two weeks before each meeting.")
+    top += 18
+    table(top, [56, 220, 520], ["left", "left", "right"],
+          [("Book", "Notes", "Week"), ("The Quiet Orchard", "short chapters, good for new members", "1"),
+           ("Salt and Lanterns", "a long read, start early", "2"), ("North of the River", "large print copies available", "3"),
+           ("Paper Boats", "poems, read a few each day", "4")], 14)
+    c.showPage()
+    c.save()
+
+
 if __name__ == "__main__":
     import sys
 
+    if sys.argv[1:] == ["lowercase"]:
+        lowercase_tables()
+        print(["lowercase_tables.pdf"])
+        sys.exit(0)
     if sys.argv[1:] == ["cv"]:
         cv_two_column()
         print(["cv_two_column.pdf"])

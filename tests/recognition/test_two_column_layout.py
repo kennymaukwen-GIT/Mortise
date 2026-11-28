@@ -6,8 +6,9 @@
 
 全部用虛構資料：
   - 前半：合成的文字框位置（不跑文字辨識，很快），涵蓋側欄＋主欄、兩欄同行距但被小標題錯開、價目表、課表、
-    有分組列的表格、兩欄版面其中一欄裡的小表格。
-  - 後半：tests/fixtures 的三份虛構 PDF（cv_two_column、two_column_notes、borderless_tables）畫成 150 dpi 截圖，
+    有分組列的表格、兩欄版面其中一欄裡的小表格、表題加短註記的小表；④的保險不能拆掉的真表格
+    （電子郵件欄、檔名欄、小寫備註欄，照真實字寬排）；字級量歪而落單的一行要放回原來的區塊。
+  - 後半：tests/fixtures 的四份虛構 PDF（cv_two_column、two_column_notes、borderless_tables、lowercase_tables）畫成 150 dpi 截圖，
     走完整的影像產線，輸出版面固定的 Word 與可編輯 PDF，用⑦的逐行檢查確認每一行都在。
 """
 
@@ -185,7 +186,7 @@ def test_table_inside_one_column_of_a_two_column_page():
     tables, rejected, found = find(table_inside_right_column())
     assert tables == [(4, 3)] and rejected
     x0, _, x1, _ = found[0]["box"]
-    assert x0 >= 400 and x1 <= 1030  # 只在右欄
+    assert x0 >= 400 and x1 <= 1030 + LINE_H  # 只在右欄（最後一欄右邊多留約一個字高的餘裕）
 
 
 def test_rows_inside_a_ruled_table_are_not_another_table():
@@ -216,7 +217,10 @@ def test_threshold_comes_from_params():
     from mortise.config import Config
 
     c = Config.load().section("recognize")
-    assert c.get("region_bl_flow_pair_min") == R.DEFAULT_PARAMS["bl_flow_pair_min"]
+    for key in ("bl_flow_pair_min", "bl_flow_unpaired_min", "bl_col_edge_pad"):
+        assert c.get(f"region_{key}") == R.DEFAULT_PARAMS[key], key
+    s = Config.load().section("structure")
+    assert (s.get("table_flow_min_ratio"), s.get("table_flow_fill_min")) == (0.3, 0.85)
     tables, _, _ = find(sidebar_cv(), bl_flow_pair_min=0.0)
     assert tables
 
@@ -283,6 +287,153 @@ def test_s4_keeps_real_borderless_table_even_with_lowercase_cells():
             lines.append(_line(10 * r + k, t, [0.1, 0.35, 0.55][k], r, w))
     out, used, notes = _s4_tables(_region([0.1, 0.3, 0.5, 0.85], 4), lines)
     assert len(out) == 1 and len(used) == 12 and notes == []
+
+
+PW = 595.276  # 頁寬（pt）：下面的合成行用 pt 排，再換成相對單位
+
+
+def _metric_line(i: int, text: str, x0_pt: float, top_pt: float, size_pt: float = 10.0, err: float | None = None, bold: bool = False,
+                 measured_pt: float | None = None):
+    """照 Helvetica 的字寬排出來的一行（每個字的位置 char_x 都有，像真的文字辨識結果），用來測「放不下下一個詞」的判斷。
+    measured_pt：量到的字級（照片、掃描的量測誤差：字照 size_pt 排，字級卻量成另一個值）。"""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    from mortise.artifacts import Color, Point, Provenance, Quad, TextLine, TextRun, measured
+
+    font = "Helvetica-Bold" if bold else "Helvetica"
+    xs, x = [], x0_pt
+    for ch in text:
+        if ch.strip():
+            xs.append(x / PW)
+        x += stringWidth(ch, font, size_pt)
+    w = stringWidth(text, font, size_pt) / PW
+    s = (measured_pt or size_pt) / PW
+    x0, y = x0_pt / PW, top_pt / PW
+    q = Quad.from_rect(x0, y, x0 + w, y + s)
+    m = lambda v, e=None: measured(v, 0.9, Provenance.MEASURED, "t", e)  # noqa: E731
+    run = TextRun(text=text, quad=q, font_size=m(s, None if err is None else err * s), bold=m(bold), italic=m(False),
+                  color=m(Color(r=40, g=40, b=40)), char_x=xs)
+    return TextLine(id=f"m{i:03d}", quad=q, z=i, baseline=(Point(x=x0, y=y + 0.8 * s), Point(x=x0 + w, y=y + 0.8 * s)), runs=[run])
+
+
+def _pt_region(xs_pt: list[float], top_pt: float, pitch_pt: float, n_rows: int):
+    from mortise.artifacts import Quad, TableRegion
+
+    ys = [(top_pt - 0.3 * pitch_pt + r * pitch_pt) / PW for r in range(n_rows + 1)]
+    xs = [x / PW for x in xs_pt]
+    return TableRegion(id="p001-tbl-real", quad=Quad.from_rect(xs[0], ys[0], xs[-1], ys[-1]), h_lines=ys, v_lines=xs, ruled=False, confidence=0.5)
+
+
+# 真正的無框線表格，有一欄是小寫開頭、一格只有一個詞或一個短句（虛構）：③的欄界是空白帶的中線
+CONTACTS = ([("Name", "Role", "Email", "Desk"), ("Ines Varga", "Head librarian", "ines.varga@example.org", "A1"),
+             ("Tom Achebe", "Children's books", "kids@example.org", "B2"), ("Lena Fischer", "Local history", "lena.fischer@example.org", "C1"),
+             ("Omar Haddad", "Computers", "omar.haddad@example.org", "A3"), ("Rosa Lindqvist", "Volunteers", "helpers@example.org", "B1"),
+             ("Kofi Mensah", "Deliveries", "kofi.mensah@example.org", "D2")], [56, 170, 300, 480], [50, 163, 293, 473, 495])
+FILES = ([("File", "Size", "Updated"), ("rota-spring.xlsx", "48 KB", "monday"), ("welcome-pack.pdf", "1.2 MB", "tuesday"),
+          ("lost-property.docx", "36 KB", "thursday"), ("photos-open-day.zip", "64 MB", "saturday")], [56, 300, 420], [50, 230, 380, 460])
+BOOKS = ([("Book", "Notes", "Week"), ("The Quiet Orchard", "short chapters, good for new members", "1"),
+          ("Salt and Lanterns", "a long read, start early", "2"), ("North of the River", "large print copies available", "3"),
+          ("Paper Boats", "poems, read a few each day", "4")], [56, 220, 520], [50, 200, 450, 531])
+# 菜單：備註欄排得很緊（最長的備註幾乎排滿到下一條欄界），每一格都是小寫開頭、放不下下一格的第一個詞
+MENU = ([("Leek soup", "served with warm bread and butter", "3.80"), ("Bean chilli", "vegan, mild and filling", "4.20"),
+         ("Fish pie", "contains milk and egg; topped with cheese", "5.50"), ("Apple crumble", "made with apples from the garden", "2.60"),
+         ("Flapjack", "contains oats and golden syrup", "1.40")], [56, 200, 412], [50, 190, 404, 432])
+
+
+@pytest.mark.parametrize("pitch_factor", [1.4, 1.5, 1.6, 1.7])
+@pytest.mark.parametrize("case", ["contacts", "files", "books", "menu"])
+def test_s4_keeps_tables_with_lowercase_or_one_word_columns(case, pitch_factor):
+    """審查找到的錯：電子郵件欄、檔名欄、小寫備註欄，每一格都「放不下下一格的第一個詞」而且下一格小寫開頭，
+    以前每一列都算一處句子接續，行距 1.4–1.8 倍字級的通訊錄、菜單、檔案清單整張被拆掉。現在要求上一行像一般句子（至少 3 個詞、
+    結尾不是電子郵件或檔名）、幾乎排滿到下一條欄界，再加上接續要佔一欄相鄰兩行的一定比例：這些都還是表格。"""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    rows, col_x, edges = {"contacts": CONTACTS, "files": FILES, "books": BOOKS, "menu": MENU}[case]
+    right = {"books": 530.0, "menu": 430.0}.get(case)  # 最後一欄靠右對齊（週次、價格）的右緣（pt）
+    pitch = 10.0 * pitch_factor
+
+    def x_of(k: int, t: str) -> float:
+        return right - stringWidth(t, "Helvetica", 10.0) if right is not None and k == len(col_x) - 1 else col_x[k]
+
+    lines = [_metric_line(100 * r + k, t, x_of(k, t), 200 + r * pitch) for r, row in enumerate(rows) for k, t in enumerate(row)]
+    out, used, notes = _s4_tables(_pt_region(edges, 200, pitch, len(rows)), lines)
+    assert notes == [] and len(out) == 1, notes
+    assert (len(out[0].row_lines) - 1, len(out[0].col_lines) - 1) == (len(rows), len(rows[0]))
+    assert len(used) == len(lines)
+
+
+def test_s4_still_dissolves_running_text_with_real_metrics():
+    """同一套字寬下，兩欄的段落（每行排滿、句子接到下一行）仍會被認出來，不做成表格（保險還有作用）。"""
+    left = ["Cold frames go in during the first dry week of March, and", "seedlings that start under glass are ready for the open",
+            "beds about three weeks sooner than the ones sown outside,", "so the soil has time to warm before the first planting."]
+    right = ["Water in the early morning or after six in", "the evening. One full can per square metre", "is enough for most beds; seedlings need a",
+             "fine rose and a much lighter hand than beds."]
+    lines = [_metric_line(i, t, 56, 200 + 13 * i, 9.5) for i, t in enumerate(left)]
+    lines += [_metric_line(10 + i, t, 330, 200 + 13 * i, 9.5) for i, t in enumerate(right)]
+    out, used, notes = _s4_tables(_pt_region([56, 318, 540], 200, 13, 4), lines)
+    assert out == [] and not used and notes
+
+
+def test_small_table_with_caption_and_short_note_is_kept():
+    """審查找到的錯：3 列 × 2 欄的小表，上面一行只在第一欄的表題、下面一行短短的註記（都沒有跨過欄間），
+    成對比例只有 0.75（8 行裡 2 行沒有同列鄰居），以前被當成兩欄版面放棄。現在還要求沒有同列鄰居的行至少 4 行。"""
+    q = [box(117, 100 + 26 * i, 1000 if i < 2 else 420) for i in range(3)]  # 全寬段落（最後一行短）
+    q.append(box(117, 196, 170, 24))  # 表題（只在第一欄）
+    y = 236
+    for w0, w1 in ((230, 160), (120, 160), (110, 160)):
+        q += [box(117, y, w0), box(500, y, w1)]
+        y += 38
+    q.append(box(117, y + 6, 300, 15))  # 表下的短註記
+    q += [box(117, y + 60 + 26 * i, 1000 if i < 2 else 380) for i in range(3)]  # 下一段全寬段落
+    old, _, _ = find(q, bl_flow_unpaired_min=0)
+    assert old == [], "這個情境在只看成對比例時應該會被放棄（不然測不到東西）"
+    tables, rejected, _ = find(q)
+    assert tables == [(3, 2)] and rejected == []
+
+
+def test_borderless_column_lines_sit_next_to_the_column_text():
+    """交出去的欄界貼在下一欄文字的左邊（不是寬空白帶的中線）：不然⑤把字到格線的距離當成左右邊距，格子裡放不下字。"""
+    _, _, found = find(price_list_and_timetable())
+    hmed = float(LINE_H)
+    price = next(t for t in found if len(t["grid"].v_lines) == 4)
+    # 價目表三欄的字從 117、480、約 755 px 開始：欄界在字的左邊 0.5 個字高
+    assert price["grid"].v_lines[0] == 117
+    assert price["grid"].v_lines[1] == pytest.approx(480 - 0.5 * hmed, abs=1.0)
+    assert 700 < price["grid"].v_lines[2] < 755
+
+
+def test_orphan_line_with_mismeasured_size_goes_back_into_its_block(monkeypatch):
+    """照片、掃描量到的字級有誤差：一行字量小了兩成，自己成一個文字框疊在大框中間（大框在那裡空了一行；
+    兩欄講義的掃描版就是這樣，右欄的大框和這個小框疊在一起）。放回去之後，四行是同一段、同一個框。"""
+    from mortise.artifacts import ElementList, PageSpec, ProductionLine
+    from mortise.config import Config
+    from mortise.stages import s4_structure as S4
+
+    texts = ["Volunteers who cannot come on their day should tell", "the coordinators as early as they can. Messages are",
+             "answered on weekday evenings; for anything urgent,", "leave a note on the board by the gate."]
+    lines = [_metric_line(i, t, 330, 300 + 13 * i, 9.5, err=0.1, measured_pt=7.4 if i == 2 else None) for i, t in enumerate(texts)]
+    el = ElementList(page_index=0, production_line=ProductionLine.IMAGE, texts=lines)
+    spec = PageSpec.model_construct(page_index=0, aspect_ratio=841.89 / PW)
+    with monkeypatch.context() as m:  # 先確認：沒有補漏的話，這一行會自己成一個框（不然測不到東西）
+        m.setattr(S4, "_adopt_orphans", lambda blocks, c: blocks)
+        assert len(S4.run_page(el, spec, Config.load(), []).text_boxes) == 2
+    layout = S4.run_page(el, spec, Config.load(), [])
+    assert len(layout.text_boxes) == 1
+    by = {p.id: p for p in layout.paragraphs}
+    assert [len(by[pid].line_ids) for pid in layout.text_boxes[0].paragraph_ids] == [4]
+
+
+@pytest.mark.parametrize("size_pt, bold, err", [(12.5, True, 0.1), (7.4, False, 0.0)])
+def test_line_with_really_different_style_stays_on_its_own(size_pt, bold, err):
+    """真的不同的行不放回去：粗體的小標題；原生 PDF（量測誤差 0）裡字級真的比較小的一行。"""
+    from mortise.config import Config
+    from mortise.stages import s4_structure as S4
+
+    texts = ["Coordinators answer messages on weekday", "Next meeting", "on the board by the gate."]
+    blocks = [[_metric_line(0, texts[0], 330, 300, 9.5, err=err), _metric_line(2, texts[2], 330, 326, 9.5, err=err)],
+              [_metric_line(1, texts[1], 330, 313, size_pt, err=err, bold=bold)]]
+    out = S4._adopt_orphans(blocks, Config.load().section("structure"))
+    assert [len(b) for b in out] == [2, 1]
 
 
 # ---------------------------------------------------------------- 完整的影像產線：虛構 fixture 的截圖
@@ -366,3 +517,47 @@ def test_borderless_tables_fixture_is_still_recognized(tmp_path_factory):
         assert all(c.paragraph_ids for c in t.cells), t.id
     assert (cell_text(price, 0, 0), cell_text(price, 1, 0), cell_text(price, 7, 2)) == ("Item", "Filter coffee", "4.50")
     assert (cell_text(week, 0, 1), cell_text(week, 5, 1), cell_text(week, 3, 5)) == ("Mon", "Homework", "Lunch")
+
+
+def test_lowercase_tables_fixture_keeps_every_table(tmp_path_factory):
+    """審查找到的錯的整條產線版本：通訊錄（電子郵件欄）、檔案清單（檔名欄）、書單（小寫備註欄）、表題加短註記的小表，
+    ③要全部找到、④不能拆掉（以前④把通訊錄和書單拆成段落，③把小表當成兩欄版面放棄）。"""
+    _, report, el, layout = _run("lowercase_tables", tmp_path_factory)
+    shapes = sorted((len(t.h_lines) - 1, len(t.v_lines) - 1) for t in el.table_regions)
+    assert shapes == [(3, 2), (5, 3), (5, 3), (7, 4)] and not any(t.ruled for t in el.table_regions)
+    assert sorted((len(t.row_lines) - 1, len(t.col_lines) - 1) for t in layout.tables) == shapes
+    assert not [n for n in layout.notes if "無框線表格" in n]
+    by_par = {p.id: p for p in layout.paragraphs}
+    by_line = {t.id: t for t in el.texts}
+
+    def cell_text(t, r, k):
+        cell = next(c for c in t.cells if (c.row, c.col) == (r, k))
+        return " ".join(by_line[i].text.strip() for pid in cell.paragraph_ids for i in by_par[pid].line_ids)
+
+    tables = {cell_text(t, 0, 0): t for t in layout.tables}
+    assert (cell_text(tables["Name"], 1, 2), cell_text(tables["Name"], 0, 3)) == ("ines.varga@example.org", "Desk")
+    assert (cell_text(tables["File"], 0, 1), cell_text(tables["File"], 1, 1), cell_text(tables["File"], 4, 0)) == ("Size", "48 KB", "photos-open-day.zip")
+    assert cell_text(tables["Book"], 1, 1) == "short chapters, good for new members"
+    assert (cell_text(tables["Monday to Friday"], 2, 0), cell_text(tables["Monday to Friday"], 2, 1)) == ("Sunday", "11:00 to 15:00")
+    # 每一格的字都在成品裡（以前無框表格的欄界在空白帶中線，字離格線太遠，⑤把那段距離當成左右邊距，「Size」「48 KB」整格被擠掉）
+    for fr in report.format_reports:
+        if fr.format == OutputFormat.DOCX_FIXED and not libreoffice.available():
+            continue
+        missing = [i.message for p in fr.pages for i in p.issues if i.code == "line_missing"]
+        assert missing == [], (fr.format, missing)
+
+
+def test_orphan_below_a_block_is_not_appended():
+    """只補區塊中間空出的一行，不接在區塊最後面：靠右對齊的聯絡資料（電子郵件、電話），下面字小一點的地址仍是自己一段
+    （接在後面等於放寬字級容差，兩欄履歷的截圖裡會把地址併進電話那一段）。"""
+    from mortise.config import Config
+    from mortise.stages import s4_structure as S4
+
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    texts = ["casey.morgan@example.org", "+1 555 0142", "12 Lakeside Road, Northshire"]
+    right = 540.0
+    lines = [_metric_line(i, t, right - stringWidth(t, "Helvetica", 9.5 if i < 2 else 8.0), 60 + 13 * i, 9.5 if i < 2 else 8.0, err=0.08)
+             for i, t in enumerate(texts)]
+    out = S4._adopt_orphans([lines[:2], lines[2:]], Config.load().section("structure"))
+    assert [len(b) for b in out] == [2, 1]
